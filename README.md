@@ -100,6 +100,8 @@ flowchart TD
     L-->N
     M-->P[" "]
     P-->O
+    G-->M
+    I-->M
 
 ```
 
