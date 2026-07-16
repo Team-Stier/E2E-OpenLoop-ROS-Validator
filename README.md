@@ -3,6 +3,29 @@ openloop validator for e2e AV models based on ROS1 noetic
 
 TFv6 / InterFuser / DiffusionDrive v2 / SparseDrive v2 에 대응
 
+## 0. Convention
+### branch rule
+main에 merge, PR하지 말것. 코드 리뷰 후에 진행.
+기능 개발시 브랜치 파서 진행 합니다.
+브랜치 이름은 `feature/name`를 따른다. 
+- 예시: `inference_engine-data_buffer/taeyun`
+### commets
+코드 최상단에 코드의 역할과 구독, 발행하는 토픽을 비롯한 i/o 적기.
+- 예시:
+```
+"""
+inference engine의 인풋이 되는 데이터를 저장하는 버퍼 객체
+토픽을 callback으로 객체 내부에 저장.
+pub:
+sub: 
+    /lidar3D/BEV
+    /image/main/processed
+    /image/left/processed
+    /image/right/processed
+    /Ego_topic
+"""
+```
+
 ## 1. File Structure
 ```
 E2E-OpenLoop-ROS-Validator/
