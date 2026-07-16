@@ -6,11 +6,13 @@ TFv6 / InterFuser / DiffusionDrive v2 / SparseDrive v2 에 대응
 ## 1. File Structure
 ```
 E2E-OpenLoop-ROS-Validator/
-└── src/
-    ├── MORAI-ROS_morai_msgs
-    └── Validator_pkg
+├── src/
+│   ├── MORAI-ROS_morai_msgs
+│   └── Validator_pkg
+└── rosbag/
 ```
 코드 파일은 Validator_pkg 밑에 둘 것.
+`rosbag/`에 [2026-07-16-17-13-14.bag](https://drive.google.com/drive/folders/1IBFk-q1ZYYRfLVi6TD8P2BgOuWAzudab?usp=share_link)저장.
 
 ## 2. Architecture
 ```mermaid
