@@ -3,6 +3,7 @@ build/
 devel/
 logs/
 .catkin_workspace
+rosbag/*.bag
 
 # (선택) catkin_tools 사용 시 생성되는 폴더 제외
 .build_tools/
