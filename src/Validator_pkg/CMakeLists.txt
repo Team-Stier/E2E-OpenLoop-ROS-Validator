@@ -9,10 +9,12 @@ project(Validator_pkg)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   cv_bridge
+  message_filters
   morai_msgs
   rospy
   sensor_msgs
   std_msgs
+  tf2_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -107,7 +109,7 @@ find_package(catkin REQUIRED COMPONENTS
 catkin_package(
 #  INCLUDE_DIRS include
 #  LIBRARIES Validator_pkg
-#  CATKIN_DEPENDS cv_bridge morai_msgs rospy sensor_msgs std_msgs
+  CATKIN_DEPENDS cv_bridge message_filters morai_msgs rospy sensor_msgs std_msgs tf2_msgs
 #  DEPENDS system_lib
 )
 
@@ -209,5 +211,14 @@ include_directories(
 
 catkin_install_python(PROGRAMS
   scripts/image_adaptor.py
+  scripts/camera_bev_stitcher.py
+  scripts/front_bev_processor.py
+  scripts/left_bev_processor.py
+  scripts/right_bev_processor.py
+  scripts/lidar_bev_processor.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(DIRECTORY config launch
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
