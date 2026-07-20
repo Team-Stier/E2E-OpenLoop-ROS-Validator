@@ -1,0 +1,15 @@
+std_msgs/Header header
+string run_id
+uint64 tick_index
+string model_id
+string outcome
+float64 elapsed_ms
+string[] input_keys
+float64[] input_age_ms
+string[] missing_input_keys
+string[] compatibility_flags
+uint32 history_count
+float64 history_span_ms
+uint64 rng_seed
+string profile_sha256
+string calibration_profile_sha256
