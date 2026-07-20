@@ -7,7 +7,7 @@ from validator_inference.profile_store import ProfileError, load_selected_profil
 
 @pytest.fixture
 def profile_path() -> Path:
-    return Path(__file__).parents[1] / "config" / "profile.json"
+    return Path(__file__).parents[2] / "config" / "profile.json"
 
 
 def test_selected_profile_has_stable_hashes(profile_path: Path):
