@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import sys
 from threading import RLock
@@ -51,6 +51,9 @@ class InferenceFrame:
 @dataclass(frozen=True)
 class NotReady:
     missing_input_keys: List[str]
+    input_age_ms: Dict[str, float] = field(default_factory=dict)
+    history_count: int = 0
+    history_span_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,22 @@ def _message_stamp_ns(message: Any) -> int:
         raise TypeError("message must provide header.stamp") from error
 
 
+def _ros_message_types() -> Dict[str, Any]:
+    """Import only the ROS message classes allowed by the profile contract."""
+    from geometry_msgs.msg import PointStamped
+    from sensor_msgs.msg import Image, PointCloud2
+    from tf2_msgs.msg import TFMessage
+    from validator_msgs.msg import DrivingFeature
+
+    return {
+        "sensor_msgs/Image": Image,
+        "sensor_msgs/PointCloud2": PointCloud2,
+        "geometry_msgs/PointStamped": PointStamped,
+        "validator_msgs/DrivingFeature": DrivingFeature,
+        "tf2_msgs/TFMessage": TFMessage,
+    }
+
+
 class InputBuffer:
     """Keep bounded input FIFOs and form stable causal snapshots."""
 
@@ -120,6 +139,128 @@ class InputBuffer:
                 + ", ".join(sorted(unknown_pose_keys))
             )
         self._lock = RLock()
+        self._subscribers: Tuple[Any, ...] = ()
+
+    @classmethod
+    def configure(
+        cls,
+        profile: Any,
+        *,
+        subscriber_factory: Any = None,
+    ) -> "InputBuffer":
+        """Build profile FIFOs and own every inference-layer subscription."""
+        data = getattr(profile, "data", profile)
+        required = list(data.get("required_inputs", ()))
+        requirements = data.get("buffer_requirements", {})
+        history_by_key = {
+            item["key"]: item
+            for item in requirements.get("history_inputs", ())
+        }
+
+        message_types = _ros_message_types()
+        specs: List[InputSpec] = []
+        seen_topics = set()
+        for declaration in required:
+            key = str(declaration["key"])
+            topic = str(declaration["topic"])
+            ros_type = str(declaration["ros_type"])
+            if ros_type not in message_types or ros_type == "tf2_msgs/TFMessage":
+                raise ValueError(
+                    "unsupported inference input ROS type: {}".format(ros_type)
+                )
+            if topic in seen_topics:
+                raise ValueError(
+                    "duplicate inference input subscription topic: {}".format(topic)
+                )
+            seen_topics.add(topic)
+            history = history_by_key.get(key)
+            fifo_depth = int(history["fifo_depth"]) if history else 2
+            history_count = fifo_depth if history else 1
+            specs.append(
+                InputSpec(key, topic, ros_type, fifo_depth, history_count)
+            )
+
+        unknown_history = set(history_by_key) - {spec.key for spec in specs}
+        if unknown_history:
+            raise ValueError(
+                "history input is not declared in required_inputs: "
+                + ", ".join(sorted(unknown_history))
+            )
+
+        pose_histories = {
+            key: TfPoseHistory(float(item["max_tf_bracket_gap_ms"]))
+            for key, item in history_by_key.items()
+            if item.get("paired_pose") or key == "lidar_raw"
+        }
+        buffer = cls(specs, pose_histories=pose_histories)
+
+        if subscriber_factory is None:
+            import rospy
+
+            subscriber_factory = rospy.Subscriber
+
+        subscribers = []
+        for spec in specs:
+            callback = lambda message, key=spec.key: buffer.store(key, message)
+            subscribers.append(
+                subscriber_factory(
+                    spec.topic,
+                    message_types[spec.ros_type],
+                    callback,
+                    queue_size=1,
+                )
+            )
+        if pose_histories:
+            subscribers.append(
+                subscriber_factory(
+                    "/tf",
+                    message_types["tf2_msgs/TFMessage"],
+                    buffer._store_tf_message,
+                    queue_size=1,
+                )
+            )
+        buffer._subscribers = tuple(subscribers)
+        return buffer
+
+    @property
+    def subscribers(self) -> Tuple[Any, ...]:
+        return self._subscribers
+
+    @property
+    def pose_histories(self) -> Dict[str, "TfPoseHistory"]:
+        return dict(self._pose_histories)
+
+    def latest_driving_feature_stamp(self) -> Optional[Any]:
+        with self._lock:
+            samples = self._samples.get("driving_feature", ())
+            if not samples:
+                return None
+            newest = max(samples, key=lambda sample: sample.stamp_ns)
+            return newest.message.header.stamp
+
+    def _store_tf_message(self, message: Any) -> None:
+        for transform in message.transforms:
+            parent = str(transform.header.frame_id).lstrip("/")
+            child = str(transform.child_frame_id).lstrip("/")
+            if parent != "map" or child != "base_link":
+                continue
+            value = transform.transform
+            pose = PoseSample(
+                _stamp_ns(transform.header.stamp),
+                (
+                    float(value.translation.x),
+                    float(value.translation.y),
+                    float(value.translation.z),
+                ),
+                (
+                    float(value.rotation.x),
+                    float(value.rotation.y),
+                    float(value.rotation.z),
+                    float(value.rotation.w),
+                ),
+            )
+            for history in self._pose_histories.values():
+                history.add(pose)
 
     def store(self, key: str, message: Any) -> None:
         if key not in self._specs:
@@ -159,9 +300,25 @@ class InputBuffer:
 
                 if spec.history_count > 1:
                     if len(causal) < spec.history_count:
+                        if causal:
+                            newest = causal[-1]
+                            input_age_ms[key] = _milliseconds(
+                                reference_ns - newest.stamp_ns
+                            )
+                            history_count = max(history_count, len(causal))
+                            history_span_ns = max(
+                                history_span_ns,
+                                causal[-1].stamp_ns - causal[0].stamp_ns,
+                            )
                         missing.append(f"{key} history({spec.history_count})")
                         continue
                     selected = causal[-spec.history_count :]
+                    newest = selected[-1]
+                    input_age_ms[key] = _milliseconds(
+                        reference_ns - newest.stamp_ns
+                    )
+                    history_count = len(selected)
+                    history_span_ns = selected[-1].stamp_ns - selected[0].stamp_ns
                     pose_history = self._pose_histories.get(key)
                     if pose_history is None:
                         if spec.ros_type == "sensor_msgs/PointCloud2":
@@ -193,12 +350,6 @@ class InputBuffer:
                             for sample, pose in zip(selected, poses)
                         ]
                     inputs[f"{key}_history"] = history_inputs
-                    newest = selected[-1]
-                    input_age_ms[key] = _milliseconds(
-                        reference_ns - newest.stamp_ns
-                    )
-                    history_count = len(selected)
-                    history_span_ns = selected[-1].stamp_ns - selected[0].stamp_ns
                     continue
 
                 if not causal:
@@ -209,7 +360,12 @@ class InputBuffer:
                 input_age_ms[key] = _milliseconds(reference_ns - selected.stamp_ns)
 
             if missing:
-                return NotReady(list(missing))
+                return NotReady(
+                    list(missing),
+                    input_age_ms=dict(input_age_ms),
+                    history_count=history_count,
+                    history_span_ms=_milliseconds(history_span_ns),
+                )
 
             return InferenceFrame(
                 reference_stamp=reference_stamp,
@@ -223,10 +379,13 @@ class InputBuffer:
 class TfPoseHistory:
     """Thread-safe timestamped pose history with bounded-gap interpolation."""
 
-    def __init__(self, max_bracket_gap_ms: float) -> None:
+    def __init__(self, max_bracket_gap_ms: float, max_samples: int = 256) -> None:
         if max_bracket_gap_ms < 0:
             raise ValueError("max_bracket_gap_ms must be nonnegative")
+        if max_samples < 2:
+            raise ValueError("max_samples must be at least two")
         self._max_bracket_gap_ns = int(max_bracket_gap_ms * 1_000_000)
+        self._max_samples = int(max_samples)
         self._poses: List[PoseSample] = []
         self._lock = RLock()
 
@@ -238,6 +397,13 @@ class TfPoseHistory:
                 self._poses[index] = pose
             else:
                 self._poses.insert(index, pose)
+            if len(self._poses) > self._max_samples:
+                del self._poses[: len(self._poses) - self._max_samples]
+
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return len(self._poses)
 
     def interpolate(self, stamp: Any) -> Optional[PoseSample]:
         requested_ns = _stamp_ns(stamp)

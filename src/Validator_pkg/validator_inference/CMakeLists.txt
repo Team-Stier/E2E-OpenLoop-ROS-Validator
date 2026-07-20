@@ -8,6 +8,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   sensor_msgs
   std_msgs
+  tf2_msgs
   tf2_ros
   validator_msgs
 )
@@ -22,6 +23,7 @@ catkin_package(
     rospy
     sensor_msgs
     std_msgs
+    tf2_msgs
     tf2_ros
     validator_msgs
 )
@@ -35,6 +37,10 @@ catkin_install_python(PROGRAMS scripts/recorder_node.py
 )
 
 catkin_install_python(PROGRAMS scripts/fetch_model_assets.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+catkin_install_python(PROGRAMS scripts/inference_engine_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
