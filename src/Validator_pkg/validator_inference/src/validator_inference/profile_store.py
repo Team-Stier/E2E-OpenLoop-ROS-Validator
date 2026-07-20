@@ -75,6 +75,9 @@ def load_selected_profile(
         raise ProfileError(f"unsupported model_id: {model_id}")
 
     selected = copy.deepcopy(profiles[model_id])
+    selected["static_transforms"] = copy.deepcopy(
+        payload["common_inference_policy"]["static_transforms"]
+    )
     calibration_hash = ""
     if model_id == "sparsedrive_v2":
         calibration = selected["static_runtime_inputs"]["camera_calibration"]

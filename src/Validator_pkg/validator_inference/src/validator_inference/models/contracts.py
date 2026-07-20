@@ -14,6 +14,10 @@ class ModelRuntimeError(RuntimeError):
     """A selected source/checkpoint runtime cannot be loaded or invoked."""
 
 
+class SourceRuntimeError(ModelRuntimeError):
+    """A pinned source or checkpoint violates its executable contract."""
+
+
 class ModelInputError(ValueError):
     """An inference frame violates the selected source model's input contract."""
 
@@ -106,9 +110,101 @@ def ros_image_to_chw(value: Any) -> Any:
     return np.ascontiguousarray(image.astype(dtype.newbyteorder("="), copy=False))
 
 
-def point_xy(value: Any, *, carla_y_right: bool) -> Any:
-    if hasattr(value, "point"):
-        x = float(value.point.x)
-        y = float(value.point.y)
-        return [x, -y if carla_y_right else y]
-    return value
+def model_target_xy(
+    value: Any, profile: dict[str, Any], *, carla_y_right: bool
+) -> Any:
+    """Convert a Lidar3D-4 PointStamped into source ego/base coordinates."""
+    if not hasattr(value, "point"):
+        return value
+    try:
+        declaration = profile["static_transforms"]["T_base_from_lidar"]
+        expected_frame = str(declaration["child_frame_id"])
+        observed_frame = str(value.header.frame_id)
+        translation = np.asarray(declaration["translation_m"], dtype=np.float64)
+        quaternion = tuple(float(item) for item in declaration["quaternion_xyzw"])
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise ModelInputError(
+            "model target conversion requires static_transforms.T_base_from_lidar"
+        ) from error
+    if observed_frame != expected_frame:
+        raise ModelInputError(
+            f"model target expected {expected_frame} frame, got {observed_frame}"
+        )
+    if translation.shape != (3,) or len(quaternion) != 4:
+        raise ModelInputError("T_base_from_lidar must contain translation[3] and quaternion[4]")
+    rotation = _quaternion_rotation_matrix(quaternion)
+    point_lidar = np.asarray(
+        [float(value.point.x), float(value.point.y), float(value.point.z)],
+        dtype=np.float64,
+    )
+    point_base = rotation @ point_lidar + translation
+    y = -point_base[1] if carla_y_right else point_base[1]
+    return [float(point_base[0]), float(y)]
+
+
+def _quaternion_rotation_matrix(quaternion_xyzw: tuple[float, ...]) -> np.ndarray:
+    x, y, z, w = quaternion_xyzw
+    norm = x * x + y * y + z * z + w * w
+    if norm <= np.finfo(float).eps:
+        raise ModelInputError("T_base_from_lidar quaternion must be nonzero")
+    scale = 2.0 / norm
+    return np.asarray(
+        [
+            [1 - scale * (y * y + z * z), scale * (x * y - z * w), scale * (x * z + y * w)],
+            [scale * (x * y + z * w), 1 - scale * (x * x + z * z), scale * (y * z - x * w)],
+            [scale * (x * z - y * w), scale * (y * z + x * w), 1 - scale * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def load_source_state_dict(
+    network: Any,
+    raw_state: dict[str, Any],
+    *,
+    model_id: str,
+    checkpoint_path: str | Path,
+    documented_prefixes: tuple[str, ...],
+) -> None:
+    """Normalize documented checkpoint prefixes and enforce an exact network match."""
+    normalized: dict[str, Any] = {}
+    for raw_key, value in raw_state.items():
+        key = str(raw_key)
+        for prefix in documented_prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix) :]
+                break
+        if key in normalized:
+            raise SourceRuntimeError(
+                f"model {model_id} checkpoint {checkpoint_path} has duplicate normalized key {key}"
+            )
+        normalized[key] = value
+
+    expected = set(network.state_dict())
+    observed = set(normalized)
+    matched = expected & observed
+    if not matched:
+        raise SourceRuntimeError(
+            f"model {model_id} checkpoint {checkpoint_path} has zero critical-key match; "
+            f"missing={sorted(expected)} unexpected={sorted(observed)}"
+        )
+    missing = sorted(expected - observed)
+    unexpected = sorted(observed - expected)
+    if missing or unexpected:
+        raise SourceRuntimeError(
+            f"model {model_id} checkpoint {checkpoint_path} incompatible: "
+            f"missing={missing} unexpected={unexpected}"
+        )
+    try:
+        incompatibility = network.load_state_dict(normalized, strict=True)
+    except Exception as error:
+        raise SourceRuntimeError(
+            f"model {model_id} checkpoint {checkpoint_path} strict load failed: {error}"
+        ) from error
+    missing_after = list(getattr(incompatibility, "missing_keys", ()))
+    unexpected_after = list(getattr(incompatibility, "unexpected_keys", ()))
+    if missing_after or unexpected_after:
+        raise SourceRuntimeError(
+            f"model {model_id} checkpoint {checkpoint_path} strict load incompatible: "
+            f"missing={missing_after} unexpected={unexpected_after}"
+        )

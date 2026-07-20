@@ -97,6 +97,9 @@ def test_tfv6_requires_exactly_ten_past_sweeps():
 
 
 def test_tfv6_ten_sweep_history_is_chronological_with_count_and_span():
+    poses = TfPoseHistory(max_bracket_gap_ms=120)
+    for index in range(10):
+        poses.add(transform_at(index * 0.1))
     buffer = InputBuffer(
         [
             InputSpec(
@@ -106,7 +109,8 @@ def test_tfv6_ten_sweep_history_is_chronological_with_count_and_span():
                 10,
                 history_count=10,
             )
-        ]
+        ],
+        pose_histories={"lidar_raw": poses},
     )
     for index in reversed(range(10)):
         buffer.store("lidar_raw", stamped(index, index * 0.1))
@@ -114,9 +118,9 @@ def test_tfv6_ten_sweep_history_is_chronological_with_count_and_span():
     frame = buffer.snapshot_at(time_from_sec(1.0), ["lidar_raw"])
 
     assert isinstance(frame, InferenceFrame)
-    assert [message.value for message in frame.inputs["lidar_raw_history"]] == list(
-        range(10)
-    )
+    assert [
+        sample.point_cloud.value for sample in frame.inputs["lidar_raw_history"]
+    ] == list(range(10))
     assert frame.history_count == 10
     assert frame.history_span_ms == 900.0
     assert frame.input_age_ms["lidar_raw"] == 100.0

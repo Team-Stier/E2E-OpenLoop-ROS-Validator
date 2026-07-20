@@ -283,6 +283,10 @@ class _TFv6Source:
 
     def build_temporal_lidar(self, history):
         assert len(history) == 10
+        assert all(hasattr(item, "point_cloud") for item in history)
+        assert all(
+            hasattr(item, "T_anchor_lidar_from_sweep_lidar") for item in history
+        )
         return "source-rasterized-history"
 
     def forward(self, data):
@@ -298,7 +302,13 @@ def test_tfv6_forward_uses_history_and_has_no_radar_model_input(tmp_path):
         _frame(
             {
                 "camera_main": "panorama",
-                "lidar_raw_history": list(range(10)),
+                "lidar_raw_history": [
+                    SimpleNamespace(
+                        point_cloud=f"cloud-{index}",
+                        T_anchor_lidar_from_sweep_lidar=np.eye(4),
+                    )
+                    for index in range(10)
+                ],
                 "driving_feature": feature,
                 "route_target_point_previous": "previous",
                 "route_target_point": "current",
@@ -324,7 +334,13 @@ def test_tfv6_rejects_nonempty_radar_and_short_history(tmp_path):
     }
     with pytest.raises(ModelInputError, match=r"tfv6.*lidar_raw_history.*10"):
         model.forward(_frame(base))
-    base["lidar_raw_history"] = list(range(10))
+    base["lidar_raw_history"] = [
+        SimpleNamespace(
+            point_cloud=f"cloud-{index}",
+            T_anchor_lidar_from_sweep_lidar=np.eye(4),
+        )
+        for index in range(10)
+    ]
     base["driving_feature"] = _driving(
         [0, 0, 0, 1, 0, 0, 7.0], radar=[0.0], rows=1, cols=1
     )
@@ -469,7 +485,7 @@ def test_sparsedrive_builds_left_front_right_projection_conditions(tmp_path):
         np.asarray(left_calibration.t_lidar_from_camera).reshape(4, 4)
     )
     source_resize_crop = np.asarray(
-        [[0.8, 0.0, 0.0], [0.0, 0.8, -128.0], [0.0, 0.0, 1.0]]
+        [[0.8, 0.0, 0.0], [0.0, 0.6, -32.0], [0.0, 0.0, 1.0]]
     )
     np.testing.assert_allclose(
         camera_feature["projection_mat"][0],

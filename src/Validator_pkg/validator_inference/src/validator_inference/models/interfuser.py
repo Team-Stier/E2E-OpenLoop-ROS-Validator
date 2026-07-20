@@ -10,7 +10,7 @@ from validator_inference.assets import source_checkout_path, verify_runtime_asse
 from validator_inference.models.contracts import (
     ModelPrediction,
     ModelRuntimeError,
-    point_xy,
+    model_target_xy,
     prepend_source_path,
     require_module_from_checkout,
     require_inputs,
@@ -122,7 +122,11 @@ class InterFuserModel:
             "rgb_center": image(center),
             "lidar": image(lidar),
             "measurements": vector(status),
-            "target_point": vector(point_xy(target, carla_y_right=True)),
+            "target_point": vector(
+                model_target_xy(
+                    target, self.selected_profile.data, carla_y_right=True
+                )
+            ),
         }
         output = runtime.forward(data)
         if not isinstance(output, (tuple, list)) or len(output) < 2:

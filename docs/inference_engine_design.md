@@ -243,6 +243,8 @@ SelectedModel은 runtime에 선택된 concrete object를 뜻할 뿐 interface/ad
 
 - first 10 LiDAR sweep 구간은 not_ready이며 CSV에 남긴다. 임의 history padding을 하지 않는다.
 - 이후 history의 stale sweep은 사용하고 age/history span을 기록한다.
+- 각 chronological PointCloud2는 해당 stamp의 map -> base_link pose와 결합되고, newest causal sweep 기준 `T_anchor_lidar_from_sweep_lidar`를 가진다. pose가 없거나 120 ms bracket 제한을 넘으면 해당 tick은 not_ready다.
+- model boundary는 ROS-native PointCloud2 reader로 finite xyz를 decode하고 sweep을 anchor에 정렬한다. 그 뒤 CARLA y-right 변환, LEAD source의 0.1 m x/y/z quantization, `rasterize_lidar`, 16-bit PNG `compress_float_image`/`decompress_float_image` 순서를 그대로 적용한다.
 - `model_id=tfv6`는 공식 Hugging Face `noradar_resnet34` config와 `model_0030_1.pth`, `model_0030_2.pth` ensemble을 사용한다. config의 `use_radar_detection=false` 경로에서는 pinned `OpenLoopInference`가 radar feature를 만들거나 읽지 않는다.
 - 소스는 public `cvpr2026` branch의 검증된 checkpoint-compatible pin `730bc1a2f44d5f28312dd55f0ca958e94a24c038`이다. Hugging Face config가 private training commit SHA까지 제공하는 것은 아니므로 그 provenance를 주장하지 않는다.
 - OptFeederNode는 `DrivingFeature.tfv6_radar`를 빈 vector, rows=0, cols=0으로 발행한다. synthetic radar와 compatibility flag는 생성하지 않는다. ROS message의 optional radar fields는 향후 checkpoint 호환성을 위해 유지한다.
@@ -264,7 +266,7 @@ distortion_coefficients
 T_lidar_from_camera_4x4
 ~~~
 
-runtime은 T_camera_from_lidar = inverse(T_lidar_from_camera)를 만들고, undistortion 후 원본 source resize/crop matrix A_resize_crop를 적용해 lidar2img = A_resize_crop * K_original * T_camera_from_lidar[:3,:]를 구성한다. calibration이 하나라도 비어 있으면 SparseDrive만 not_ready다.
+runtime은 T_camera_from_lidar = inverse(T_lidar_from_camera)를 만들고, 원본 source resize/crop matrix A_resize_crop를 적용해 lidar2img = A_resize_crop * K_original * T_camera_from_lidar[:3,:]를 구성한다. 고정 source geometry는 raw image를 1920x1080-equivalent로 놓은 뒤 512x288로 resize하고 (x=0, y=32, w=512, h=256)으로 crop한다. 이 pinned source path는 distortion metadata를 보관하지만 image undistortion이나 계수 적용을 수행하지 않는다. calibration이 하나라도 비어 있으면 SparseDrive만 not_ready다.
 
 ### 6.4 output frame 변환
 
@@ -286,6 +288,8 @@ p_lidar = inverse(T_base_from_lidar) * p_base
 | SparseDrive V2 | NAVSIM status[8], validated inline calibration | STRAIGHT |
 
 모든 temporary route point는 Lidar3D-4 frame에서 발행한다. status feature의 source는 fallback으로 명시한다.
+
+CARLA 계열 TFv6/InterFuser에 target을 넣을 때는 profile에 기록된 `T_base_from_lidar`를 먼저 적용한다. 이 bag의 고정 transform은 parent=base_link, child=Lidar3D-4, translation=[2,0,1.5] m, quaternion=[0,0,0,1]이다. 따라서 5/15/30 m fallback은 회전이 identity인 현재 bag에서 base x=7/17/32 m가 된 다음 CARLA y-right 부호 변환을 거친다.
 
 ## 8. ROS message와 code-level 경계
 

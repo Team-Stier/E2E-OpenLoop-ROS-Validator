@@ -5,14 +5,16 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import numpy as np
 
 from validator_inference.assets import source_checkout_path, verify_runtime_assets
 from validator_inference.models.contracts import (
     ModelInputError,
     ModelPrediction,
     ModelRuntimeError,
-    point_xy,
+    model_target_xy,
     prepend_source_path,
     require_module_from_checkout,
     require_inputs,
@@ -25,6 +27,59 @@ SOURCE_SYMBOL = "lead.inference.open_loop_inference.OpenLoopInference.forward"
 TEMPORAL_LIDAR_SYMBOL = "lead.data_loader.carla_dataset_utils.rasterize_lidar"
 
 
+def prepare_tfv6_temporal_lidar(
+    history: list[Any],
+    *,
+    training_config: Any,
+    point_precision_xyz: tuple[float, float, float],
+    read_points: Callable[..., Any],
+    rasterize_lidar: Callable[..., Any],
+    compress_float_image: Callable[..., Any],
+    decompress_float_image: Callable[..., Any],
+) -> np.ndarray:
+    """Reproduce LEAD SensorAgent's temporal LiDAR fidelity path."""
+    merged = []
+    for item in history:
+        point_cloud = getattr(item, "point_cloud", None)
+        transform = getattr(
+            item, "T_anchor_lidar_from_sweep_lidar", None
+        )
+        if point_cloud is None or transform is None:
+            raise ModelRuntimeError(
+                "model tfv6 temporal LiDAR requires point_cloud and "
+                "T_anchor_lidar_from_sweep_lidar for every sweep"
+            )
+        points = np.asarray(
+            list(
+                read_points(
+                    point_cloud,
+                    field_names=("x", "y", "z"),
+                    skip_nans=True,
+                )
+            ),
+            dtype=np.float32,
+        )
+        if points.size == 0:
+            points = np.zeros((0, 3), dtype=np.float32)
+        else:
+            points = points.reshape(-1, 3)
+            points = points[np.isfinite(points).all(axis=1)]
+        matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
+        homogeneous = np.concatenate(
+            [points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1
+        )
+        aligned = (matrix @ homogeneous.T).T[:, :3].astype(np.float32)
+        aligned[:, 1] *= -1.0
+        merged.append(aligned)
+
+    points = np.concatenate(merged, axis=0)
+    for axis, precision in enumerate(point_precision_xyz):
+        points[:, axis] = np.round(points[:, axis] / precision) * precision
+    raster = rasterize_lidar(config=training_config, lidar=points)[..., None]
+    compressed = compress_float_image(raster, training_config)
+    return np.asarray(decompress_float_image(compressed), dtype=np.float32).squeeze()
+
+
 class _LeadOpenLoopRuntime:
     def __init__(self, profile: dict[str, Any], project_root: Path) -> None:
         checkout = source_checkout_path(profile, project_root)
@@ -35,6 +90,9 @@ class _LeadOpenLoopRuntime:
             open_config_module = importlib.import_module("lead.inference.config_open_loop")
             inference_module = importlib.import_module("lead.inference.open_loop_inference")
             lidar_module = importlib.import_module("lead.data_loader.carla_dataset_utils")
+            cache_module = importlib.import_module("lead.data_loader.training_cache")
+            expert_config_module = importlib.import_module("lead.expert.config_expert")
+            point_cloud_module = importlib.import_module("sensor_msgs.point_cloud2")
             require_module_from_checkout(inference_module, checkout, SOURCE_SYMBOL)
             require_module_from_checkout(lidar_module, checkout, TEMPORAL_LIDAR_SYMBOL)
         except Exception as error:
@@ -59,6 +117,15 @@ class _LeadOpenLoopRuntime:
         self._torch = torch
         self._training_config = training_config
         self._rasterize_lidar = lidar_module.rasterize_lidar
+        self._compress_float_image = cache_module.compress_float_image
+        self._decompress_float_image = cache_module.decompress_float_image
+        self._read_points = point_cloud_module.read_points
+        expert_config = expert_config_module.ExpertConfig()
+        self._point_precision_xyz = (
+            float(expert_config.point_precision_x),
+            float(expert_config.point_precision_y),
+            float(expert_config.point_precision_z),
+        )
         self._model = inference_module.OpenLoopInference(
             config_training=training_config,
             config_open_loop=open_config,
@@ -68,35 +135,15 @@ class _LeadOpenLoopRuntime:
         )
 
     def build_temporal_lidar(self, history: list[Any]) -> Any:
-        """Merge ten source-aligned sweeps and invoke LEAD's official rasterizer.
-
-        Each engine history item must be an ``(points_xyz, T_anchor_from_sweep)``
-        pair, or expose those names.  This keeps the source transform explicit and
-        prevents silently treating ten differently posed sweeps as one cloud.
-        """
-        np = importlib.import_module("numpy")
-        merged = []
-        for item in history:
-            if isinstance(item, tuple) and len(item) == 2:
-                points, transform = item
-            else:
-                points = getattr(item, "points_xyz", None)
-                transform = getattr(item, "t_anchor_from_sweep", None)
-            if points is None or transform is None:
-                raise ModelRuntimeError(
-                    "model tfv6 temporal LiDAR requires each lidar_raw_history item "
-                    "to carry points_xyz and T_anchor_from_sweep"
-                )
-            xyz = np.asarray(points, dtype=np.float32)[:, :3]
-            matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
-            homogeneous = np.concatenate(
-                [xyz, np.ones((xyz.shape[0], 1), dtype=xyz.dtype)], axis=1
-            )
-            aligned = (matrix @ homogeneous.T).T[:, :3]
-            aligned[:, 1] *= -1.0
-            merged.append(aligned)
-        points = np.concatenate(merged, axis=0)
-        raster = self._rasterize_lidar(self._training_config, points)
+        raster = prepare_tfv6_temporal_lidar(
+            history,
+            training_config=self._training_config,
+            point_precision_xyz=self._point_precision_xyz,
+            read_points=self._read_points,
+            rasterize_lidar=self._rasterize_lidar,
+            compress_float_image=self._compress_float_image,
+            decompress_float_image=self._decompress_float_image,
+        )
         return self._torch.as_tensor(raster, dtype=self._torch.float32, device="cuda")[
             None, None
         ]
@@ -188,9 +235,15 @@ class TFv6Model:
 
         image_convert = getattr(runtime, "image_tensor", None)
         vector_convert = getattr(runtime, "batch_vector", None)
-        previous_target = point_xy(previous_target, carla_y_right=True)
-        current_target = point_xy(current_target, carla_y_right=True)
-        next_target = point_xy(next_target, carla_y_right=True)
+        previous_target = model_target_xy(
+            previous_target, self.selected_profile.data, carla_y_right=True
+        )
+        current_target = model_target_xy(
+            current_target, self.selected_profile.data, carla_y_right=True
+        )
+        next_target = model_target_xy(
+            next_target, self.selected_profile.data, carla_y_right=True
+        )
 
         data = {
             "rgb": image_convert(camera) if image_convert else camera,

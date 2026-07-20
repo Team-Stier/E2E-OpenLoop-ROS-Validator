@@ -26,7 +26,14 @@
       "frame_id": "Lidar3D-4",
       "fields": ["x", "y", "z", "intensity"],
       "median_period_ms": 107.0,
-      "static_base_link_to_lidar_translation_m": [2.0, 0.0, 1.5]
+      "static_base_link_to_lidar_translation_m": [2.0, 0.0, 1.5],
+      "static_transform": {
+        "name": "T_base_from_lidar",
+        "parent_frame_id": "base_link",
+        "child_frame_id": "Lidar3D-4",
+        "translation_m": [2.0, 0.0, 1.5],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
+      }
     },
     "cameras": {
       "front": {"frame_id": "Camera-1", "resolution": [1280, 720], "median_period_ms": 49.0},
@@ -49,6 +56,14 @@
       "ros_path_frame": "Lidar3D-4",
       "model_output_to_lidar_frame": "First convert the model ego coordinates to ROS base_link coordinates. The bag TF is T_base_from_lidar (base_link parent, Lidar3D-4 child); publish p_lidar = inverse(T_base_from_lidar) * p_base in Lidar3D-4.",
       "no_global_route_frame": true
+    },
+    "static_transforms": {
+      "T_base_from_lidar": {
+        "parent_frame_id": "base_link",
+        "child_frame_id": "Lidar3D-4",
+        "translation_m": [2.0, 0.0, 1.5],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
+      }
     },
     "main_loop": {
       "rate_hz": 10.0,
@@ -205,7 +220,7 @@
         {"role": "velocity_vocabulary", "path": "models/sparsedrive_v2/navsim_v2/velocity_256.npy", "source_path": "velocity_256.npy", "sha256": "acfaa8699401a20283c2744f7ea4beb4f8c734f3a3f145ca0366a3ba6abae2ee"},
         {"role": "trajectory_vocabulary", "path": "models/sparsedrive_v2/navsim_v2/trajectory_1024_256.npz", "source_path": "trajectory_1024_256.npz", "sha256": "94868f922fcd7ac3a027057476ddf630948c908053fec483d8936e84b2ad8683"}
       ],
-      "static_runtime_inputs": {"camera_calibration": {"source": "profile_inline", "lidar_frame_id": "Lidar3D-4", "projection_contract": "For each camera fill K_original_3x3, distortion_model, distortion_coefficients, and T_lidar_from_camera_4x4. At runtime compute T_camera_from_lidar = inverse(T_lidar_from_camera), then lidar2img = A_resize_crop * K_original * T_camera_from_lidar[:3,:]. Distortion is removed according to the supplied model before the resize/crop image transform.", "cameras": [{"name": "front", "frame_id": "Camera-1", "image_size_px": [1280, 720], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "left", "frame_id": "Camera-2", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "right", "frame_id": "Camera-3", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}]}},
+      "static_runtime_inputs": {"camera_calibration": {"source": "profile_inline", "lidar_frame_id": "Lidar3D-4", "projection_contract": "For each camera fill K_original_3x3, distortion_model, distortion_coefficients, and T_lidar_from_camera_4x4. At runtime compute T_camera_from_lidar = inverse(T_lidar_from_camera), then lidar2img = A_resize_crop * K_original * T_camera_from_lidar[:3,:]. The pinned SparseDrive source records distortion metadata but does not undistort images or consume those coefficients in its selected inference path.", "cameras": [{"name": "front", "frame_id": "Camera-1", "image_size_px": [1280, 720], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "left", "frame_id": "Camera-2", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "right", "frame_id": "Camera-3", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}]}},
       "buffer_requirements": {"latest_inputs": ["camera_left", "camera_main", "camera_right", "driving_feature"], "history_inputs": []},
       "required_inputs": [
         {"key": "camera_left", "topic": "/image/sparsedrive_v2/left", "ros_type": "sensor_msgs/Image", "preprocess_contract": "cam_l0 RGB, resize 1920x1080-equivalent to 512x288, center crop (0,32,512,288), final 256x512, mean=[123.675,116.28,103.53], std=[58.395,57.12,57.375]."},

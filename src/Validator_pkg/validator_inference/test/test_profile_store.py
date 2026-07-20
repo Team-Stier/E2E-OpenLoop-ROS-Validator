@@ -15,6 +15,12 @@ def test_selected_profile_has_stable_hashes(profile_path: Path):
     assert selected.model_id == "tfv6"
     assert len(selected.profile_sha256) == 64
     assert selected.calibration_profile_sha256 == ""
+    assert selected.data["static_transforms"]["T_base_from_lidar"] == {
+        "parent_frame_id": "base_link",
+        "child_frame_id": "Lidar3D-4",
+        "translation_m": [2.0, 0.0, 1.5],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
 
 
 def test_tfv6_profile_pins_official_noradar_checkpoint_contract(profile_path: Path):

@@ -44,7 +44,9 @@ The anchor shape is (20, 8, 2), dtype float64 in the source file, and the model 
 | command/speed | CARLA command one-hot [LEFT, RIGHT, STRAIGHT, LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT] plus forward speed m/s | OptFeederNode |
 | route | previous/current/next ego-local points | OptFeederNode |
 
-The LiDAR raster uses x=[-32,64] m, y=[-40,40] m, 4 pixels/m, occupancy clip=5. Ten sweeps are transformed through the pose history to the newest causal anchor. ROS y-left is converted to the checkpoint's CARLA y-right before rasterization.
+The LiDAR raster uses x=[-32,64] m, y=[-40,40] m, 4 pixels/m, occupancy clip=5. InputBuffer pairs each of the ten chronological PointCloud2 messages with `T_anchor_lidar_from_sweep_lidar`, computed from the interpolated map-to-base poses against the newest causal anchor; a missing pose is `not_ready`. The TFv6 source boundary decodes finite `(x,y,z)` with ROS `sensor_msgs.point_cloud2.read_points`, aligns each sweep, changes ROS y-left to CARLA y-right, rounds x/y/z to the pinned LEAD 0.1 m point precision, calls LEAD `rasterize_lidar`, and applies LEAD's 16-bit PNG `compress_float_image`/`decompress_float_image` round-trip before tensor conversion.
+
+Fallback route points remain published in `Lidar3D-4`. Before TFv6 forward they are transformed by the recorded `T_base_from_lidar` (`base_link` parent, `Lidar3D-4` child, translation `[2,0,1.5]`, quaternion `[0,0,0,1]`) and only then converted to CARLA y-right coordinates.
 
 ### 3.2 Official no-radar contract
 
@@ -70,7 +72,7 @@ Native prediction is eight ego-relative waypoint points at 0.25 s intervals. Fir
 | status | B×7: CARLA command[6] and forward speed | OptFeederNode |
 | target point | B×2 CARLA ego-local route point | OptFeederNode |
 
-Image tensors use the official resize/crop and ImageNet normalization. The LiDAR histogram uses original CARLA-space bounds x=[-28,28], y=[-28,0], 8 pixels/m, clip=5. InterFuser requires no temporal FIFO and outputs ten ego-relative waypoints.
+Image tensors use the official resize/crop and ImageNet normalization. The LiDAR histogram uses original CARLA-space bounds x=[-28,28], y=[-28,0], 8 pixels/m, clip=5. The `Lidar3D-4` target point is transformed by the same recorded `T_base_from_lidar` before the CARLA y sign change. InterFuser requires no temporal FIFO and outputs ten ego-relative waypoints.
 
 ### 4.2 Current-bag compatibility
 
@@ -121,6 +123,8 @@ SparseDrive's projection matrices are model conditions. They are not concatenate
 ### 6.2 Inline calibration schema
 
 Only the selected SparseDrive profile carries calibration. The user fills each camera's K_original_3x3, distortion model/coefficients, and T_lidar_from_camera_4x4.
+
+The pinned SparseDrive inference builder keeps distortion model/coefficients as calibration metadata but does not undistort the selected camera images or consume those coefficients. Projection uses the raw-image intrinsic composed with the source 1920x1080-equivalent -> 512x288 -> crop `(0,32,512,256)` geometry.
 
 ~~~text
 T_camera_from_lidar = inverse(T_lidar_from_camera)

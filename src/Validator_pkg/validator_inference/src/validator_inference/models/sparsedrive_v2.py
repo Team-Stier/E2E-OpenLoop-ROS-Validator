@@ -13,6 +13,8 @@ from validator_inference.models.contracts import (
     ModelInputError,
     ModelPrediction,
     ModelRuntimeError,
+    SourceRuntimeError,
+    load_source_state_dict,
     prepend_source_path,
     require_module_from_checkout,
     require_inputs,
@@ -27,16 +29,16 @@ FINAL_IMAGE_WH = (512.0, 256.0)
 
 
 def _resize_crop_matrix(width: int, height: int) -> np.ndarray:
-    final_width, final_height = FINAL_IMAGE_WH
-    resize = max(final_height / float(height), final_width / float(width))
-    resized_width = int(width * resize)
-    resized_height = int(height * resize)
-    crop_x = int(max(0, resized_width - final_width) / 2)
-    # SparseDriveFeatureBuilder uses bot_pct_lim=(0, 0): keep the bottom of
-    # the resized image and remove the full vertical excess from the top.
-    crop_y = int(max(0, resized_height - final_height))
+    if width <= 0 or height <= 0:
+        raise ModelInputError("SparseDrive image dimensions must be positive")
+    # The pinned builder is configured for a 1920x1080 canonical image,
+    # resizes that canvas to 512x288, then crops y=[32, 288].  Preprocess
+    # supplies each raw camera in that canonical geometry, so compose both
+    # stages instead of applying an aspect-preserving resize to raw pixels.
+    scale_x = 512.0 / float(width)
+    scale_y = 288.0 / float(height)
     return np.asarray(
-        [[resize, 0.0, -crop_x], [0.0, resize, -crop_y], [0.0, 0.0, 1.0]],
+        [[scale_x, 0.0, 0.0], [0.0, scale_y, -32.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
 
@@ -123,20 +125,20 @@ class _SparseDriveNetworkRuntime:
             network = model_module.SparseDriveModel(config)
             checkpoint = torch.load(str(roles["checkpoint"]), map_location="cpu")
             raw_state = checkpoint.get("state_dict", checkpoint)
-            state = {}
-            for key, value in raw_state.items():
-                for prefix in (
+            load_source_state_dict(
+                network,
+                raw_state,
+                model_id="sparsedrive_v2",
+                checkpoint_path=roles["checkpoint"],
+                documented_prefixes=(
                     "agent._sparsedrive_model.",
                     "_sparsedrive_model.",
-                    "agent.",
-                ):
-                    if key.startswith(prefix):
-                        key = key[len(prefix) :]
-                        break
-                state[key] = value
-            network.load_state_dict(state, strict=False)
+                ),
+            )
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             network.to(device).eval()
+        except SourceRuntimeError:
+            raise
         except Exception as error:
             raise ModelRuntimeError(
                 f"model sparsedrive_v2 cannot load {SOURCE_SYMBOL} from {checkout}: "

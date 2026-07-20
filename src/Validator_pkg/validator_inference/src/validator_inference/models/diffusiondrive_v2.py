@@ -14,6 +14,8 @@ from validator_inference.assets import (
 from validator_inference.models.contracts import (
     ModelPrediction,
     ModelRuntimeError,
+    SourceRuntimeError,
+    load_source_state_dict,
     prepend_source_path,
     require_module_from_checkout,
     require_inputs,
@@ -38,8 +40,16 @@ class _DiffusionDriveSelectorRuntime:
                 "run fetch_model_assets.py"
             )
         derivative_text = derivative.read_text(encoding="utf-8")
-        forbidden_imports = ("pdm_planner", "ProcessPoolExecutor(", "navsim.evaluate.pdm_score")
-        present = [token for token in forbidden_imports if token in derivative_text]
+        forbidden_tokens = (
+            "pdm_planner",
+            "navsim.evaluate.pdm_score",
+            "ProcessPoolExecutor",
+            "_pdm_pool",
+            "metric_cache",
+            "get_pdm_score_para",
+            "reward_dict",
+        )
+        present = [token for token in forbidden_tokens if token in derivative_text]
         if present:
             raise ModelRuntimeError(
                 f"model diffusiondrive_v2 derivative {derivative} contains forbidden "
@@ -70,20 +80,20 @@ class _DiffusionDriveSelectorRuntime:
             network = model_module.V2TransfuserModel(config)
             checkpoint = torch.load(str(roles["checkpoint"]), map_location="cpu")
             raw_state = checkpoint.get("state_dict", checkpoint)
-            state = {}
-            for key, value in raw_state.items():
-                for prefix in (
+            load_source_state_dict(
+                network,
+                raw_state,
+                model_id="diffusiondrive_v2",
+                checkpoint_path=roles["checkpoint"],
+                documented_prefixes=(
                     "agent._transfuser_model.",
                     "_transfuser_model.",
-                    "agent.",
-                ):
-                    if key.startswith(prefix):
-                        key = key[len(prefix) :]
-                        break
-                state[key] = value
-            network.load_state_dict(state, strict=False)
+                ),
+            )
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             network.to(device).eval()
+        except SourceRuntimeError:
+            raise
         except Exception as error:
             raise ModelRuntimeError(
                 f"model diffusiondrive_v2 cannot load {SOURCE_SYMBOL} from {checkout}: "

@@ -10,6 +10,8 @@ import sys
 from threading import RLock
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
+
 try:
     from tf.transformations import quaternion_slerp
 except ModuleNotFoundError as error:
@@ -58,6 +60,14 @@ class PoseSample:
     quaternion_xyzw: Tuple[float, float, float, float]
 
 
+@dataclass(frozen=True)
+class AlignedPointCloudSweep:
+    """One stamped cloud plus its rigid alignment into the newest sweep."""
+
+    point_cloud: Any
+    T_anchor_lidar_from_sweep_lidar: np.ndarray
+
+
 def _stamp_ns(stamp: Any) -> int:
     """Return integer nanoseconds from rospy.Time-compatible values."""
     to_nsec = getattr(stamp, "to_nsec", None)
@@ -81,7 +91,12 @@ def _message_stamp_ns(message: Any) -> int:
 class InputBuffer:
     """Keep bounded input FIFOs and form stable causal snapshots."""
 
-    def __init__(self, specs: Iterable[InputSpec]) -> None:
+    def __init__(
+        self,
+        specs: Iterable[InputSpec],
+        *,
+        pose_histories: Optional[Dict[str, "TfPoseHistory"]] = None,
+    ) -> None:
         spec_list = list(specs)
         if any(spec.fifo_depth < 1 for spec in spec_list):
             raise ValueError("fifo_depth must be positive")
@@ -97,6 +112,13 @@ class InputBuffer:
         self._samples: Dict[str, Deque[StampedSample]] = {
             key: deque() for key in self._specs
         }
+        self._pose_histories = dict(pose_histories or {})
+        unknown_pose_keys = set(self._pose_histories) - set(self._specs)
+        if unknown_pose_keys:
+            raise ValueError(
+                "pose history keys must name configured inputs: "
+                + ", ".join(sorted(unknown_pose_keys))
+            )
         self._lock = RLock()
 
     def store(self, key: str, message: Any) -> None:
@@ -140,9 +162,37 @@ class InputBuffer:
                         missing.append(f"{key} history({spec.history_count})")
                         continue
                     selected = causal[-spec.history_count :]
-                    inputs[f"{key}_history"] = [
-                        sample.message for sample in selected
-                    ]
+                    pose_history = self._pose_histories.get(key)
+                    if pose_history is None:
+                        if spec.ros_type == "sensor_msgs/PointCloud2":
+                            missing.append(f"{key} pose_history")
+                            continue
+                        history_inputs = [sample.message for sample in selected]
+                    else:
+                        poses = [
+                            pose_history.interpolate(sample.message.header.stamp)
+                            for sample in selected
+                        ]
+                        missing_pose_stamps = [
+                            sample.stamp_ns
+                            for sample, pose in zip(selected, poses)
+                            if pose is None
+                        ]
+                        if missing_pose_stamps:
+                            missing.extend(
+                                f"{key} pose@{stamp_ns}"
+                                for stamp_ns in missing_pose_stamps
+                            )
+                            continue
+                        anchor_from_map = np.linalg.inv(_pose_matrix(poses[-1]))
+                        history_inputs = [
+                            AlignedPointCloudSweep(
+                                sample.message,
+                                anchor_from_map @ _pose_matrix(pose),
+                            )
+                            for sample, pose in zip(selected, poses)
+                        ]
+                    inputs[f"{key}_history"] = history_inputs
                     newest = selected[-1]
                     input_age_ms[key] = _milliseconds(
                         reference_ns - newest.stamp_ns
@@ -221,3 +271,38 @@ class TfPoseHistory:
 
 def _milliseconds(nanoseconds: int) -> float:
     return nanoseconds / 1_000_000.0
+
+
+def _pose_matrix(pose: PoseSample) -> np.ndarray:
+    """Return T_map_from_base for one interpolated pose."""
+    x, y, z, w = pose.quaternion_xyzw
+    norm = x * x + y * y + z * z + w * w
+    if norm <= np.finfo(float).eps:
+        raise ValueError("pose quaternion must be nonzero")
+    scale = 2.0 / norm
+    matrix = np.asarray(
+        [
+            [
+                1.0 - scale * (y * y + z * z),
+                scale * (x * y - z * w),
+                scale * (x * z + y * w),
+                0.0,
+            ],
+            [
+                scale * (x * y + z * w),
+                1.0 - scale * (x * x + z * z),
+                scale * (y * z - x * w),
+                0.0,
+            ],
+            [
+                scale * (x * z - y * w),
+                scale * (y * z + x * w),
+                1.0 - scale * (x * x + y * y),
+                0.0,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    matrix[:3, 3] = pose.translation_xyz
+    return matrix

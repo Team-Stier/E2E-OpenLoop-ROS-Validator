@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ SOURCE_DIRECTORY_NAMES = {
 DIFFUSION_DERIVATIVE_RELATIVE_PATH = Path(
     "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel_inference.py"
 )
+DIFFUSION_SOURCE_COMMIT = "1cd12a1e155c34dcc471261835444c8d5587580b"
 
 
 class AssetError(RuntimeError):
@@ -259,104 +261,247 @@ def _download_atomic(
             temporary.unlink()
 
 
-def _remove_exact_line_groups(text: str) -> str:
-    forbidden_imports = (
-        "from omegaconf import OmegaConf\n",
-        "from hydra.utils import instantiate\n",
-        "from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator\n",
-        "from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer\n",
-        "from navsim.evaluate.pdm_score import pdm_score, pdm_score_para\n",
-        "from navsim.common.dataclasses import Trajectory\n",
-        "import lzma\n",
-        "import pickle\n",
-        "import concurrent.futures as cf, cloudpickle, os\n",
-        "import multiprocessing as mp\n",
-        "from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import (\n    WeightedMetricIndex as WIdx,\n)\n",
-        "from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import MultiMetricIndex, WeightedMetricIndex\n",
-        "import joblib\n",
+def _source_segment(lines: list[str], node: ast.AST) -> str:
+    return "".join(lines[node.lineno - 1 : node.end_lineno])
+
+
+def _replace_original_line_ranges(
+    text: str, replacements: list[tuple[int, int, str]]
+) -> str:
+    lines = text.splitlines(keepends=True)
+    for start, end, replacement in sorted(replacements, reverse=True):
+        lines[start - 1 : end] = [replacement]
+    return "".join(lines)
+
+
+def _trajectory_head_derivative(
+    source_text: str, source_path: Path, tree: ast.Module
+) -> tuple[ast.ClassDef, str]:
+    lines = source_text.splitlines(keepends=True)
+    trajectory = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "TrajectoryHead"
+        ),
+        None,
     )
-    for item in forbidden_imports:
-        text = text.replace(item, "")
-    return text
+    if trajectory is None:
+        raise AssetError(f"DiffusionDrive V2 TrajectoryHead missing in {source_path}")
+    methods = {
+        node.name: node
+        for node in trajectory.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    required = {
+        "__init__",
+        "norm_odo",
+        "denorm_odo",
+        "_get_scorer_inputs",
+        "_select_topk",
+        "add_mul_noise",
+        "forward_test_rl",
+        "bezier_xyyaw",
+    }
+    if required - set(methods):
+        raise AssetError(
+            f"DiffusionDrive V2 derivative methods missing in {source_path}: "
+            f"{sorted(required - set(methods))}"
+        )
 
+    constructor = _source_segment(lines, methods["__init__"])
+    pdm_start = constructor.find("        # pdm score\n")
+    pdm_end = constructor.find("        self.loss_bce =", pdm_start)
+    vocab_start = constructor.find("        self.vocab_pdm_gt_path =")
+    if pdm_start < 0 or pdm_end < 0 or vocab_start < 0:
+        raise AssetError(
+            f"DiffusionDrive V2 pinned constructor markers changed in {source_path}"
+        )
+    constructor = constructor[:pdm_start] + constructor[pdm_end:vocab_start]
 
-def create_diffusiondrive_derivative(checkout: str | Path) -> Dict[str, str]:
-    """Create the pinned PDM-free SEL derivative beside its upstream module."""
-    checkout = Path(checkout)
-    source = checkout / "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel.py"
-    destination = checkout / DIFFUSION_DERIVATIVE_RELATIVE_PATH
-    if not source.is_file():
-        raise AssetError(f"DiffusionDrive V2 missing pinned source module: {source}")
-    text = source.read_text(encoding="utf-8")
-    text = _remove_exact_line_groups(text)
-
-    helper_start = text.find("def _pairwise_subscores")
-    class_start = text.find("class V2TransfuserModel")
-    if helper_start < 0 or class_start < 0 or helper_start >= class_start:
-        raise AssetError(f"DiffusionDrive V2 derivative markers missing in {source}")
-    text = text[:helper_start] + text[class_start:]
-
-    pdm_init_start = text.find("        # pdm score\n")
-    pdm_init_end = text.find("        self.loss_bce =", pdm_init_start)
-    if pdm_init_start < 0 or pdm_init_end < 0:
-        raise AssetError(f"DiffusionDrive V2 PDM constructor markers missing in {source}")
-    text = text[:pdm_init_start] + text[pdm_init_end:]
-
-    outer_signature = (
-        "    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, "
-        "eta=0.0, metric_cache=None, cal_pdm=True,token=None) -> Dict[str, torch.Tensor]:"
+    source_forward = _source_segment(lines, methods["forward_test_rl"])
+    signature_end = source_forward.find("\n")
+    source_forward = (
+        "    def forward_test_rl_without_pdm(self, ego_query,agents_query,bev_feature,"
+        "bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,"
+        "global_img,eta=1.0) -> Dict[str, torch.Tensor]:"
+        + source_forward[signature_end:]
     )
-    text = text.replace(
-        outer_signature,
-        "    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, eta=0.0) -> Dict[str, torch.Tensor]:",
-        1,
+    fine_start = source_forward.find("        loss_fine, final_fine_reward")
+    fine_end_marker = "        )\n"
+    fine_end = source_forward.find(fine_end_marker, fine_start)
+    if fine_start < 0 or fine_end < 0:
+        raise AssetError(
+            f"DiffusionDrive V2 pinned fine-selector markers changed in {source_path}"
+        )
+    fine_end += len(fine_end_marker)
+    fine_selection = '''        fine_best_idx_list = []
+        for feat in fine_traj_feature_list:
+            EP_score = self.fine_EP_head(feat).squeeze(-1)
+            NC_score = self.fine_NC_head(feat).squeeze(-1)
+            DAC_score = self.fine_DAC_head(feat).squeeze(-1)
+            TTC_score = self.fine_TTC_head(feat).squeeze(-1)
+            C_score = self.fine_C_head(feat).squeeze(-1)
+            final_fine_score = (
+                self.sigmoid(NC_score) * self.sigmoid(DAC_score) *
+                (5 * self.sigmoid(TTC_score) + 5 * self.sigmoid(EP_score) +
+                 2 * self.sigmoid(C_score)) / 12
+            )
+            fine_best_idx_list.append(torch.argmax(final_fine_score, dim=-1))
+'''
+    source_forward = (
+        source_forward[:fine_start] + fine_selection + source_forward[fine_end:]
     )
-    text = text.replace("targets=targets,global_img=None,eta=eta,metric_cache=metric_cache, cal_pdm=cal_pdm,token=token)", "targets=targets,global_img=None,eta=eta)", 1)
+    concat = "        traj_to_score = torch.cat(traj_to_score, dim=1)"
+    concat_start = source_forward.find(concat)
+    if concat_start < 0:
+        raise AssetError(
+            f"DiffusionDrive V2 pinned final-selector marker changed in {source_path}"
+        )
+    concat_end = source_forward.find("\n", concat_start) + 1
+    source_forward = (
+        source_forward[:concat_end]
+        + '        return {"trajectory": traj_to_score[:, -1]}\n'
+    )
 
-    head_forward_start = text.find(
-        "    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets=None,global_img=None,eta=0.0,metric_cache=None, cal_pdm=True, old_model=False,token=None)"
+    class_preamble = "".join(
+        lines[trajectory.lineno - 1 : methods["__init__"].lineno - 1]
     )
-    next_method = text.find("    def get_pdm_score_para", head_forward_start)
-    if head_forward_start < 0 or next_method < 0:
-        raise AssetError(f"DiffusionDrive V2 selector forward markers missing in {source}")
-    head_forward = '''    def forward(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, status_feature, camera_feature, targets=None, global_img=None, eta=0.0) -> Dict[str, torch.Tensor]:
-        """PDM-free open-loop selector forward."""
+    forward = '''    def forward(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, status_feature, camera_feature, targets=None, global_img=None, eta=0.0) -> Dict[str, torch.Tensor]:
         return self.forward_test_rl_without_pdm(
             ego_query, agents_query, bev_feature, bev_spatial_shape,
             status_encoding, status_feature, camera_feature, targets, global_img, eta
         )
 
 '''
-    text = text[:head_forward_start] + head_forward + text[next_method:]
+    retained = [
+        constructor,
+        _source_segment(lines, methods["norm_odo"]),
+        _source_segment(lines, methods["denorm_odo"]),
+        _source_segment(lines, methods["_get_scorer_inputs"]),
+        _source_segment(lines, methods["_select_topk"]),
+        _source_segment(lines, methods["add_mul_noise"]),
+        source_forward,
+        _source_segment(lines, methods["bezier_xyyaw"]),
+    ]
+    return trajectory, class_preamble + constructor + "\n" + forward + "\n".join(retained[1:])
 
-    test_signature = "    def forward_test_rl(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img,metric_cache,eta=1.0,token=None)"
+
+def create_diffusiondrive_derivative(checkout: str | Path) -> Dict[str, str]:
+    """Generate the version-pinned neural selector with evaluation code absent."""
+    checkout = Path(checkout)
+    try:
+        observed_commit = subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise AssetError(
+            f"DiffusionDrive V2 derivative requires a readable pinned checkout: {checkout}"
+        ) from error
+    if observed_commit != DIFFUSION_SOURCE_COMMIT:
+        raise AssetError(
+            f"DiffusionDrive V2 derivative requires commit {DIFFUSION_SOURCE_COMMIT}, "
+            f"observed {observed_commit} at {checkout}"
+        )
+
+    source = checkout / "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel.py"
+    destination = checkout / DIFFUSION_DERIVATIVE_RELATIVE_PATH
+    if not source.is_file():
+        raise AssetError(f"DiffusionDrive V2 missing pinned source module: {source}")
+    source_text = source.read_text(encoding="utf-8")
+    tree = ast.parse(source_text, filename=str(source))
+    lines = source_text.splitlines(keepends=True)
+    trajectory, trajectory_text = _trajectory_head_derivative(
+        source_text, source, tree
+    )
+
+    banned_modules = {
+        "omegaconf",
+        "hydra.utils",
+        "navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator",
+        "navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer",
+        "navsim.evaluate.pdm_score",
+        "navsim.common.dataclasses",
+        "lzma",
+        "pickle",
+        "concurrent.futures",
+        "multiprocessing",
+        "navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums",
+        "joblib",
+    }
+    removals: list[tuple[int, int, str]] = [
+        (trajectory.lineno, trajectory.end_lineno, trajectory_text)
+    ]
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and (node.module or "") in banned_modules:
+            removals.append((node.lineno, node.end_lineno, ""))
+        elif isinstance(node, ast.Import) and any(
+            alias.name in banned_modules for alias in node.names
+        ):
+            removals.append((node.lineno, node.end_lineno, ""))
+        elif isinstance(node, ast.FunctionDef) and node.name in {
+            "_pairwise_subscores",
+            "_pairwise_scores",
+            "_pdm_worker",
+            "_init_pool",
+        }:
+            removals.append((node.lineno, node.end_lineno, ""))
+    text = _replace_original_line_ranges(source_text, removals)
+
+    outer_signature = (
+        "    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, "
+        "eta=0.0, metric_cache=None, cal_pdm=True,token=None) -> Dict[str, torch.Tensor]:"
+    )
+    outer_call = (
+        "targets=targets,global_img=None,eta=eta,metric_cache=metric_cache, "
+        "cal_pdm=cal_pdm,token=token)"
+    )
+    if text.count(outer_signature) != 1 or text.count(outer_call) != 1:
+        raise AssetError(
+            f"DiffusionDrive V2 pinned outer-forward markers changed in {source}"
+        )
     text = text.replace(
-        test_signature,
-        "    def forward_test_rl_without_pdm(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img,eta=1.0)",
+        outer_signature,
+        "    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, eta=0.0) -> Dict[str, torch.Tensor]:",
+        1,
+    ).replace(
+        outer_call,
+        "targets=targets,global_img=None,eta=eta)",
         1,
     )
-    selector_marker = (
-        "        # for official eval\n"
-        "        # return {\"trajectory\": traj_to_score[:,-1]}\n"
-    )
-    selector_start = text.find(selector_marker)
-    selector_end = text.find("    def compute_diversity", selector_start)
-    if selector_start < 0 or selector_end < 0:
-        raise AssetError(f"DiffusionDrive V2 final selector markers missing in {source}")
-    text = (
-        text[:selector_start]
-        + "        return {\"trajectory\": traj_to_score[:, -1]}\n\n"
-        + text[selector_end:]
-    )
     header = (
-        '"""Generated PDM-free open-loop derivative.\n\n'
-        "Upstream commit is recorded by asset-manifest.json. Do not edit in place.\n"
+        '"""Generated evaluation-free open-loop derivative.\n\n'
+        f"Exact upstream commit: {DIFFUSION_SOURCE_COMMIT}. Do not edit in place.\n"
         '"""\n'
     )
-    destination.write_text(header + text, encoding="utf-8")
+    text = header + text
+    banned_tokens = (
+        "pdm_planner",
+        "navsim.evaluate.pdm_score",
+        "ProcessPoolExecutor",
+        "_pdm_pool",
+        "metric_cache",
+        "get_pdm_score_para",
+        "reward_dict",
+    )
+    present = [token for token in banned_tokens if token in text]
+    if present:
+        raise AssetError(
+            f"DiffusionDrive V2 derivative retained evaluation token(s): {present}"
+        )
+    try:
+        compile(text, str(destination), "exec")
+    except SyntaxError as error:
+        raise AssetError(
+            f"DiffusionDrive V2 generated derivative does not compile: {error}"
+        ) from error
+    destination.write_text(text, encoding="utf-8")
     return {
         "path": str(DIFFUSION_DERIVATIVE_RELATIVE_PATH),
         "sha256": sha256_file(destination),
+        "source_commit": observed_commit,
     }
 
 
