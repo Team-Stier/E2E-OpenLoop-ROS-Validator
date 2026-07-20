@@ -14,7 +14,8 @@ rosbag/*.bag
 records/openloop/*.csv
 
 # Downloaded model weights and their auxiliary binary assets
-/models/
+/models/*
+!/models/.gitkeep
 .coterm/
 __pycache__/
 
