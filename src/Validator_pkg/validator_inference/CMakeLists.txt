@@ -30,6 +30,10 @@ catkin_install_python(PROGRAMS scripts/opt_feeder_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+catkin_install_python(PROGRAMS scripts/recorder_node.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 catkin_install_python(PROGRAMS scripts/fetch_model_assets.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
