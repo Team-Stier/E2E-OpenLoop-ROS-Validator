@@ -19,6 +19,11 @@ _OUTPUT_FRAME = "Lidar3D-4"
 
 
 def _as_numpy(value: Any) -> np.ndarray:
+    """모델 tensor·목록을 검증된 2차원 numpy trajectory로 바꾼다.
+
+    입력: tensor, numpy 배열 또는 수치 sequence.
+    반환: batch 차원이 제거된 float64 numpy 배열.
+    """
     detach = getattr(value, "detach", None)
     if callable(detach):
         value = detach()
@@ -38,6 +43,11 @@ def _as_numpy(value: Any) -> np.ndarray:
 
 
 def _rotation_matrix(quaternion: Sequence[float]) -> np.ndarray:
+    """정규화 가능 여부를 검증해 quaternion의 3×3 회전 행렬을 만든다.
+
+    입력: ``[x, y, z, w]`` quaternion.
+    반환: Lidar와 base frame 변환에 쓰는 float64 회전 행렬.
+    """
     if len(quaternion) != 4:
         raise ValueError("T_base_from_lidar quaternion must have length 4")
     x, y, z, w = (float(item) for item in quaternion)
@@ -68,6 +78,11 @@ def _rotation_matrix(quaternion: Sequence[float]) -> np.ndarray:
 
 
 def _normalized_quaternion(quaternion: Sequence[float]) -> Tuple[float, ...]:
+    """유한한 quaternion을 단위 quaternion으로 정규화한다.
+
+    입력: ``[x, y, z, w]`` quaternion.
+    반환: 길이가 1인 ``(x, y, z, w)`` tuple.
+    """
     values = np.asarray(quaternion, dtype=np.float64)
     if values.shape != (4,) or not np.isfinite(values).all():
         raise ValueError("T_base_from_lidar quaternion must have four finite values")
@@ -80,6 +95,11 @@ def _normalized_quaternion(quaternion: Sequence[float]) -> Tuple[float, ...]:
 def _quaternion_product(
     left: Sequence[float], right: Sequence[float]
 ) -> Tuple[float, float, float, float]:
+    """두 ``xyzw`` quaternion을 Hamilton 곱으로 합성한다.
+
+    입력: 좌·우 회전을 나타내는 quaternion 두 개.
+    반환: 왼쪽 회전 뒤 오른쪽 회전을 적용한 quaternion.
+    """
     lx, ly, lz, lw = left
     rx, ry, rz, rw = right
     return (
@@ -91,7 +111,18 @@ def _quaternion_product(
 
 
 class PathMessageBuilder:
+    """모델의 ego trajectory를 ``Lidar3D-4`` 기준 ``nav_msgs/Path``로 바꾼다.
+
+    입력: profile의 ``T_base_from_lidar``와 모델 trajectory.
+    반환: publisher가 그대로 발행할 stamp가 보존된 ``Path``.
+    """
+
     def __init__(self, t_base_from_lidar: dict[str, Any]) -> None:
+        """정적 base-to-LiDAR 변환을 검증하고 path 변환 상태를 준비한다.
+
+        입력: ``base_link``에서 ``Lidar3D-4``로 향하는 profile transform.
+        부작용: translation, rotation, orientation 변환용 quaternion을 보관한다.
+        """
         try:
             parent_frame = str(t_base_from_lidar["parent_frame_id"])
             child_frame = str(t_base_from_lidar["child_frame_id"])
@@ -127,6 +158,11 @@ class PathMessageBuilder:
     def build(
         self, trajectory: Any, coordinate_convention: str, stamp: Any
     ) -> Path:
+        """모델 좌표계의 trajectory를 LiDAR frame의 ROS Path로 직렬화한다.
+
+        입력: ``N×2`` 또는 ``N×3`` trajectory, CARLA/NAVSIM 좌표계, 기준 stamp.
+        반환: 위치와 선택적 heading을 가진 ``nav_msgs/Path``.
+        """
         convention = str(coordinate_convention).upper()
         if convention.startswith("CARLA"):
             carla = True

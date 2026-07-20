@@ -24,6 +24,11 @@ MODEL_IDS = ("tfv6", "interfuser", "diffusiondrive_v2", "sparsedrive_v2")
 
 
 def _parser() -> argparse.ArgumentParser:
+    """asset bootstrap CLI의 명시적 model·profile·refresh 인자를 정의한다.
+
+    입력: 없음.
+    반환: 검증 전 CLI argument를 parse할 ``ArgumentParser``.
+    """
     parser = argparse.ArgumentParser(
         description="Fetch pinned local source/checkpoint assets and write a verified manifest."
     )
@@ -39,6 +44,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    """선택 model의 source/checkpoint를 확보하고 검증 manifest 경로를 출력한다.
+
+    입력: 선택적으로 test가 주입하는 CLI argument sequence.
+    반환: 성공 시 0, profile·asset 오류 시 1.
+    부작용: models 아래 source, asset, manifest를 생성·갱신할 수 있다.
+    """
     args = _parser().parse_args(argv)
     project_root = (
         args.project_root.resolve() if args.project_root else default_project_root()

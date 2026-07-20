@@ -46,7 +46,11 @@ def load_diffusiondrive_selector_state_dict(
     *,
     checkpoint_path: str | Path,
 ) -> None:
-    """official selector checkpoint를 PDM-free derivative에 strict-load한다."""
+    """official selector checkpoint를 PDM-free derivative에 strict-load한다.
+
+    입력: derivative network, 원본 state dict, checkpoint 경로.
+    부작용: 평가 vocabulary 한 key만 제외하고 strict-load 실패를 오류로 만든다.
+    """
     normalized: dict[str, Any] = {}
     for raw_key, value in raw_state.items():
         key = str(raw_key)
@@ -73,7 +77,18 @@ def load_diffusiondrive_selector_state_dict(
 
 
 class _DiffusionDriveSelectorRuntime:
+    """PDM 없는 DiffusionDrive derivative와 deterministic tensor adapter를 감싼다.
+
+    입력: DiffusionDrive profile과 project root.
+    반환: wrapper가 learned selector만 실행할 source runtime.
+    """
+
     def __init__(self, profile: dict[str, Any], project_root: Path) -> None:
+        """생성 derivative 구조와 checkpoint를 검증한 뒤 network를 초기화한다.
+
+        입력: 검증된 profile과 project root.
+        부작용: PDM token 없는 derivative를 import하고 eval network를 device에 올린다.
+        """
         checkout = source_checkout_path(profile, project_root)
         derivative = checkout / DIFFUSION_DERIVATIVE_RELATIVE_PATH
         if not derivative.is_file():
@@ -148,11 +163,21 @@ class _DiffusionDriveSelectorRuntime:
         self._network = network
 
     def set_seed(self, seed: int) -> None:
+        """diffusion sampling 재현성을 위해 CPU와 CUDA RNG seed를 설정한다.
+
+        입력: worker가 run/model/stamp에서 만든 64-bit seed.
+        부작용: torch 전역 RNG state를 갱신한다.
+        """
         self._torch.manual_seed(seed)
         if self._torch.cuda.is_available():
             self._torch.cuda.manual_seed_all(seed)
 
     def tensor(self, value: Any) -> Any:
+        """수치 feature를 runtime device의 float32 tensor로 변환한다.
+
+        입력: tensor 또는 numpy/sequence 값.
+        반환: CPU/CUDA float32 tensor.
+        """
         if self._torch.is_tensor(value):
             return value.to(self._device, dtype=self._torch.float32)
         return self._torch.as_tensor(
@@ -160,30 +185,62 @@ class _DiffusionDriveSelectorRuntime:
         )
 
     def image_tensor(self, value: Any) -> Any:
+        """ROS camera 또는 BEV image를 CHW batch tensor로 변환한다.
+
+        입력: ROS image 또는 source-compatible image 값.
+        반환: batch 차원이 있는 image tensor.
+        """
         tensor = self.tensor(ros_image_to_chw(value))
         return tensor.unsqueeze(0) if tensor.ndim == 3 else tensor
 
     def batch_vector(self, value: Any) -> Any:
+        """status feature에 필요할 때만 leading batch 차원을 추가한다.
+
+        입력: 수치 vector 또는 tensor.
+        반환: ``[1, N]`` 또는 기존 batch tensor.
+        """
         tensor = self.tensor(value)
         return tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
 
     def forward_pdm_free(self, features: dict[str, Any]) -> dict[str, Any]:
+        """PDM·metric cache 없이 learned selector derivative를 실행한다.
+
+        입력: camera, LiDAR BEV, status feature dict.
+        반환: final learned selector의 ``trajectory`` output dict.
+        """
         with self._torch.inference_mode():
             return self._network(features)
 
 
 class DiffusionDriveV2InferenceModel:
+    """DiffusionDrive V2 open-loop derivative를 공통 prediction 계약으로 감싼다.
+
+    입력: selected profile, project root, 선택적 source runtime.
+    반환: PDM 평가 없이 선택된 8-step trajectory ``ModelPrediction``.
+    """
+
     def __init__(
         self,
         selected_profile: Any,
         project_root: str | Path,
         source_runtime: Any = None,
     ) -> None:
+        """lazy-load할 DiffusionDrive V2 wrapper 상태를 초기화한다.
+
+        입력: 선택 profile, workspace root, 선택적으로 주입된 runtime.
+        부작용: 실제 derivative/checkpoint load를 첫 forward까지 지연한다.
+        """
         self.selected_profile = selected_profile
         self.project_root = Path(project_root).resolve()
         self._source_runtime = source_runtime
 
     def load(self) -> "DiffusionDriveV2InferenceModel":
+        """asset을 검증하고 PDM-free source runtime을 한 번만 load한다.
+
+        입력: 없음.
+        반환: load된 자기 자신.
+        부작용: derivative 구조·checkpoint를 검증하고 network를 초기화한다.
+        """
         if self._source_runtime is not None:
             return self
         try:
@@ -200,6 +257,11 @@ class DiffusionDriveV2InferenceModel:
         return self
 
     def forward(self, frame: Any, rng_seed: int) -> ModelPrediction:
+        """causal frame과 worker seed로 deterministic learned-selector forward를 한다.
+
+        입력: camera·LiDAR BEV·8-value status frame과 결정적 RNG seed.
+        반환: PDM을 거치지 않은 source ``trajectory`` ``ModelPrediction``.
+        """
         camera, lidar, driving = require_inputs(
             "diffusiondrive_v2",
             frame,

@@ -29,11 +29,22 @@ class ModelInputError(ValueError):
 
 @dataclass(frozen=True)
 class ModelPrediction:
+    """어떤 concrete model도 engine에 돌려주는 공통 추론 결과다.
+
+    입력: source-native trajectory와 이를 만든 source symbol.
+    반환: engine이 Path로 변환할 불변 prediction.
+    """
+
     trajectory: Any
     source_symbol: str
 
 
 def require_inputs(model_id: str, frame: Any, names: Iterable[str]) -> Tuple[Any, ...]:
+    """model이 선언한 모든 input이 causal frame에 있는지 확인한다.
+
+    입력: model id, ``InferenceFrame``, 필요한 input key 순서.
+    반환: 요청 순서를 유지한 input value tuple.
+    """
     missing = [name for name in names if name not in frame.inputs]
     if missing:
         raise ModelInputError(
@@ -43,6 +54,11 @@ def require_inputs(model_id: str, frame: Any, names: Iterable[str]) -> Tuple[Any
 
 
 def require_status(model_id: str, driving_feature: Any, length: int) -> list[float]:
+    """driving feature의 status vector 길이를 모델 계약과 대조한다.
+
+    입력: model id, driving feature, 요구 status 길이.
+    반환: 검증된 status feature list.
+    """
     try:
         status = list(driving_feature.status_feature)
     except AttributeError as error:
@@ -57,12 +73,22 @@ def require_status(model_id: str, driving_feature: Any, length: int) -> list[flo
 
 
 def prepend_source_path(path: Path) -> None:
+    """pinned source checkout을 import 탐색 순서의 맨 앞에 둔다.
+
+    입력: 원본 model source checkout 경로.
+    부작용: 아직 없을 때만 ``sys.path`` 첫 항목으로 삽입한다.
+    """
     value = str(path.resolve())
     if value not in sys.path:
         sys.path.insert(0, value)
 
 
 def require_module_from_checkout(module: Any, checkout: Path, symbol: str) -> None:
+    """import된 symbol이 profile이 고정한 checkout 내부에 있음을 검증한다.
+
+    입력: import module, checkout directory, 사람이 읽을 symbol 이름.
+    부작용: 외부 module로 해석되면 ``ModelRuntimeError``를 발생시킨다.
+    """
     module_path = Path(getattr(module, "__file__", "")).resolve()
     checkout = checkout.resolve()
     if not module_path.is_file() or checkout not in module_path.parents:
@@ -73,7 +99,11 @@ def require_module_from_checkout(module: Any, checkout: Path, symbol: str) -> No
 
 
 def ros_image_to_chw(value: Any) -> Any:
-    """cv_bridge를 import하지 않고 ROS ``sensor_msgs/Image``를 decode한다."""
+    """cv_bridge 없이 ROS ``sensor_msgs/Image``를 CHW numpy 배열로 decode한다.
+
+    입력: ROS image 또는 이미 source-native 형식인 값.
+    반환: RGB 순서의 contiguous CHW 배열 또는 변환하지 않은 원래 값.
+    """
     if not all(hasattr(value, name) for name in ("height", "width", "encoding", "data")):
         return value
     encoding = str(value.encoding).lower()
@@ -118,7 +148,11 @@ def ros_image_to_chw(value: Any) -> Any:
 def model_target_xy(
     value: Any, profile: dict[str, Any], *, carla_y_right: bool
 ) -> Any:
-    """Lidar3D-4 PointStamped를 source ego/base 좌표로 변환한다."""
+    """Lidar3D-4 ``PointStamped``를 source ego/base 좌표로 변환한다.
+
+    입력: target point, static transform profile, CARLA y-right 여부.
+    반환: model 입력용 ``[x, y]`` 또는 point가 아니면 원래 값.
+    """
     if not hasattr(value, "point"):
         return value
     try:
@@ -148,6 +182,11 @@ def model_target_xy(
 
 
 def _quaternion_rotation_matrix(quaternion_xyzw: tuple[float, ...]) -> np.ndarray:
+    """``xyzw`` quaternion을 base-from-LiDAR 회전 행렬로 변환한다.
+
+    입력: 길이 4의 0이 아닌 quaternion.
+    반환: 3×3 float64 rotation matrix.
+    """
     x, y, z, w = quaternion_xyzw
     norm = x * x + y * y + z * z + w * w
     if norm <= np.finfo(float).eps:
@@ -171,7 +210,11 @@ def load_source_state_dict(
     checkpoint_path: str | Path,
     documented_prefixes: tuple[str, ...],
 ) -> None:
-    """문서화된 checkpoint prefix를 정규화하고 정확한 network match를 강제한다."""
+    """문서화된 checkpoint prefix를 정규화하고 정확한 network match를 강제한다.
+
+    입력: network, 원본 state dict, model id, checkpoint 경로, 허용 prefix.
+    부작용: strict-load하거나 key mismatch 시 ``SourceRuntimeError``를 발생시킨다.
+    """
     normalized: dict[str, Any] = {}
     for raw_key, value in raw_state.items():
         key = str(raw_key)

@@ -22,6 +22,11 @@ from validator_inference.models.tfv6 import TFv6Model
 def build_selected_model(
     selected_profile: Any, project_root: str | Path | None = None
 ) -> object:
+    """선택 profile의 model id에 대응하는 정확히 하나의 concrete wrapper를 만든다.
+
+    입력: ``SelectedProfile``과 선택적 project root.
+    반환: 아직 lazy-load 상태인 TFv6·InterFuser·DiffusionDrive·SparseDrive runtime.
+    """
     root = Path(project_root).resolve() if project_root else default_project_root()
     concrete_types = {
         "tfv6": TFv6Model,

@@ -34,6 +34,11 @@ GROUND_REMOVAL_SYMBOL = "lead.common.ransac.remove_ground"
 
 
 def _rigid_transform_matrix(declaration: dict[str, Any]) -> np.ndarray:
+    """profile의 ``T_base_from_lidar``를 homogeneous transform으로 검증·변환한다.
+
+    입력: translation과 ``xyzw`` quaternion을 가진 static transform 선언.
+    반환: LiDAR 점을 base 좌표로 옮기는 4×4 float64 matrix.
+    """
     try:
         translation = np.asarray(declaration["translation_m"], dtype=np.float64)
         quaternion = np.asarray(declaration["quaternion_xyzw"], dtype=np.float64)
@@ -78,6 +83,11 @@ def _rigid_transform_matrix(declaration: dict[str, Any]) -> np.ndarray:
 
 
 def _transform_xyz(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """XYZ point batch에 하나의 homogeneous rigid transform을 적용한다.
+
+    입력: ``N×3`` points와 ``4×4`` transform.
+    반환: 같은 순서를 유지한 ``N×3`` float32 transformed points.
+    """
     homogeneous = np.concatenate(
         [points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1
     )
@@ -90,7 +100,11 @@ def _source_prefilter_tfv6_sweep(
     expert_config: Any,
     remove_ground: Callable[..., Any],
 ) -> np.ndarray:
-    """heuristic 없이 LEAD base_agent.py:158-163, 203-237을 port한다."""
+    """heuristic 없이 LEAD의 ego mask·RANSAC·BEV bounds 순서를 port한다.
+
+    입력: ROS base 좌표 points, 원본 expert config, 원본 ground remover.
+    반환: source rasterizer에 전달할 정제된 base 좌표 point batch.
+    """
     lidar_x = points_base_ros[:, 0]
     lidar_y = points_base_ros[:, 1]
     points = points_base_ros[
@@ -139,10 +153,10 @@ def prepare_tfv6_temporal_lidar(
 ) -> np.ndarray:
     """pinned LEAD의 prefilter, accumulation, raster, PNG 단계를 재현한다.
 
-    ROS sensor points remain x-forward/y-left through mount transform,
-    per-sweep filtering, and newest-anchor alignment.  The conversion to the
-    pinned source's CARLA y-right convention happens exactly once immediately
-    before the source quantization/raster boundary.
+    입력: pose-align된 10-sweep history, 원본 config·point reader·raster helpers.
+    반환: source ``OpenLoopInference``가 기대하는 float32 LiDAR raster.
+    좌표: ROS x-forward/y-left를 mount·filter·anchor alignment 뒤 raster 직전에만
+    pinned CARLA x-forward/y-right로 한 번 변환한다.
     """
     base_from_lidar = _rigid_transform_matrix(T_base_from_lidar)
     merged = []
@@ -197,7 +211,18 @@ def prepare_tfv6_temporal_lidar(
 
 
 class _LeadOpenLoopRuntime:
+    """pinned LEAD import·CUDA model·원본 LiDAR helper를 캡슐화한다.
+
+    입력: TFv6 profile과 project root.
+    반환: 외부 wrapper가 source-native forward에 사용할 runtime adapter.
+    """
+
     def __init__(self, profile: dict[str, Any], project_root: Path) -> None:
+        """원본 LEAD symbols, config, CUDA ensemble, LiDAR helper를 load한다.
+
+        입력: 검증을 통과한 TFv6 profile과 workspace root.
+        부작용: source checkout import path를 앞에 두고 CUDA model을 초기화한다.
+        """
         checkout = source_checkout_path(profile, project_root)
         prepend_source_path(checkout)
         try:
@@ -256,6 +281,11 @@ class _LeadOpenLoopRuntime:
         )
 
     def build_temporal_lidar(self, history: list[Any]) -> Any:
+        """pose-align된 raw LiDAR history를 CUDA batch raster tensor로 바꾼다.
+
+        입력: InputBuffer가 만든 ``AlignedPointCloudSweep`` 10개.
+        반환: shape ``[1, 1, H, W]``의 source input tensor.
+        """
         raster = prepare_tfv6_temporal_lidar(
             history,
             training_config=self._training_config,
@@ -273,24 +303,48 @@ class _LeadOpenLoopRuntime:
         ]
 
     def tensor(self, value: Any) -> Any:
+        """수치 값을 CUDA float32 tensor로 옮긴다.
+
+        입력: tensor 또는 numpy/sequence 값.
+        반환: CUDA device의 float32 tensor.
+        """
         if self._torch.is_tensor(value):
             return value.to(device="cuda", dtype=self._torch.float32)
         return self._torch.as_tensor(value, dtype=self._torch.float32, device="cuda")
 
     def image_tensor(self, value: Any) -> Any:
+        """ROS image를 RGB CHW CUDA batch tensor로 바꾼다.
+
+        입력: ``sensor_msgs/Image`` 또는 source-compatible image.
+        반환: batch 차원이 있는 image tensor.
+        """
         tensor = self.tensor(ros_image_to_chw(value))
         return tensor.unsqueeze(0) if tensor.ndim == 3 else tensor
 
     def batch_vector(self, value: Any) -> Any:
+        """1차원 model feature에 필요할 때만 batch 차원을 추가한다.
+
+        입력: 수치 vector 또는 tensor.
+        반환: ``[1, N]`` 또는 기존 batch를 보존한 CUDA tensor.
+        """
         tensor = self.tensor(value)
         return tensor.unsqueeze(0) if tensor.ndim == 1 else tensor
 
     def forward(self, data: dict[str, Any]) -> Any:
+        """원본 LEAD OpenLoopInference의 data dict forward를 호출한다.
+
+        입력: rgb, rasterized_lidar, command, target point를 가진 source data.
+        반환: ``pred_future_waypoints``를 포함해야 하는 원본 output.
+        """
         return self._model.forward(data)
 
 
 class TFv6Model:
-    """pinned LEAD open-loop ensemble의 concrete wrapper."""
+    """pinned LEAD open-loop ensemble을 ``ModelPrediction`` 계약으로 감싼다.
+
+    입력: TFv6 selected profile, project root, 선택적 test runtime.
+    반환: engine이 공통으로 소비하는 8개 CARLA-relative waypoint prediction.
+    """
 
     def __init__(
         self,
@@ -298,11 +352,22 @@ class TFv6Model:
         project_root: str | Path,
         source_runtime: Any = None,
     ) -> None:
+        """lazy-load source runtime을 갖는 TFv6 wrapper를 초기화한다.
+
+        입력: 선택 profile, project root, 선택적으로 주입된 source runtime.
+        부작용: 실제 CUDA load는 ``load`` 또는 첫 ``forward``까지 지연한다.
+        """
         self.selected_profile = selected_profile
         self.project_root = Path(project_root).resolve()
         self._source_runtime = source_runtime
 
     def load(self) -> "TFv6Model":
+        """asset hash를 검증하고 아직 없으면 pinned LEAD runtime을 load한다.
+
+        입력: 없음.
+        반환: load된 자기 자신.
+        부작용: source/checkpoint 검증과 CUDA model 초기화를 수행할 수 있다.
+        """
         if self._source_runtime is not None:
             return self
         try:
@@ -317,6 +382,11 @@ class TFv6Model:
         return self
 
     def forward(self, frame: Any, rng_seed: int | None = None) -> ModelPrediction:
+        """TFv6 frame을 원본 data dict로 변환해 8개 waypoint를 추론한다.
+
+        입력: panorama·10 LiDAR sweep·status·세 target이 든 causal frame, 미사용 seed.
+        반환: ``pred_future_waypoints``를 담은 ``ModelPrediction``.
+        """
         (
             camera,
             history,
@@ -354,6 +424,11 @@ class TFv6Model:
         rasterized = runtime.build_temporal_lidar(history)
 
         def tensor(value: Any) -> Any:
+            """test runtime도 지원하도록 선택적으로 tensor 변환을 적용한다.
+
+            입력: source data dict에 넣을 수치 값.
+            반환: runtime converter가 있으면 변환한 값, 없으면 원래 값.
+            """
             convert = getattr(runtime, "tensor", None)
             return convert(value) if convert else value
 

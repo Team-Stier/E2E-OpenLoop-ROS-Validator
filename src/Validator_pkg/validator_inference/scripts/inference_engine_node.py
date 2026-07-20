@@ -24,6 +24,11 @@ from validator_inference.worker import InferenceWorker
 
 
 def _default_profile_file() -> str:
+    """source와 install 배치 모두에서 기본 profile.json 위치를 찾는다.
+
+    입력: 없음.
+    반환: 존재하는 config profile path, 없으면 우선 후보 path 문자열.
+    """
     package_dir = Path(rospkg.RosPack().get_path("validator_inference"))
     candidates = (
         package_dir.parent / "config" / "profile.json",
@@ -36,11 +41,21 @@ def _default_profile_file() -> str:
 
 
 def _new_run_id() -> str:
+    """CSV와 metric을 묶을 UTC 시각 기반의 충돌 가능성 낮은 run id를 만든다.
+
+    입력: 없음.
+    반환: UTC timestamp와 짧은 UUID suffix를 합친 run id.
+    """
     started = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     return "{}-{}".format(started, uuid.uuid4().hex[:8])
 
 
 def require_sim_time(get_param) -> None:
+    """rosbag open-loop 평가가 simulated clock을 사용하도록 강제한다.
+
+    입력: ROS parameter getter.
+    부작용: ``/use_sim_time``이 참이 아니면 ``RuntimeError``를 발생시킨다.
+    """
     if get_param("/use_sim_time", False) is not True:
         raise RuntimeError(
             "InferenceEngineNode requires /use_sim_time=true for rosbag open-loop time"
@@ -48,7 +63,18 @@ def require_sim_time(get_param) -> None:
 
 
 class InferenceEngineNode:
+    """inference layer의 buffer·worker·engine을 조립하는 ROS1 process다.
+
+    입력: ROS private params와 profile별 perception/feature topics.
+    반환: ``/waypoints``와 ``/inference_metric``을 발행하는 10 Hz engine.
+    """
+
     def __init__(self) -> None:
+        """profile을 load하고 concrete model, buffer, worker, publisher, timer를 만든다.
+
+        입력: ``~model_id``, 선택적 ``~profile_file``, 선택적 ``~run_id`` ROS params.
+        부작용: model을 load하고 topic subscription 및 10 Hz timer를 시작한다.
+        """
         require_sim_time(rospy.get_param)
         model_id = rospy.get_param("~model_id")
         profile_file = rospy.get_param("~profile_file", _default_profile_file())
@@ -82,6 +108,11 @@ class InferenceEngineNode:
 
 
 def main() -> None:
+    """InferenceEngineNode를 초기화하고 ROS shutdown까지 spin한다.
+
+    입력: 없음.
+    부작용: ``InferenceEngineNode``라는 ROS node를 시작한다.
+    """
     rospy.init_node("InferenceEngineNode")
     InferenceEngineNode()
     rospy.spin()

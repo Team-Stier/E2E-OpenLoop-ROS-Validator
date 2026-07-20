@@ -31,6 +31,12 @@ except ModuleNotFoundError as error:
 
 @dataclass(frozen=True)
 class InputSpec:
+    """하나의 inference 입력 topic과 FIFO 요구량을 선언한다.
+
+    입력: 내부 key, ROS topic/type, FIFO depth, 선택적 history count.
+    반환: ``InputBuffer`` 초기화에 쓰이는 불변 입력 명세.
+    """
+
     key: str
     topic: str
     ros_type: str
@@ -40,12 +46,24 @@ class InputSpec:
 
 @dataclass(frozen=True)
 class StampedSample:
+    """수신 시각과 원본 ROS message를 함께 보관하는 FIFO 항목이다.
+
+    입력: nanosecond stamp와 원본 message.
+    반환: causal snapshot 선택에 쓰이는 불변 sample.
+    """
+
     stamp_ns: int
     message: Any
 
 
 @dataclass(frozen=True)
 class InferenceFrame:
+    """한 model forward에 전달할 causal input snapshot이다.
+
+    입력: 기준 stamp, 선택된 inputs, age, LiDAR history 통계.
+    반환: worker가 그대로 처리하는 불변 frame.
+    """
+
     reference_stamp: Any
     inputs: Dict[str, Any]
     input_age_ms: Dict[str, float]
@@ -55,6 +73,12 @@ class InferenceFrame:
 
 @dataclass(frozen=True)
 class NotReady:
+    """기준 시각까지 필요한 입력이 충족되지 않았음을 설명한다.
+
+    입력: 빠진 input key와 확보된 age·history 통계.
+    반환: engine이 ``not_ready`` metric으로 바꾸는 불변 결과.
+    """
+
     missing_input_keys: List[str]
     input_age_ms: Dict[str, float] = field(default_factory=dict)
     history_count: int = 0
@@ -63,6 +87,12 @@ class NotReady:
 
 @dataclass(frozen=True)
 class PoseSample:
+    """``map``에서 ``base_link``로의 한 시각 pose를 보관한다.
+
+    입력: nanosecond stamp, translation, ``xyzw`` quaternion.
+    반환: point-cloud sweep 정렬에 쓰이는 불변 pose.
+    """
+
     stamp_ns: int
     translation_xyz: Tuple[float, float, float]
     quaternion_xyzw: Tuple[float, float, float, float]
@@ -70,14 +100,22 @@ class PoseSample:
 
 @dataclass(frozen=True)
 class AlignedPointCloudSweep:
-    """timestamp가 있는 cloud와 최신 sweep으로의 rigid alignment 쌍."""
+    """timestamp가 있는 cloud와 최신 sweep으로의 rigid alignment 쌍이다.
+
+    입력: 원본 ``PointCloud2``와 anchor LiDAR frame으로의 4×4 transform.
+    반환: TFv6 temporal preprocessing에 전달할 불변 sweep.
+    """
 
     point_cloud: Any
     T_anchor_lidar_from_sweep_lidar: np.ndarray
 
 
 def _stamp_ns(stamp: Any) -> int:
-    """rospy.Time-compatible 값에서 integer nanoseconds를 반환한다."""
+    """ROS time 호환 값을 비교 가능한 정수 nanosecond로 변환한다.
+
+    입력: ``to_nsec`` 또는 초·나노초 field를 제공하는 stamp.
+    반환: 정수 nanosecond timestamp.
+    """
     to_nsec = getattr(stamp, "to_nsec", None)
     if callable(to_nsec):
         return int(to_nsec())
@@ -90,6 +128,11 @@ def _stamp_ns(stamp: Any) -> int:
 
 
 def _message_stamp_ns(message: Any) -> int:
+    """ROS message header의 stamp를 정수 nanosecond로 읽는다.
+
+    입력: ``header.stamp``가 있는 ROS message.
+    반환: message의 생성 timestamp.
+    """
     try:
         return _stamp_ns(message.header.stamp)
     except AttributeError as error:
@@ -97,7 +140,11 @@ def _message_stamp_ns(message: Any) -> int:
 
 
 def _ros_message_types() -> Dict[str, Any]:
-    """profile 계약이 허용한 ROS message class만 import한다."""
+    """profile 계약이 허용한 ROS message class만 import한다.
+
+    입력: 없음.
+    반환: profile의 ``ros_type`` 문자열과 ROS class의 대응표.
+    """
     from geometry_msgs.msg import PointStamped
     from sensor_msgs.msg import Image, PointCloud2
     from tf2_msgs.msg import TFMessage
@@ -113,7 +160,11 @@ def _ros_message_types() -> Dict[str, Any]:
 
 
 class InputBuffer:
-    """bounded input FIFO를 유지하고 안정적인 causal snapshot을 만든다."""
+    """모든 inference subscription을 소유하고 bounded causal FIFO를 만든다.
+
+    입력: profile에서 파생한 ``InputSpec``과 선택적 TF pose history.
+    반환: main loop가 소비할 ``InferenceFrame`` 또는 ``NotReady``.
+    """
 
     def __init__(
         self,
@@ -121,6 +172,11 @@ class InputBuffer:
         *,
         pose_histories: Optional[Dict[str, "TfPoseHistory"]] = None,
     ) -> None:
+        """입력별 FIFO와 pose history를 검증해 빈 buffer를 초기화한다.
+
+        입력: 고유 key를 가진 input 명세와 선택적 pose history mapping.
+        부작용: thread-safe queue, lock, subscriber 보관 공간을 생성한다.
+        """
         spec_list = list(specs)
         if any(spec.fifo_depth < 1 for spec in spec_list):
             raise ValueError("fifo_depth must be positive")
@@ -153,7 +209,11 @@ class InputBuffer:
         *,
         subscriber_factory: Any = None,
     ) -> "InputBuffer":
-        """profile FIFO를 만들고 모든 inference-layer subscription을 소유한다."""
+        """profile FIFO를 만들고 모든 inference-layer subscription을 소유한다.
+
+        입력: 선택 profile과 선택적 ROS subscriber factory.
+        반환: 각 required topic 및 필요한 ``/tf``를 구독하는 ``InputBuffer``.
+        """
         data = getattr(profile, "data", profile)
         required = list(data.get("required_inputs", ()))
         requirements = data.get("buffer_requirements", {})
@@ -229,13 +289,28 @@ class InputBuffer:
 
     @property
     def subscribers(self) -> Tuple[Any, ...]:
+        """buffer가 소유해 수명 동안 유지해야 할 ROS subscriber를 반환한다.
+
+        입력: 없음.
+        반환: profile 입력 topic과 선택적 ``/tf`` subscriber tuple.
+        """
         return self._subscribers
 
     @property
     def pose_histories(self) -> Dict[str, "TfPoseHistory"]:
+        """history input별 TF pose history의 방어적 mapping 복사본을 반환한다.
+
+        입력: 없음.
+        반환: input key에서 ``TfPoseHistory``로의 mapping.
+        """
         return dict(self._pose_histories)
 
     def latest_driving_feature_stamp(self) -> Optional[Any]:
+        """수신된 driving feature 중 가장 최신 기준 시각을 반환한다.
+
+        입력: 없음.
+        반환: 기준 stamp 또는 driving feature가 없을 때 ``None``.
+        """
         with self._lock:
             samples = self._samples.get("driving_feature", ())
             if not samples:
@@ -244,6 +319,11 @@ class InputBuffer:
             return newest.message.header.stamp
 
     def _store_tf_message(self, message: Any) -> None:
+        """``/tf``에서 map-to-base transform만 골라 모든 history에 저장한다.
+
+        입력: ``tf2_msgs/TFMessage``.
+        부작용: 유효한 ``map → base_link`` pose를 timestamp 순서로 추가한다.
+        """
         for transform in message.transforms:
             parent = str(transform.header.frame_id).lstrip("/")
             child = str(transform.child_frame_id).lstrip("/")
@@ -268,6 +348,11 @@ class InputBuffer:
                 history.add(pose)
 
     def store(self, key: str, message: Any) -> None:
+        """subscription callback이 전달한 message를 해당 FIFO의 끝에 저장한다.
+
+        입력: profile input key와 ``header.stamp``가 있는 ROS message.
+        부작용: depth를 넘은 가장 오래된 sample을 버린다.
+        """
         if key not in self._specs:
             raise KeyError(key)
         stamp_ns = _message_stamp_ns(message)
@@ -280,6 +365,11 @@ class InputBuffer:
     def snapshot_at(
         self, reference_stamp: Any, required_keys: List[str]
     ) -> Union[InferenceFrame, NotReady]:
+        """기준 시각 이후 sample을 배제한 causal model input snapshot을 만든다.
+
+        입력: driving feature 기준 stamp와 모델이 요구하는 input key 순서.
+        반환: pose-align된 history를 포함한 ``InferenceFrame`` 또는 ``NotReady``.
+        """
         reference_ns = _stamp_ns(reference_stamp)
         with self._lock:
             unknown_keys = [key for key in required_keys if key not in self._specs]
@@ -382,9 +472,18 @@ class InputBuffer:
 
 
 class TfPoseHistory:
-    """bounded-gap interpolation을 제공하는 thread-safe timestamp pose history."""
+    """bounded-gap interpolation을 제공하는 thread-safe timestamp pose history다.
+
+    입력: 허용할 TF bracket gap과 보관 sample 상한.
+    반환: temporal LiDAR sweep을 anchor 시각으로 정렬할 pose.
+    """
 
     def __init__(self, max_bracket_gap_ms: float, max_samples: int = 256) -> None:
+        """유한한 시간순 pose 저장소를 초기화한다.
+
+        입력: 보간 가능한 최대 gap과 메모리에 유지할 pose 수.
+        부작용: timestamp-ordered pose list와 lock을 생성한다.
+        """
         if max_bracket_gap_ms < 0:
             raise ValueError("max_bracket_gap_ms must be nonnegative")
         if max_samples < 2:
@@ -395,6 +494,11 @@ class TfPoseHistory:
         self._lock = RLock()
 
     def add(self, pose: PoseSample) -> None:
+        """pose를 timestamp 순서에 맞춰 삽입하거나 같은 시각 값을 교체한다.
+
+        입력: ``map → base_link`` ``PoseSample``.
+        부작용: 최대 sample 수를 초과한 가장 오래된 pose를 제거한다.
+        """
         with self._lock:
             stamps = [sample.stamp_ns for sample in self._poses]
             index = bisect_left(stamps, pose.stamp_ns)
@@ -407,10 +511,20 @@ class TfPoseHistory:
 
     @property
     def sample_count(self) -> int:
+        """현재 interpolation에 사용할 수 있는 pose 수를 반환한다.
+
+        입력: 없음.
+        반환: 보관 중인 ``PoseSample`` 개수.
+        """
         with self._lock:
             return len(self._poses)
 
     def interpolate(self, stamp: Any) -> Optional[PoseSample]:
+        """요청 시각을 양쪽 TF pose 사이에서 선형·slerp 보간한다.
+
+        입력: 보간할 ROS time 호환 stamp.
+        반환: gap 계약을 만족한 pose, 범위 밖이면 ``None``.
+        """
         requested_ns = _stamp_ns(stamp)
         with self._lock:
             stamps = [sample.stamp_ns for sample in self._poses]
@@ -441,11 +555,20 @@ class TfPoseHistory:
 
 
 def _milliseconds(nanoseconds: int) -> float:
+    """정수 nanosecond duration을 metric용 millisecond로 바꾼다.
+
+    입력: nanosecond 단위 duration.
+    반환: float millisecond duration.
+    """
     return nanoseconds / 1_000_000.0
 
 
 def _pose_matrix(pose: PoseSample) -> np.ndarray:
-    """interpolated pose 하나의 T_map_from_base를 반환한다."""
+    """interpolated pose 하나의 ``T_map_from_base`` homogeneous matrix를 만든다.
+
+    입력: translation과 quaternion이 채워진 ``PoseSample``.
+    반환: ``map → base_link`` 4×4 float64 transform.
+    """
     x, y, z, w = pose.quaternion_xyzw
     norm = x * x + y * y + z * z + w * w
     if norm <= np.finfo(float).eps:

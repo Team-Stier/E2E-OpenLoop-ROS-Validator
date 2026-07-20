@@ -23,6 +23,11 @@ from validator_inference.profile_store import load_selected_profile
 
 
 def _default_profile_file() -> str:
+    """source/install package 위치에서 OptFeeder의 기본 profile.json을 찾는다.
+
+    입력: 없음.
+    반환: 존재하는 profile path 또는 우선 후보 path 문자열.
+    """
     package_dir = Path(rospkg.RosPack().get_path("validator_inference"))
     candidates = (
         package_dir.parent / "config" / "profile.json",
@@ -35,6 +40,11 @@ def _default_profile_file() -> str:
 
 
 def _calibration_message(data: CameraCalibrationData) -> CameraCalibration:
+    """profile에서 검증한 calibration 값 객체를 ROS message로 직렬화한다.
+
+    입력: 한 camera의 ``CameraCalibrationData``.
+    반환: ``DrivingFeature``에 넣을 ``CameraCalibration`` message.
+    """
     message = CameraCalibration()
     message.name = data.name
     message.frame_id = data.frame_id
@@ -48,9 +58,18 @@ def _calibration_message(data: CameraCalibrationData) -> CameraCalibration:
 
 
 class OptFeederNode:
-    """단일 ego 구독과 선택 모델의 선택적 publisher를 소유한다."""
+    """단일 ego 구독에서 모든 model auxiliary feature를 발행하는 ROS1 node다.
+
+    입력: ``/Ego_topic``과 선택 profile의 static calibration.
+    반환: ``/driving_feature`` 및 필요한 fallback target topic.
+    """
 
     def __init__(self) -> None:
+        """profile별 publisher와 하나의 ``/Ego_topic`` subscription을 만든다.
+
+        입력: ``~model_id``와 선택적 ``~profile_file`` ROS params.
+        부작용: driving feature/target publisher와 ego subscriber를 등록한다.
+        """
         self._model_id = rospy.get_param("~model_id")
         profile_file = rospy.get_param("~profile_file", _default_profile_file())
         self._profile = load_selected_profile(profile_file, self._model_id)
@@ -68,6 +87,11 @@ class OptFeederNode:
         )
 
     def _on_ego(self, ego: EgoVehicleStatus) -> None:
+        """ego motion 한 샘플을 model-native feature와 fallback target으로 발행한다.
+
+        입력: velocity·acceleration·header를 가진 ``EgoVehicleStatus``.
+        부작용: 동기화된 stamp로 ``/driving_feature``와 route target을 발행한다.
+        """
         data = build_driving_feature_data(
             self._model_id,
             vx=ego.velocity.x,
@@ -101,6 +125,11 @@ class OptFeederNode:
 
 
 def main() -> None:
+    """OptFeederNode를 초기화하고 ROS shutdown까지 spin한다.
+
+    입력: 없음.
+    부작용: ``OptFeederNode``라는 ROS node를 시작한다.
+    """
     rospy.init_node("OptFeederNode")
     OptFeederNode()
     rospy.spin()

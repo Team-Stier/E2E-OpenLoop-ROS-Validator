@@ -45,10 +45,20 @@ class AssetError(RuntimeError):
 
 
 def default_project_root() -> Path:
+    """설치 위치와 무관하게 현재 workspace의 root를 계산한다.
+
+    입력: 없음.
+    반환: ``src/Validator_pkg``를 포함하는 project root 경로.
+    """
     return Path(__file__).resolve().parents[5]
 
 
 def sha256_file(path: str | Path) -> str:
+    """큰 binary asset도 고정 크기 chunk로 읽어 SHA-256을 계산한다.
+
+    입력: 읽을 수 있는 로컬 파일 경로.
+    반환: 파일 전체 내용의 16진수 SHA-256 digest.
+    """
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -57,6 +67,11 @@ def sha256_file(path: str | Path) -> str:
 
 
 def _resolve(path: str | Path, project_root: str | Path) -> Path:
+    """profile 상대 경로를 project root 기준의 절대 경로로 정규화한다.
+
+    입력: profile path와 project root.
+    반환: symbolic link가 해석된 절대 ``Path``.
+    """
     candidate = Path(path)
     if candidate.is_absolute():
         return candidate.resolve()
@@ -64,6 +79,11 @@ def _resolve(path: str | Path, project_root: str | Path) -> Path:
 
 
 def source_checkout_path(profile: Dict[str, Any], project_root: str | Path) -> Path:
+    """model id에 대응하는 고정 source checkout directory를 반환한다.
+
+    입력: model profile과 workspace root.
+    반환: ``models/sources/<model>`` 아래의 checkout path.
+    """
     model_id = profile.get("id")
     try:
         directory = SOURCE_DIRECTORY_NAMES[model_id]
@@ -73,6 +93,11 @@ def source_checkout_path(profile: Dict[str, Any], project_root: str | Path) -> P
 
 
 def _source_metadata(profile: Dict[str, Any], project_root: str | Path) -> Dict[str, Any]:
+    """pinned Git checkout이 profile commit과 일치하는지 확인해 metadata를 만든다.
+
+    입력: 선택 profile과 project root.
+    반환: repository, 선언·관측 commit, checkout, 선택적 derivative hash metadata.
+    """
     model_id = profile.get("id", "<unknown>")
     source = profile.get("source")
     if not isinstance(source, dict):
@@ -130,7 +155,11 @@ def verify_runtime_assets(
     *,
     verify_source: bool = True,
 ) -> Dict[str, Any]:
-    """다운로드 없이 선언된 asset을 검증하고 안정적인 manifest metadata를 반환한다."""
+    """다운로드 없이 선언된 asset과 선택적 source commit을 검증한다.
+
+    입력: 선택 profile, project root, source 검증 여부.
+    반환: 관측 SHA-256과 source revision을 담은 manifest metadata.
+    """
     root = Path(project_root).resolve() if project_root else default_project_root()
     model_id = profile.get("id", "<unknown>")
     assets = []
@@ -173,13 +202,23 @@ def verify_runtime_assets(
 
 
 def _manifest_path(profile: Dict[str, Any], project_root: str | Path) -> Path:
+    """선택 모델의 runtime asset manifest 저장 경로를 계산한다.
+
+    입력: model profile과 project root.
+    반환: ``models/<model>/asset-manifest.json`` 절대 경로.
+    """
     return Path(project_root).resolve() / "models" / str(profile["id"]) / "asset-manifest.json"
 
 
 def write_asset_manifest(
     profile: Dict[str, Any], metadata: Dict[str, Any], project_root: str | Path | None = None
 ) -> Path:
-    """이미 검증된 metadata만으로 canonical JSON을 기록한다."""
+    """이미 검증된 metadata만으로 atomic canonical JSON manifest를 기록한다.
+
+    입력: model profile, 검증 metadata, 선택적 project root.
+    반환: 새로 기록한 manifest 경로.
+    부작용: parent directory를 만들고 기존 manifest를 atomic replace한다.
+    """
     root = Path(project_root).resolve() if project_root else default_project_root()
     payload = {
         "model_id": profile["id"],
@@ -198,6 +237,11 @@ def write_asset_manifest(
 
 
 def _run(command: list[str]) -> None:
+    """외부 bootstrap 명령을 실행하고 실패를 domain 오류로 바꾼다.
+
+    입력: 인자 분리된 실행 명령.
+    부작용: 명령 실패 시 ``AssetError``를 발생시킨다.
+    """
     try:
         subprocess.run(command, check=True)
     except (OSError, subprocess.CalledProcessError) as error:
@@ -207,6 +251,12 @@ def _run(command: list[str]) -> None:
 def _ensure_source_checkout(
     profile: Dict[str, Any], project_root: Path, refresh_source: bool
 ) -> Path:
+    """source checkout을 clone하거나 profile이 고정한 commit으로 맞춘다.
+
+    입력: profile, project root, 기존 checkout refresh 허용 여부.
+    반환: 검증 가능한 detached source checkout path.
+    부작용: 필요할 때 Git clone/fetch/checkout을 실행한다.
+    """
     source = profile["source"]
     checkout = source_checkout_path(profile, project_root)
     expected = source["commit"]
@@ -241,6 +291,11 @@ def _ensure_source_checkout(
 
 
 def _checkpoint_url(profile: Dict[str, Any], asset: Dict[str, Any]) -> Optional[str]:
+    """asset 선언에서 다운로드할 checkpoint URL을 결정한다.
+
+    입력: model profile과 runtime asset 선언.
+    반환: 직접 URL 또는 Hugging Face resolve URL, 불명확하면 ``None``.
+    """
     if asset.get("source_url"):
         return str(asset["source_url"])
     source_path = asset.get("source_path")
@@ -257,6 +312,11 @@ def _checkpoint_url(profile: Dict[str, Any], asset: Dict[str, Any]) -> Optional[
 def _download_atomic(
     url: str, destination: Path, downloader: Callable[[str, str | Path], Any]
 ) -> None:
+    """asset을 임시 파일로 내려받아 검증 전 불완전 파일 노출을 막는다.
+
+    입력: URL, 최종 destination, 주입 가능한 downloader.
+    부작용: 성공 시 destination을 atomic replace하고 실패 임시 파일을 제거한다.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         prefix=f".{destination.name}.", suffix=".part", dir=destination.parent, delete=False
@@ -274,12 +334,22 @@ def _download_atomic(
 
 
 def _source_segment(lines: list[str], node: ast.AST) -> str:
+    """AST node가 차지하는 원본 source line 범위를 그대로 추출한다.
+
+    입력: 줄 단위 source와 시작·끝 line을 가진 AST node.
+    반환: node 범위의 원본 Python text.
+    """
     return "".join(lines[node.lineno - 1 : node.end_lineno])
 
 
 def _replace_original_line_ranges(
     text: str, replacements: list[tuple[int, int, str]]
 ) -> str:
+    """원본 source의 여러 line 범위를 뒤쪽부터 안전하게 교체한다.
+
+    입력: 전체 source text와 ``(start, end, replacement)`` 목록.
+    반환: line number 충돌 없이 모든 replacement를 반영한 source text.
+    """
     lines = text.splitlines(keepends=True)
     for start, end, replacement in sorted(replacements, reverse=True):
         lines[start - 1 : end] = [replacement]
@@ -289,6 +359,11 @@ def _replace_original_line_ranges(
 def _trajectory_head_derivative(
     source_text: str, source_path: Path, tree: ast.Module
 ) -> tuple[ast.ClassDef, str]:
+    """원본 TrajectoryHead에서 PDM 평가를 제거한 learned-selector source를 만든다.
+
+    입력: 고정 commit의 원본 source text/path와 parse tree.
+    반환: 원본 ``TrajectoryHead`` node와 PDM-free replacement class text.
+    """
     lines = source_text.splitlines(keepends=True)
     trajectory = next(
         (
@@ -400,7 +475,11 @@ def _trajectory_head_derivative(
 
 
 def selector_flow_stages(source_text: str) -> tuple[str, ...]:
-    """생성된 method의 전체 learned-selector 경로를 AST로 점검한다."""
+    """생성된 method의 learned-selector 단계가 원본 순서를 보존했는지 점검한다.
+
+    입력: 생성된 DiffusionDrive PDM-free derivative source text.
+    반환: 검증을 통과한 고정 stage 이름 tuple.
+    """
     tree = ast.parse(source_text)
     trajectory = next(
         (
@@ -427,6 +506,11 @@ def selector_flow_stages(source_text: str) -> tuple[str, ...]:
         )
 
     def call_line(attribute: str) -> int:
+        """selector method 안에서 지정한 method 호출의 최초 source line을 찾는다.
+
+        입력: ``diff_decoder`` 같은 AST attribute 이름.
+        반환: 가장 이른 호출 line number.
+        """
         lines = [
             node.lineno
             for node in ast.walk(method)
@@ -505,7 +589,12 @@ def selector_flow_stages(source_text: str) -> tuple[str, ...]:
 
 
 def create_diffusiondrive_derivative(checkout: str | Path) -> Dict[str, str]:
-    """evaluation code를 제거한 version-pinned neural selector를 생성한다."""
+    """고정 DiffusionDrive source에서 PDM 평가 없는 selector derivative를 생성한다.
+
+    입력: profile이 고정한 upstream Git checkout.
+    반환: 생성 파일 상대 경로, SHA-256, 검증 commit metadata.
+    부작용: checkout 내부 derivative Python module을 생성·검증한다.
+    """
     checkout = Path(checkout)
     try:
         observed_commit = subprocess.check_output(
@@ -631,7 +720,12 @@ def fetch_runtime_assets(
     refresh_source: bool = False,
     downloader: Callable[[str, str | Path], Any] = urlretrieve,
 ) -> Path:
-    """선택 모델의 선언된 source/asset을 가져와 검증된 manifest를 기록한다."""
+    """선택 모델의 선언 source·asset을 bootstrap하고 검증 manifest를 기록한다.
+
+    입력: selected profile, model id, project root, source refresh, downloader.
+    반환: hash와 source revision을 검증한 asset manifest 경로.
+    부작용: source checkout·checkpoint·derivative·manifest 파일을 생성할 수 있다.
+    """
     root = Path(project_root).resolve() if project_root else default_project_root()
     if profile.get("id") != model_id:
         raise AssetError(

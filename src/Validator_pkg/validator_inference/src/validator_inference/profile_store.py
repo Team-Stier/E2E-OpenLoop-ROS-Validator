@@ -21,6 +21,12 @@ class ProfileError(ValueError):
 
 @dataclass(frozen=True)
 class SelectedProfile:
+    """선택된 모델의 독립 runtime profile과 재현성 hash를 보관한다.
+
+    입력: model id, 복사된 profile data, 전체 profile·calibration hash.
+    반환: profile loader가 engine과 OptFeeder에 전달하는 불변 값 객체.
+    """
+
     model_id: str
     data: dict[str, Any]
     profile_sha256: str
@@ -28,6 +34,11 @@ class SelectedProfile:
 
 
 def _sha256_canonical_json(value: Any) -> str:
+    """JSON 값을 키 순서에 영향받지 않는 SHA-256으로 식별한다.
+
+    입력: JSON으로 직렬화 가능한 값.
+    반환: 16진수 SHA-256 digest.
+    """
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
@@ -35,6 +46,11 @@ def _sha256_canonical_json(value: Any) -> str:
 
 
 def _require_nonempty(camera: dict[str, Any], camera_name: str, field: str) -> Any:
+    """camera calibration의 필수 비어 있지 않은 field를 읽는다.
+
+    입력: camera object, camera 이름, 필수 field 이름.
+    반환: 검증을 통과한 field 값.
+    """
     value = camera.get(field)
     if value is None or value == "" or value == []:
         raise ProfileError(f"camera {camera_name} requires nonempty {field}")
@@ -42,6 +58,11 @@ def _require_nonempty(camera: dict[str, Any], camera_name: str, field: str) -> A
 
 
 def _validate_sparse_calibration(calibration: dict[str, Any]) -> None:
+    """SparseDrive V2의 3-camera inline calibration 계약을 검증한다.
+
+    입력: profile의 ``camera_calibration`` object.
+    부작용: 누락·형상 오류가 있으면 ``ProfileError``를 발생시킨다.
+    """
     cameras = calibration.get("cameras")
     if not isinstance(cameras, list):
         raise ProfileError("camera_calibration requires cameras")
@@ -74,6 +95,11 @@ def _validate_sparse_calibration(calibration: dict[str, Any]) -> None:
 def load_selected_profile(
     profile_path: str | Path, model_id: str
 ) -> SelectedProfile:
+    """로컬 profile에서 한 모델을 복사하고 실행에 필요한 계약을 검증한다.
+
+    입력: ``profile.json`` 경로와 선택할 model id.
+    반환: 공통 static transform과 재현성 hash가 포함된 ``SelectedProfile``.
+    """
     payload = json.loads(Path(profile_path).read_text(encoding="utf-8"))
     profiles = {item["id"]: item for item in payload["profiles"]}
     if model_id not in profiles:

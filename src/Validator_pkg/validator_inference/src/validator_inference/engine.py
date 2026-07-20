@@ -19,6 +19,11 @@ _OUTPUT_FRAME = "Lidar3D-4"
 
 
 def _profile_flags(selected_profile: Any) -> List[str]:
+    """profile과 rig condition의 compatibility flag를 중복 없이 합친다.
+
+    입력: 선택 model profile.
+    반환: 기록할 안정된 compatibility flag 목록.
+    """
     data = selected_profile.data
     declared = list(data.get("compatibility_flags", ()))
     rig = data.get("rig_conditions", {})
@@ -34,7 +39,11 @@ def _profile_flags(selected_profile: Any) -> List[str]:
 
 
 class InferenceEngine:
-    """각 inference tick outcome에 대해 최종 metric 하나만 발행한다."""
+    """10 Hz tick마다 causal snapshot·worker·ROS 출력을 조합한다.
+
+    입력: selected profile, input buffer, one-slot worker, path/metric publisher.
+    반환: 성공 시 waypoints, 모든 tick에서 하나의 ``InferenceMetric``.
+    """
 
     def __init__(
         self,
@@ -47,6 +56,11 @@ class InferenceEngine:
         metric_publisher: Any,
         run_id: str,
     ) -> None:
+        """선택 profile과 협력 객체를 묶어 engine의 tick 상태를 초기화한다.
+
+        입력: buffer, worker, path builder, ROS publishers, 평가 run id.
+        부작용: required input 순서와 submitted frame별 원래 tick을 저장한다.
+        """
         self._profile = selected_profile
         self._buffer = input_buffer
         self._worker = worker
@@ -67,9 +81,19 @@ class InferenceEngine:
 
     @property
     def tick_index(self) -> int:
+        """현재까지 처리한 10 Hz engine tick 번호를 반환한다.
+
+        입력: 없음.
+        반환: 1부터 증가하는 현재 tick index.
+        """
         return self._tick_index
 
     def on_timer_tick(self, _event: Any) -> None:
+        """timer 한 번에서 completion, not-ready, busy, submit 중 하나를 처리한다.
+
+        입력: ``rospy.Timer`` event(값은 사용하지 않음).
+        부작용: waypoints 또는 metric을 발행하고 필요하면 worker에 frame을 제출한다.
+        """
         self._tick_index += 1
 
         completion = self._worker.take_completed()
@@ -126,6 +150,11 @@ class InferenceEngine:
         self._submitted_ticks[id(snapshot)] = self._tick_index
 
     def _publish_completion(self, completion: Any, tick_index: int) -> None:
+        """완료된 model prediction을 LiDAR path와 완료 metric으로 발행한다.
+
+        입력: worker completion과 frame이 최초 제출된 tick 번호.
+        부작용: ``/waypoints``와 ``/inference_metric``을 순서대로 발행한다.
+        """
         if completion.model_id != self._profile.model_id:
             raise RuntimeError(
                 "worker completion model {} does not match selected {}".format(
@@ -168,6 +197,11 @@ class InferenceEngine:
         elapsed_ms: float,
         rng_seed: int,
     ) -> None:
+        """어떤 tick outcome이든 공통 ``InferenceMetric`` 하나로 발행한다.
+
+        입력: outcome, 기준 stamp, input age, history, 측정 시간, RNG seed.
+        부작용: profile/calibration hash를 포함한 metric을 publisher로 전송한다.
+        """
         ordered_keys = [key for key in self._required_keys if key in input_age_ms]
         ordered_keys.extend(
             sorted(set(input_age_ms).difference(ordered_keys))

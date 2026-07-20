@@ -34,6 +34,11 @@ FINAL_IMAGE_WH = (512.0, 256.0)
 
 
 def _resize_crop_matrix(width: int, height: int) -> np.ndarray:
+    """원본 camera pixel 좌표를 SparseDrive 최종 crop 좌표로 옮기는 행렬을 만든다.
+
+    입력: profile이 선언한 원본 image width와 height.
+    반환: 512×288 resize 뒤 y=32 crop을 합성한 3×3 matrix.
+    """
     if width <= 0 or height <= 0:
         raise ModelInputError("SparseDrive image dimensions must be positive")
     # pinned builder는 1920x1080 canonical image를 512x288로 resize한 뒤
@@ -49,6 +54,11 @@ def _resize_crop_matrix(width: int, height: int) -> np.ndarray:
 
 
 def build_projection_conditions(driving_feature: Any) -> dict[str, Any]:
+    """inline calibration으로 SparseDrive image projection condition을 구성한다.
+
+    입력: front·left·right ``camera_calibrations``를 포함한 driving feature.
+    반환: source가 요구하는 projection, intrinsic, extrinsic, distortion dict.
+    """
     calibrations = {
         getattr(calibration, "name", ""): calibration
         for calibration in getattr(driving_feature, "camera_calibrations", [])
@@ -106,7 +116,18 @@ def build_projection_conditions(driving_feature: Any) -> dict[str, Any]:
 
 
 class _SparseDriveNetworkRuntime:
+    """pinned SparseDrive network과 calibration/image tensor adapter를 감싼다.
+
+    입력: SparseDrive profile과 project root.
+    반환: wrapper가 source-native forward에 사용할 runtime adapter.
+    """
+
     def __init__(self, profile: dict[str, Any], project_root: Path) -> None:
+        """원본 config·backbone·vocabulary·checkpoint를 strict-load한다.
+
+        입력: 검증된 SparseDrive profile과 project root.
+        부작용: source import path를 설정하고 eval network를 device에 올린다.
+        """
         checkout = source_checkout_path(profile, project_root)
         prepend_source_path(checkout)
         try:
@@ -154,6 +175,11 @@ class _SparseDriveNetworkRuntime:
         self._network = network
 
     def tensor(self, value: Any) -> Any:
+        """수치 condition을 runtime device의 float32 tensor로 변환한다.
+
+        입력: tensor 또는 numpy/sequence 값.
+        반환: CPU/CUDA float32 tensor.
+        """
         if self._torch.is_tensor(value):
             return value.to(self._device, dtype=self._torch.float32)
         return self._torch.as_tensor(
@@ -161,27 +187,54 @@ class _SparseDriveNetworkRuntime:
         )
 
     def prepare_images(self, values: list[Any]) -> Any:
+        """left·front·right ROS image를 SparseDrive batch image tensor로 묶는다.
+
+        입력: source camera 순서의 image 세 개.
+        반환: shape ``[1, 3, C, H, W]`` image tensor.
+        """
         tensors = [self.tensor(ros_image_to_chw(value)) for value in values]
         tensors = [value.squeeze(0) if value.ndim == 4 and value.shape[0] == 1 else value for value in tensors]
         return self._torch.stack(tensors, dim=0).unsqueeze(0)
 
     def forward(self, features: dict[str, Any]) -> Any:
+        """gradient 없이 source SparseDrive network를 open-loop 모드로 실행한다.
+
+        입력: ``camera_feature``와 ``status_feature`` source feature dict.
+        반환: ``trajectory``를 포함해야 하는 원본 output.
+        """
         with self._torch.inference_mode():
             return self._network(features, targets={})
 
 
 class SparseDriveV2Model:
+    """inline calibration SparseDrive V2 입력을 공통 prediction 계약으로 변환한다.
+
+    입력: selected profile, project root, 선택적 source runtime.
+    반환: source trajectory를 담은 ``ModelPrediction``.
+    """
+
     def __init__(
         self,
         selected_profile: Any,
         project_root: str | Path,
         source_runtime: Any = None,
     ) -> None:
+        """lazy-load할 SparseDrive V2 wrapper 상태를 초기화한다.
+
+        입력: 선택 profile, workspace root, 선택적으로 주입된 runtime.
+        부작용: 실제 model load를 첫 forward까지 지연한다.
+        """
         self.selected_profile = selected_profile
         self.project_root = Path(project_root).resolve()
         self._source_runtime = source_runtime
 
     def load(self) -> "SparseDriveV2Model":
+        """asset을 검증하고 아직 없으면 strict source runtime을 load한다.
+
+        입력: 없음.
+        반환: load된 자기 자신.
+        부작용: checkpoint와 source dependency를 검증하고 network를 초기화한다.
+        """
         if self._source_runtime is not None:
             return self
         try:
@@ -198,6 +251,11 @@ class SparseDriveV2Model:
         return self
 
     def forward(self, frame: Any, rng_seed: int | None = None) -> ModelPrediction:
+        """세 camera, status, inline calibration을 SparseDrive forward에 전달한다.
+
+        입력: left/front/right image와 8-value driving feature frame, 미사용 seed.
+        반환: source ``trajectory``를 담은 ``ModelPrediction``.
+        """
         left, front, right, driving = require_inputs(
             "sparsedrive_v2",
             frame,

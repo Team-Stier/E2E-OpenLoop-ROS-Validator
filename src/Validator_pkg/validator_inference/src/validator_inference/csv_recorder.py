@@ -70,16 +70,31 @@ def resolve_project_root(module_file: Optional[str | Path] = None) -> Path:
 
 
 def default_record_dir(module_file: Optional[str | Path] = None) -> Path:
+    """평가 CSV의 기본 저장 위치를 계산한다.
+
+    입력: 선택적으로 source/devel/install 안의 module 파일 경로.
+    반환: workspace ``records/openloop`` 디렉터리 경로.
+    """
     return resolve_project_root(module_file) / "records" / "openloop"
 
 
 def _seoul_time(value: datetime) -> datetime:
+    """datetime을 KST timezone-aware 값으로 표준화한다.
+
+    입력: naive 또는 timezone-aware datetime.
+    반환: ``Asia/Seoul`` 기준 datetime.
+    """
     if value.tzinfo is None:
         value = value.replace(tzinfo=SEOUL)
     return value.astimezone(SEOUL)
 
 
 def _format_stamp(stamp: Any) -> str:
+    """ROS time 호환 stamp를 정렬 가능한 초.나노초 문자열로 만든다.
+
+    입력: ``secs/nsecs`` 또는 ``sec/nanosec`` 속성이 있는 stamp.
+    반환: 9자리 나노초를 갖는 문자열.
+    """
     seconds = getattr(stamp, "secs", getattr(stamp, "sec", None))
     nanoseconds = getattr(stamp, "nsecs", getattr(stamp, "nanosec", None))
     if seconds is None or nanoseconds is None:
@@ -88,6 +103,11 @@ def _format_stamp(stamp: Any) -> str:
 
 
 def _json_list(value: Any) -> str:
+    """반복 가능한 metric 필드를 CSV 셀용 압축 JSON 배열로 변환한다.
+
+    입력: input key나 age처럼 순서가 있는 값.
+    반환: UTF-8 보존 JSON 배열 문자열.
+    """
     return json.dumps(list(value), separators=(",", ":"), ensure_ascii=False)
 
 
@@ -101,6 +121,11 @@ class CsvRunWriter:
         wall_clock: Callable[[], datetime] = datetime.now,
         checkpoint_manifest: str = "",
     ) -> None:
+        """평가 시작 시각을 이름에 넣은 단일 CSV 파일을 독점 생성한다.
+
+        입력: 기록 directory, model id, wall clock, checkpoint manifest.
+        부작용: directory를 만들고 CSV header를 즉시 flush한다.
+        """
         self._wall_clock = wall_clock
         self._model_id = str(model_id)
         self._checkpoint_manifest = str(checkpoint_manifest)
@@ -118,10 +143,20 @@ class CsvRunWriter:
         self._file.flush()
 
     def close(self) -> None:
+        """열린 CSV file handle을 닫아 마지막 행까지 디스크에 반영한다.
+
+        입력: 없음.
+        부작용: 이미 닫히지 않은 file handle을 close한다.
+        """
         if not self._file.closed:
             self._file.close()
 
     def append_metric(self, metric: Any) -> None:
+        """한 inference outcome을 검증한 뒤 CSV의 정확히 한 행으로 기록한다.
+
+        입력: ``validator_msgs/InferenceMetric`` 호환 객체.
+        부작용: outcome·age·history·호환성 정보를 CSV에 쓰고 flush한다.
+        """
         input_keys = list(metric.input_keys)
         input_age_ms = list(metric.input_age_ms)
         if len(input_keys) != len(input_age_ms):

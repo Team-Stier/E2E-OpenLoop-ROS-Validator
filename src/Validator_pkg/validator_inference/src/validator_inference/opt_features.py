@@ -17,6 +17,12 @@ class FeatureContractError(ValueError):
 
 @dataclass(frozen=True)
 class CameraCalibrationData:
+    """한 SparseDrive camera의 원본 픽셀 기준 calibration을 보관한다.
+
+    입력: frame, image size, intrinsic, distortion, camera-to-LiDAR transform.
+    반환: OptFeeder가 ``CameraCalibration`` message로 직렬화할 불변 값 객체.
+    """
+
     name: str
     frame_id: str
     image_width: int
@@ -29,6 +35,12 @@ class CameraCalibrationData:
 
 @dataclass(frozen=True)
 class DrivingFeatureData:
+    """모델 forward에 필요한 ego status와 정적 compatibility 입력을 보관한다.
+
+    입력: model id, status vector, TFv6 radar placeholder, camera calibrations.
+    반환: OptFeeder가 ``DrivingFeature``로 발행할 불변 값 객체.
+    """
+
     model_id: str
     status_feature: Tuple[float, ...]
     tfv6_radar: Tuple[float, ...]
@@ -40,6 +52,12 @@ class DrivingFeatureData:
 
 @dataclass(frozen=True)
 class FallbackTarget:
+    """navigation node 부재 시 발행하는 LiDAR frame의 전방 target을 나타낸다.
+
+    입력: topic과 ``Lidar3D-4`` 기준 좌표.
+    반환: ``PointStamped``로 직렬화할 불변 target 값.
+    """
+
     topic: str
     x: float
     y: float = 0.0
@@ -62,6 +80,11 @@ _TARGETS = {
 
 
 def _require_model(model_id: str) -> None:
+    """요청 model id가 OptFeeder가 지원하는 집합에 속하는지 확인한다.
+
+    입력: profile에서 선택된 model id.
+    부작용: 지원하지 않으면 ``FeatureContractError``를 발생시킨다.
+    """
     if model_id not in _SUPPORTED_MODELS:
         raise FeatureContractError(f"unsupported model_id: {model_id}")
 
@@ -73,6 +96,11 @@ def _numeric_tuple(
     *,
     exact_length: Optional[int] = None,
 ) -> Tuple[float, ...]:
+    """calibration sequence를 길이까지 검증한 float tuple로 바꾼다.
+
+    입력: camera 이름, field 이름, 수치 sequence, 선택적 정확한 길이.
+    반환: 모델 adapter가 사용할 불변 float tuple.
+    """
     if (
         not isinstance(value, Sequence)
         or isinstance(value, (str, bytes))
@@ -94,6 +122,11 @@ def _numeric_tuple(
 
 
 def _camera_data(camera: Mapping[str, Any]) -> CameraCalibrationData:
+    """profile camera JSON 한 항목을 검증된 calibration 값 객체로 변환한다.
+
+    입력: 한 camera calibration mapping.
+    반환: 이미지 크기와 projection 변환을 갖춘 ``CameraCalibrationData``.
+    """
     name = camera.get("name")
     if not isinstance(name, str) or not name:
         raise FeatureContractError("camera calibration requires a name")
@@ -154,6 +187,11 @@ def _camera_data(camera: Mapping[str, Any]) -> CameraCalibrationData:
 def _sparse_calibrations(
     profile_data: Optional[Mapping[str, Any]],
 ) -> Tuple[CameraCalibrationData, ...]:
+    """inline profile에서 SparseDrive의 front·left·right calibration을 읽는다.
+
+    입력: 선택 모델 profile data.
+    반환: 고정 순서 ``front, left, right``의 calibration tuple.
+    """
     try:
         cameras = profile_data["static_runtime_inputs"]["camera_calibration"][  # type: ignore[index]
             "cameras"
@@ -189,7 +227,11 @@ def build_driving_feature_data(
     ay: float = 0.0,
     profile_data: Optional[Mapping[str, Any]] = None,
 ) -> DrivingFeatureData:
-    """model-native status와 선택적 static/runtime compatibility data를 만든다."""
+    """ego motion을 모델별 status feature와 정적 compatibility data로 만든다.
+
+    입력: model id, ego 속도·가속도, 선택적 profile data.
+    반환: 해당 checkpoint의 status 순서와 calibration을 갖춘 driving feature.
+    """
 
     _require_model(model_id)
 
@@ -223,7 +265,11 @@ def build_driving_feature_data(
 
 
 def build_fallback_targets(model_id: str) -> Tuple[FallbackTarget, ...]:
-    """선택 모델이 소비하는 route topic만 반환한다."""
+    """선택 모델이 소비하는 route topic의 결정적 전방 fallback을 반환한다.
+
+    입력: 선택된 model id.
+    반환: TFv6는 이전·현재·다음, InterFuser는 현재 target tuple.
+    """
 
     _require_model(model_id)
     if model_id == "tfv6":
