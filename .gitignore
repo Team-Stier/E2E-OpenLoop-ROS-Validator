@@ -8,3 +8,9 @@ rosbag/*.bag
 # (선택) catkin_tools 사용 시 생성되는 폴더 제외
 .build_tools/
 .DS_Store
+
+# open-loop evaluation records
+records/openloop/*.csv
+
+# Downloaded model weights and their auxiliary binary assets
+models/

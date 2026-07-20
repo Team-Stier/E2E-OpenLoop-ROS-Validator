@@ -18,11 +18,10 @@ inference engine의 인풋이 되는 데이터를 저장하는 버퍼 객체
 토픽을 callback으로 객체 내부에 저장.
 pub:
 sub: 
-    /lidar3D/BEV
-    /image/main/processed
-    /image/left/processed
-    /image/right/processed
-    /Ego_topic
+    profile별 perception topic
+    /driving_feature
+    /route/target_point (필요한 profile만)
+    /lidar3D (TFv6 10-sweep history인 경우만)
 """
 ```
 
@@ -32,7 +31,10 @@ E2E-OpenLoop-ROS-Validator/
 ├── src/
 │   ├── MORAI-ROS_morai_msgs
 │   └── Validator_pkg
-└── rosbag/
+├── rosbag/
+├── models/               # 다운로드한 checkpoint와 auxiliary asset; Git 미추적
+└── records/
+    └── openloop/  # 평가별 inference_YYYYMMDDTHHMMSS+0900_{model_id}.csv
 ```
 코드 파일은 Validator_pkg 밑에 둘 것.
 `rosbag/`에 [2026-07-16-17-13-14.bag](https://drive.google.com/drive/folders/1IBFk-q1ZYYRfLVi6TD8P2BgOuWAzudab?usp=share_link)저장.
@@ -41,21 +43,11 @@ E2E-OpenLoop-ROS-Validator/
 ```mermaid
 flowchart TD
     rosbag((rosbag))
-    A["/lidar3D
-     \n =======================
-     \n sensor_msgs/PointCloud2"]
-    B0["/image/front/compressed
-     \n ===========================
-     \n sensor_msgs/CompressedImage"]
-    B1["/image/left/compressed
-     \n ===========================
-     \n sensor_msgs/CompressedImage"]
-    B2["/image/right/compressed
-     \n ===========================
-     \n sensor_msgs/CompressedImage"]
-    C["/Ego_topic 
-     \n ===========================
-     \n morai_msgs/EgoVehicleStatus"]
+    A["/lidar3D\n=======================\nsensor_msgs/PointCloud2"]
+    B0["/image_jpeg/front/compressed\n===========================\nsensor_msgs/CompressedImage"]
+    B1["/image_jpeg/left/compressed\n===========================\nsensor_msgs/CompressedImage"]
+    B2["/image_jpeg/right/compressed\n===========================\nsensor_msgs/CompressedImage"]
+    C["/Ego_topic\n===========================\nmorai_msgs/EgoVehicleStatus"]
 
     rosbag-->A
     rosbag-->B0
@@ -76,55 +68,49 @@ flowchart TD
     B1-->F
     B2-->F
 
-    G["/lidar3D/BEV
-     \n =================
-     \n sensor_msgs/Image"]
-    H0["/image/main/processed
-     \n =================
-     \n sensor_msgs/Image"]
-    H1["/image/left/processed
-     \n =================
-     \n sensor_msgs/Image"]
-    H2["/image/right/processed
-     \n =================
-     \n sensor_msgs/Image"]
-    I["/image/BEV
-     \n =================
-     \n sensor_msgs/Image"]
+    G["/lidar3D/BEV\n=================\nsensor_msgs/Image"]
+    H0["/image/main/processed\n=================\nsensor_msgs/Image"]
+    H1["/image/left/processed\n=================\nsensor_msgs/Image"]
+    H2["/image/right/processed\n=================\nsensor_msgs/Image"]
+    I["/image/BEV\n=================\nsensor_msgs/Image"]
+
+    R((opt feeder))
+    DF["/driving_feature\n=========================\nvalidator_msgs/DrivingFeature\nstatus, optional TFv6 radar, optional calibration"]
+    TP["/route/target_point\n=========================\ngeometry_msgs/PointStamped"]
     
     D-->G
     E-->H0
     E-->H1
     E-->H2
     F-->I
+    C-->R
+    R-->DF
+    R-->TP
 
     J((inference engine))
 
     G-->J
+    A-->J
     H0-->J
     H1-->J
     H2-->J
-    C-->J
+    DF-->J
+    TP-->J
 
 
-    K["/waypoints
-     \n =============
-     \n nav_msgs/Path"]
-    L["/inference_time
-     \n ===============
-     \n int"]
+    K["/waypoints\n=============\nnav_msgs/Path"]
+    Q["/inference_metric\n=================\nvalidator_msgs/InferenceMetric\nelapsed_ms is ms; -1.0 when no forward"]
 
     J-->K
-    J-->L
+    J-->Q
 
     N((recoder))
     M((visualizer))
     O((rviz))
 
     K-->M
-    L-->N
-    M-->P[" "]
-    P-->O
+    Q-->N
+    M-->O
     G-->M
     I-->M
 
@@ -140,13 +126,18 @@ raw data를 가공하여 `inference engine`과 `visualizer`에 서빙하는 계�
 - 4개 모델에 대응 가능해야 함.
 
 `lidar BEV processor`, `image adaptor` 노드는 모델이 기대하는 입력 포멧에 맞춰 임의로 토픽 추가, 변경.
-`/image/front/compressed`, `/image/left/compressed`, `/image/right/compressed`를 stitch하는 경우 `/image/main/processed`로 발행하고 `/image/left/processed`, `/image/right/processed`는 발행하지 않도록 함.
+`/image_jpeg/front/compressed`, `/image_jpeg/left/compressed`, `/image_jpeg/right/compressed`를 stitch하는 경우 `/image/main/processed`로 발행하고 `/image/left/processed`, `/image/right/processed`는 발행하지 않도록 함.
 
 ### 2.2 inference layer
-`inference engine`, `recoder`로 구성됨.
+`opt feeder`, `inference engine`, `recoder`로 구성됨.
 4개 모델에 대한 추론 루프. 모델의 추론 결과 waypoints를 발행한다.
-`recoder`는 추론 시간을 기록. 이후 추가적인 metric을 기록하도록 확장 할 수 있도록 한다.
-- 책임: 추론 루프 구동 및 waypoints 발행, 추론 시간 기록.
+`recoder`는 추론 시간과 매 10 Hz tick의 상태를 CSV로 기록한다. `inference_completed`, `not_ready`, `busy_tick_skipped`가 모두 기록되며, 평가마다 `records/openloop/`에 timestamp·model ID가 포함된 새 CSV가 생성된다.
+- `opt feeder`는 `/Ego_topic`과 로컬 `profile.json`을 읽어 velocity/acceleration, profile-specific driving feature, fallback command를 `/driving_feature`로 발행한다. TFv6는 source-padded empty radar를, SparseDrive V2는 profile 내부 calibration을 같은 message에 담는다. InterFuser처럼 target point가 필요한 profile에는 `/route/target_point`도 발행한다.
+- `inference engine`의 `InputBuffer`는 profile 입력을 저장하고 10 Hz causal snapshot을 selected model에 전달한다. 각 input은 `/driving_feature.header.stamp` 이하의 최신 sample만 사용하며, non-history input은 current/previous 두 개를, TFv6만 raw `/lidar3D` 10-sweep FIFO와 timestamp별 pose history를 유지한다.
+- `InferenceWorker`는 한 번에 하나의 model forward만 실행한다. worker가 busy인 tick은 대기시키지 않고 `busy_tick_skipped`로 기록하고, 완료 결과는 one-slot mailbox로 다음 tick에 publish한다.
+- 책임: opt feeder의 auxiliary input 생성, 추론 루프 구동 및 waypoints 발행, 추론 시간과 입력 age를 포함한 평가 기록.
+
+구현 전 설계는 [Inference Engine 설계](docs/inference_engine_design.md), 모델별 실제 tensor/asset 계약은 [Model I/O Contracts](docs/model_io_contracts.md)에 정리한다.
 
 ### 2.3 visualization layer
 `visualizer`노드로 구성됨.

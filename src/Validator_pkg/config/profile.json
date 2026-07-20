@@ -1,0 +1,219 @@
+{
+  "schema_version": "2.1",
+  "selection": {
+    "ros_parameter": "~model_id",
+    "profile_file": "src/Validator_pkg/config/profile.json",
+    "local_only": true,
+    "allowed_values": [
+      "tfv6",
+      "interfuser",
+      "diffusiondrive_v2",
+      "sparsedrive_v2"
+    ]
+  },
+  "observed_bag_contract": {
+    "bag_path": "rosbag/2026-07-16-17-13-14.bag",
+    "raw_topics": {
+      "lidar": "/lidar3D",
+      "front_camera": "/image_jpeg/front/compressed",
+      "left_camera": "/image_jpeg/left/compressed",
+      "right_camera": "/image_jpeg/right/compressed",
+      "ego": "/Ego_topic",
+      "tf": "/tf"
+    },
+    "lidar": {
+      "ros_type": "sensor_msgs/PointCloud2",
+      "frame_id": "Lidar3D-4",
+      "fields": ["x", "y", "z", "intensity"],
+      "median_period_ms": 107.0,
+      "static_base_link_to_lidar_translation_m": [2.0, 0.0, 1.5]
+    },
+    "cameras": {
+      "front": {"frame_id": "Camera-1", "resolution": [1280, 720], "median_period_ms": 49.0},
+      "left": {"frame_id": "Camera-2", "resolution": [640, 480], "median_period_ms": 50.0},
+      "right": {"frame_id": "Camera-3", "resolution": [640, 480], "median_period_ms": 50.0}
+    },
+    "known_absences": [
+      "CameraInfo/intrinsic/distortion is not recorded in the bag.",
+      "No radar topic is recorded in the bag."
+    ]
+  },
+  "common_inference_policy": {
+    "reference_input": "/driving_feature",
+    "reference_stamp": "DrivingFeature.header.stamp copied from EgoVehicleStatus.header.stamp",
+    "snapshot_policy": "For every required input choose the newest buffered message whose header.stamp is less than or equal to DrivingFeature.header.stamp. Never use a future message. Non-history inputs retain current and previous stamped messages; history inputs retain their profile FIFO.",
+    "causal_latest_depth": 2,
+    "stale_input_policy": "accept_and_record",
+    "input_age_ms": "reference_stamp - input.header.stamp; signed",
+    "frame_contract": {
+      "ros_path_frame": "Lidar3D-4",
+      "model_output_to_lidar_frame": "First convert the model ego coordinates to ROS base_link coordinates. The bag TF is T_base_from_lidar (base_link parent, Lidar3D-4 child); publish p_lidar = inverse(T_base_from_lidar) * p_base in Lidar3D-4.",
+      "no_global_route_frame": true
+    },
+    "main_loop": {
+      "rate_hz": 10.0,
+      "trigger": "rospy.Timer",
+      "busy_policy": "skip_tick_and_record_busy_tick_skipped"
+    },
+    "inference_worker": {
+      "execution": "single_forward_worker",
+      "max_concurrent_forwards": 1,
+      "queue_depth": 0,
+      "submit_policy": "reject_when_busy",
+      "completion_policy": "worker writes exactly one result into a lock-protected one-slot completion mailbox; the next timer tick publishes and records that result before taking another frame"
+    },
+    "ros_time": {
+      "use_sim_time": true,
+      "clock_topic": "/clock",
+      "replay_command_requires_clock": true,
+      "wall_clock_only_for": ["run_filename", "run_started_at", "tick_wall_time"]
+    },
+    "outputs": {
+      "waypoints": {"topic": "/waypoints", "ros_type": "nav_msgs/Path"},
+      "inference_metric": {"topic": "/inference_metric", "ros_type": "validator_msgs/InferenceMetric", "row_key": "run_id plus tick_index", "elapsed_ms_contract": {"unit": "ms", "inference_completed": "measured forward elapsed time", "not_ready_or_busy_tick_skipped": -1.0}, "fields": ["run_id", "tick_index", "reference_stamp", "outcome", "elapsed_ms", "missing_input_keys", "compatibility_flags", "input_age_ms", "history_count", "history_span_ms", "rng_seed", "calibration_profile_sha256"]}
+    },
+    "recorder": {
+      "format": "csv",
+      "start_policy": "node_startup",
+      "row_trigger_topic": "/inference_metric",
+      "row_trigger_policy": "append_exactly_one_row_per_inference_metric_message",
+      "record_dir_parameter": "~record_dir",
+      "default_record_dir": "<project-root>/records/openloop",
+      "run_timestamp_source": "system_wall_clock_at_node_startup",
+      "filename_pattern": "inference_{YYYYMMDDTHHMMSS+0900}_{model_id}.csv",
+      "recorded_outcomes": ["inference_completed", "not_ready", "busy_tick_skipped"],
+      "csv_columns": [
+        "run_id", "run_started_at", "model_id", "profile_sha256", "checkpoint_manifest", "tick_index", "tick_wall_time", "reference_stamp", "outcome", "elapsed_ms", "missing_input_keys", "compatibility_flags", "history_count", "history_span_ms", "rng_seed", "age_lidar_raw_ms", "age_lidar_bev_ms", "age_camera_main_ms", "age_camera_left_ms", "age_camera_right_ms", "age_camera_center_ms", "age_driving_feature_ms", "age_route_target_point_ms", "age_route_target_point_previous_ms", "age_route_target_point_next_ms", "calibration_profile_sha256"
+      ]
+    },
+    "opt_feeder": {
+      "node_name": "OptFeederNode",
+      "source_topic": "/Ego_topic",
+      "driving_feature_topic": "/driving_feature",
+      "driving_feature_ros_type": "validator_msgs/DrivingFeature",
+      "driving_feature_contract": "Header stamp is copied from EgoVehicleStatus. status_feature contains the selected profile's exact ordered status vector. tfv6_radar is populated only for TFv6 with source-padded empty radar observations. camera_calibrations contains the selected profile's validated inline calibration only for SparseDrive V2.",
+      "route_target_topics": {
+        "current": "/route/target_point",
+        "previous": "/route/target_point_previous",
+        "next": "/route/target_point_next",
+        "ros_type": "geometry_msgs/PointStamped",
+        "frame_id": "Lidar3D-4"
+      },
+      "fallback_policy": {
+        "source_field": "fallback",
+        "interfuser_command": "LANEFOLLOW",
+        "navsim_command": "STRAIGHT",
+        "tfv6_command": "LANEFOLLOW",
+        "route_points_lidar_m": {
+          "previous": [5.0, 0.0, 0.0],
+          "current": [15.0, 0.0, 0.0],
+          "next": [30.0, 0.0, 0.0]
+        }
+      }
+    }
+  },
+  "profiles": [
+    {
+      "id": "tfv6",
+      "model_entrypoint": "TFv6Model",
+      "reference_variant": "ln2697/tfv6 tfv6_resnet34, CARLA 3-camera checkpoint ensemble",
+      "source": {
+        "repository": "https://github.com/autonomousvision/lead",
+        "commit": "5f7199bfe89c220f105a8c52fb9df1168eee202",
+        "checkpoint_repository": "https://huggingface.co/ln2697/tfv6",
+        "checkpoint_revision": "main"
+      },
+      "runtime_assets": [
+        {"role": "checkpoint_config", "path": "models/tfv6/tfv6_resnet34/config.json", "source_path": "tfv6_resnet34/config.json"},
+        {"role": "ensemble_weight", "path": "models/tfv6/tfv6_resnet34/model_0030_0.pth", "source_path": "tfv6_resnet34/model_0030_0.pth", "sha256": "7ce71a2e70a9e75c0bf60d842ee2e7976ffff94f4a96e3763de0fe550ec780ce"},
+        {"role": "ensemble_weight", "path": "models/tfv6/tfv6_resnet34/model_0030_1.pth", "source_path": "tfv6_resnet34/model_0030_1.pth", "sha256": "fe3c9fe315fedfd5a9fc0d859e405028c28ff8f60b7edcd86613cd0a7c8d3cd6"},
+        {"role": "ensemble_weight", "path": "models/tfv6/tfv6_resnet34/model_0030_2.pth", "source_path": "tfv6_resnet34/model_0030_2.pth", "sha256": "197947ff0f20e58d52e38aae87617296335d3482af8b59a27efb37a3422678bc"}
+      ],
+      "buffer_requirements": {
+        "latest_inputs": ["camera_main", "driving_feature", "route_target_point", "route_target_point_previous", "route_target_point_next"],
+        "history_inputs": [
+          {"key": "lidar_raw", "topic": "/lidar3D", "ros_type": "sensor_msgs/PointCloud2", "fifo_depth": 10, "warmup_required": true, "anchor_policy": "latest sweep at or before reference stamp", "paired_pose": "map_to_base_link at each sweep stamp", "pose_interpolation": "linear translation plus quaternion slerp between bracketing TF messages", "max_tf_bracket_gap_ms": 120}
+        ]
+      },
+      "required_inputs": [
+        {"key": "camera_main", "topic": "/image/tfv6/panorama", "ros_type": "sensor_msgs/Image", "preprocess_contract": "RGB uint8 CHW-equivalent panorama, left-front-right order, 384x1152. The selected checkpoint's original CARLA rig is three 384x384 views; current bag views are deterministically resized into those slots."},
+        {"key": "lidar_raw", "topic": "/lidar3D", "ros_type": "sensor_msgs/PointCloud2", "preprocess_contract": "10 chronological raw sweeps; transform each Lidar3D-4 sweep through base_link into the newest sweep anchor using map-to-base_link pose history; convert ROS x-forward/y-left to the checkpoint's CARLA x-forward/y-right; rasterize the merged points as 1x320x384 using x=[-32,64], y=[-40,40], 4 px/m, clip=5."},
+        {"key": "driving_feature", "topic": "/driving_feature", "ros_type": "validator_msgs/DrivingFeature", "preprocess_contract": "status fields are CARLA 6-way command [LEFT, RIGHT, STRAIGHT, LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT] and forward speed in m/s. LANEFOLLOW fallback is [0,0,0,1,0,0]. tfv6_radar is the exact source-padded empty observation described by radar_compatibility."},
+        {"key": "route_target_point", "topic": "/route/target_point", "ros_type": "geometry_msgs/PointStamped", "preprocess_contract": "current route point transformed from Lidar3D-4 to checkpoint CARLA ego coordinates and normalized by [200,50] inside the original planning decoder."},
+        {"key": "route_target_point_previous", "topic": "/route/target_point_previous", "ros_type": "geometry_msgs/PointStamped", "preprocess_contract": "previous route point; selected checkpoint has use_previous_tp=true."},
+        {"key": "route_target_point_next", "topic": "/route/target_point_next", "ros_type": "geometry_msgs/PointStamped", "preprocess_contract": "next route point; selected checkpoint has use_next_tp=true."}
+      ],
+      "radar_compatibility": {"enabled": true, "owner": "OptFeederNode", "source_equivalent_operation": "Pass four empty raw radar arrays with shape (0,4) to the original per-sensor filter_and_pad_radars routine. It produces four (75,4) zero blocks and appends sensor_id 0,1,2,3 as column 5.", "per_sensor_tensor_shape": [75, 5], "tensor_shape_after_concatenation": [300, 5], "compatibility_flag": "synthetic_radar_empty", "benchmark_equivalence": "not an official radar-free checkpoint"},
+      "output": {"coordinate_frame": "CARLA ego-relative", "ros_frame_id": "Lidar3D-4", "coordinate_conversion": "x_ros=x_carla, y_ros=-y_carla before static base-to-lidar transform", "waypoint_count": 8, "interval_s": 0.25},
+      "readiness": {"state": "compatibility_ready_after_weights_and_history_warmup", "blocking_inputs": ["lidar_raw history and paired TF pose", "camera_main", "driving_feature", "route_target_point", "route_target_point_previous", "route_target_point_next"], "never_skip_for_stale": true},
+      "integration_gaps": ["The selected checkpoint has no official radar-free mode. This profile executes the source padding rule with empty radar observations and records synthetic_radar_empty for every result."]
+    },
+    {
+      "id": "interfuser",
+      "model_entrypoint": "InterFuserModel",
+      "reference_variant": "official CARLA leaderboard agent",
+      "source": {"repository": "https://github.com/opendilab/InterFuser", "commit": "f0be8ea294c49a59febaa032dd6da40b475e3657"},
+      "runtime_assets": [
+        {"role": "checkpoint", "path": "models/interfuser/official_carla/interfuser.pth.tar", "source_url": "http://43.163.208.95/s/jRfM", "expected_filename": "interfuser.pth.tar", "sha256": null, "hash_policy": "compute_and_record_after_download"}
+      ],
+      "buffer_requirements": {"latest_inputs": ["camera_front_224", "camera_left_128", "camera_right_128", "camera_front_center_128", "lidar_bev", "driving_feature", "route_target_point"], "history_inputs": []},
+      "required_inputs": [
+        {"key": "camera_front_224", "topic": "/image/interfuser/front_224", "ros_type": "sensor_msgs/Image", "preprocess_contract": "RGB, resize 341x256 then center-crop 224x224, ImageNet normalization."},
+        {"key": "camera_left_128", "topic": "/image/interfuser/left_128", "ros_type": "sensor_msgs/Image", "preprocess_contract": "RGB, resize 195x146 then center-crop 128x128, ImageNet normalization."},
+        {"key": "camera_right_128", "topic": "/image/interfuser/right_128", "ros_type": "sensor_msgs/Image", "preprocess_contract": "RGB, resize 195x146 then center-crop 128x128, ImageNet normalization."},
+        {"key": "camera_front_center_128", "topic": "/image/interfuser/front_center_128", "ros_type": "sensor_msgs/Image", "preprocess_contract": "A separate center-crop 128x128 from the original front image; it is not a fourth physical camera."},
+        {"key": "lidar_bev", "topic": "/lidar3D/interfuser_histogram", "ros_type": "sensor_msgs/Image", "preprocess_contract": "3x224x224 float32 [below(z<=-2), above(z>-2), total]; x bins [-28,28], y bins [-28,0] in the original CARLA convention, 8 px/m, clip=5."},
+        {"key": "driving_feature", "topic": "/driving_feature", "ros_type": "validator_msgs/DrivingFeature", "preprocess_contract": "status_feature = CARLA command[6] + forward_speed[1] in m/s; LANEFOLLOW fallback is [0,0,0,1,0,0]."},
+        {"key": "route_target_point", "topic": "/route/target_point", "ros_type": "geometry_msgs/PointStamped", "preprocess_contract": "ego-local route vector, converted from Lidar3D-4 to the original CARLA coordinate convention."}
+      ],
+      "output": {"coordinate_frame": "CARLA ego-relative", "ros_frame_id": "Lidar3D-4", "coordinate_conversion": "x_ros=x_carla, y_ros=-y_carla before static base-to-lidar transform", "waypoint_count": 10},
+      "readiness": {"state": "ready_after_checkpoint", "never_skip_for_stale": true},
+      "integration_gaps": ["The current three-camera bag can satisfy the tensor contract after deterministic resizing. Its physical rig differs from CARLA training, so recorder writes a compatibility flag."]
+    },
+    {
+      "id": "diffusiondrive_v2",
+      "model_entrypoint": "DiffusionDriveV2Model",
+      "reference_variant": "official NAVSIM DiffusionDriveV2 SEL agent",
+      "source": {"repository": "https://github.com/hustvl/DiffusionDriveV2", "commit": "1cd12a1e155c34dcc471261835444c8d5587580b", "checkpoint_repository": "https://huggingface.co/hustvl/DiffusionDriveV2", "checkpoint_revision": "fa6c96fc50e076e4f72f8a1b7faf4f3013b11786"},
+      "runtime_assets": [
+        {"role": "checkpoint", "path": "models/diffusiondrive_v2/navsim_v2/diffusiondrivev2_sel.ckpt", "source_path": "diffusiondrivev2_sel.ckpt", "sha256": "452c4e0dd328c49b981f3fd5ed13eb1c6a2b0f3a9486adf43b40a5645ed543b1"},
+        {"role": "image_backbone", "path": "models/shared/timm/resnet34.a1_in1k/pytorch_model.bin", "source_url": "https://huggingface.co/timm/resnet34.a1_in1k/resolve/main/pytorch_model.bin", "sha256": "f6c1d7785b5d0e796a83f9643fe2cb952ac95740daa9fb2d5c8c6514fdadaeb3"},
+        {"role": "trajectory_anchor", "path": "models/diffusiondrive_v2/navsim_v2/kmeans_navsim_traj_20.npy", "source_repository_path": "kmeans_navsim_traj_20.npy", "shape": [20, 8, 2], "sha256": "2d341e525d7882ee5e916c67d37bea571e4c793cf801f0fff3eff59d38b20d98", "required_by": "TransfuserConfig.plan_anchor_path", "status": "official repository asset; store with this model checkpoint"}
+      ],
+      "buffer_requirements": {"latest_inputs": ["camera_main", "lidar_bev", "driving_feature"], "history_inputs": []},
+      "required_inputs": [
+        {"key": "camera_main", "topic": "/image/diffusiondrive_v2/stitched", "ros_type": "sensor_msgs/Image", "preprocess_contract": "latest left/front/right RGB only; crop left/right [28:-28,416:-416], front [28:-28], stitch left-front-right, resize 1024x256, scale to [0,1], no ImageNet normalization."},
+        {"key": "lidar_bev", "topic": "/lidar3D/diffusiondrive_v2_histogram", "ros_type": "sensor_msgs/Image", "preprocess_contract": "latest sweep only; 1x256x256 float32 above(z>0.2) histogram, x/y=[-32,32], 4 px/m, clip=5, z<100."},
+        {"key": "driving_feature", "topic": "/driving_feature", "ros_type": "validator_msgs/DrivingFeature", "preprocess_contract": "status_feature = driving_command[4] + ego_velocity[2] + ego_acceleration[2]. NAVSIM order is [LEFT, STRAIGHT, RIGHT, UNKNOWN]; velocity/acceleration are in ego x-forward/y-left m/s and m/s^2."}
+      ],
+      "inference_policy": {"pdm": "excluded", "source_return": "return trajectory = traj_to_score[:, -1] before the evaluation-only PDM branch", "source_derivative": "DiffusionDriveV2InferenceModel removes PDM imports, PDM process-pool creation, metric-cache loading, and reward_dict return while retaining checkpoint-loaded diffusion and selector weights.", "rng_seed_policy": "sha256(model_id + reference_stamp_nsec + run_id) truncated to uint64; seed is recorded in InferenceMetric and CSV"},
+      "output": {"coordinate_frame": "NAVSIM ego-relative SE2", "ros_frame_id": "Lidar3D-4", "waypoint_count": 8, "time_horizon_s": 4.0, "interval_s": 0.5, "published_forward_output": "trajectory = traj_to_score[:, -1]", "path_export": "enabled without PDM or metric-cache"},
+      "readiness": {"state": "ready_after_runtime_assets", "never_skip_for_stale": true},
+      "integration_gaps": ["The original SEL class combines inference with evaluation-only PDM setup. The selected model object must retain the source neural candidate selector but omit that evaluator setup; this does not alter checkpoint weights."]
+    },
+    {
+      "id": "sparsedrive_v2",
+      "model_entrypoint": "SparseDriveV2Model",
+      "reference_variant": "official NAVSIMv2 implementation",
+      "source": {"repository": "https://github.com/swc-17/SparseDriveV2", "commit": "696ef77924eb9e0a4b4047d013a50e9854bfa026", "checkpoint_repository": "https://huggingface.co/wenchaosun/SparseDriveV2", "checkpoint_revision": "main"},
+      "runtime_assets": [
+        {"role": "checkpoint", "path": "models/sparsedrive_v2/navsim_v2/sparsedrive_navsimv2_90p3.ckpt", "source_path": "sparsedrive_navsimv2_90p3.ckpt", "sha256": "b22438dbf8a5966ea532599ba6cf905e599594e758938b8fbab1f6bd257cbc4b"},
+        {"role": "image_backbone", "path": "models/shared/timm/resnet34.a1_in1k/pytorch_model.bin", "source_url": "https://huggingface.co/timm/resnet34.a1_in1k/resolve/main/pytorch_model.bin", "sha256": "f6c1d7785b5d0e796a83f9643fe2cb952ac95740daa9fb2d5c8c6514fdadaeb3"},
+        {"role": "path_vocabulary", "path": "models/sparsedrive_v2/navsim_v2/path_1024.npy", "source_path": "path_1024.npy", "sha256": "97ff2e843c264fa15a38a6a3920985fd4bdb8f387ef409b2a97d44eb5c88f9c1"},
+        {"role": "velocity_vocabulary", "path": "models/sparsedrive_v2/navsim_v2/velocity_256.npy", "source_path": "velocity_256.npy", "sha256": "acfaa8699401a20283c2744f7ea4beb4f8c734f3a3f145ca0366a3ba6abae2ee"},
+        {"role": "trajectory_vocabulary", "path": "models/sparsedrive_v2/navsim_v2/trajectory_1024_256.npz", "source_path": "trajectory_1024_256.npz", "sha256": "94868f922fcd7ac3a027057476ddf630948c908053fec483d8936e84b2ad8683"}
+      ],
+      "static_runtime_inputs": {"camera_calibration": {"source": "profile_inline", "lidar_frame_id": "Lidar3D-4", "projection_contract": "For each camera fill K_original_3x3, distortion_model, distortion_coefficients, and T_lidar_from_camera_4x4. At runtime compute T_camera_from_lidar = inverse(T_lidar_from_camera), then lidar2img = A_resize_crop * K_original * T_camera_from_lidar[:3,:]. Distortion is removed according to the supplied model before the resize/crop image transform.", "cameras": [{"name": "front", "frame_id": "Camera-1", "image_size_px": [1280, 720], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "left", "frame_id": "Camera-2", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "right", "frame_id": "Camera-3", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}]}},
+      "buffer_requirements": {"latest_inputs": ["camera_left", "camera_main", "camera_right", "driving_feature"], "history_inputs": []},
+      "required_inputs": [
+        {"key": "camera_left", "topic": "/image/sparsedrive_v2/left", "ros_type": "sensor_msgs/Image", "preprocess_contract": "cam_l0 RGB, resize 1920x1080-equivalent to 512x288, center crop (0,32,512,288), final 256x512, mean=[123.675,116.28,103.53], std=[58.395,57.12,57.375]."},
+        {"key": "camera_main", "topic": "/image/sparsedrive_v2/front", "ros_type": "sensor_msgs/Image", "preprocess_contract": "cam_f0 using the same 256x512 RGB/normalization contract."},
+        {"key": "camera_right", "topic": "/image/sparsedrive_v2/right", "ros_type": "sensor_msgs/Image", "preprocess_contract": "cam_r0 using the same 256x512 RGB/normalization contract."},
+        {"key": "driving_feature", "topic": "/driving_feature", "ros_type": "validator_msgs/DrivingFeature", "preprocess_contract": "status_feature = driving_command[4] + ego_velocity[2] + ego_acceleration[2], plus camera_calibrations. OptFeeder loads calibration at startup; selected-model preprocessing applies the same resize/crop matrix to lidar2img before forward."}
+      ],
+      "output": {"coordinate_frame": "NAVSIM ego-relative SE2", "ros_frame_id": "Lidar3D-4", "coordinate_conversion": "x_ros=x_navsim, y_ros=y_navsim before static base-to-lidar transform", "waypoint_count": 8, "time_horizon_s": 4.0, "interval_s": 0.5},
+      "readiness": {"state": "blocked_until_inline_camera_calibration_is_complete", "blocking_inputs": ["static_runtime_inputs.camera_calibration"], "never_skip_for_stale": true},
+      "integration_gaps": ["The only user-supplied runtime data is the complete inline calibration object. The bag does not contain CameraInfo/intrinsic/distortion, so this object cannot be fabricated faithfully."]
+    }
+  ]
+}
