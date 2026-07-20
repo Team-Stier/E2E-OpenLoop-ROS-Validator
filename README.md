@@ -142,3 +142,23 @@ raw data를 가공하여 `inference engine`과 `visualizer`에 서빙하는 계�
 ### 2.3 visualization layer
 `visualizer`노드로 구성됨.
 lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
+
+## 3. Open-loop 실행
+
+아래 예시는 `interfuser`를 선택한다. 다른 모델은 세 명령의 model ID를 동일하게 바꾼다. SparseDrive V2는 실행 전에 `src/Validator_pkg/config/profile.json`의 세 camera calibration을 모두 채워야 한다.
+
+```bash
+catkin_make
+source devel/setup.bash
+rosrun validator_inference fetch_model_assets.py --model-id interfuser
+roslaunch validator_inference openloop_inference.launch model_id:=interfuser
+```
+
+launch는 `/use_sim_time=true`를 설정하고 OptFeeder, InferenceEngine, Recorder 세 노드만 시작한다. PreprocessLayer를 실행한 뒤 다른 terminal에서 bag clock과 함께 재생한다.
+
+```bash
+source devel/setup.bash
+rosbag play --clock rosbag/2026-07-16-17-13-14.bag
+```
+
+기본 결과 위치는 프로젝트의 `records/openloop/`이며 launch 인자 `profile_file:=...`, `record_dir:=...`로 로컬 경로를 바꿀 수 있다. `/waypoints`는 `Lidar3D-4` frame이고 매 tick 결과는 `/inference_metric` 하나를 통해 CSV에 기록된다.

@@ -150,7 +150,27 @@ The model returns B×8×3 NAVSIM ego SE2 poses over 4.0 s at 0.5 s intervals. NA
 
 After the model assets are downloaded and the implementation passes its smoke tests, the only runtime value the user must supply is SparseDrive V2's inline calibration object.
 
-## 8. References
+## 8. Runtime command contract
+
+각 모델의 source/checkpoint/auxiliary asset은 선택한 local profile을 기준으로 먼저 내려받고 검증한다. 예시는 InterFuser이며 다른 모델은 model ID를 동일하게 바꾼다.
+
+```bash
+catkin_make
+source devel/setup.bash
+rosrun validator_inference fetch_model_assets.py --model-id interfuser
+roslaunch validator_inference openloop_inference.launch model_id:=interfuser
+```
+
+PreprocessLayer를 함께 실행하고, 별도 terminal에서 ROS simulated time을 공급한다.
+
+```bash
+source devel/setup.bash
+rosbag play --clock rosbag/2026-07-16-17-13-14.bag
+```
+
+launch의 `profile_file`은 로컬 JSON만 허용하며 `record_dir`은 기본적으로 프로젝트의 `records/openloop/`다. SparseDrive V2는 profile의 세 calibration record가 완성되기 전에는 worker를 만들지 않는다.
+
+## 9. References
 
 - [TFv6 model card](https://huggingface.co/ln2697/tfv6)
 - [LEAD source](https://github.com/autonomousvision/lead)

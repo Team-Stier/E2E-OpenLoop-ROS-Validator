@@ -299,7 +299,7 @@ CARLA 계열 TFv6/InterFuser에 target을 넣을 때는 profile에 기록된 `T_
 
 ~~~text
 CameraCalibration.msg
-string camera_name
+string name
 string frame_id
 uint32 image_width
 uint32 image_height
@@ -382,3 +382,23 @@ DiagnosticArray는 fixed CSV schema가 아니므로 쓰지 않는다. InferenceM
 3. OptFeederNode test: command order, ego-frame velocity/acceleration, route fallback frame, TFv6 empty radar fields, inline calibration validation.
 4. Recorder test: node-start CSV, one row for every outcome, metric field-to-column mapping, and no secondary timing topic.
 5. per-model mock forward test followed by actual checkpoint smoke inference. DiffusionDrive V2 smoke test asserts no PDM import/process pool/metric-cache access.
+
+## 11. 재현 가능한 open-loop 실행
+
+`openloop_inference.launch`는 `/use_sim_time=true`를 설정하고 `OptFeederNode`, `InferenceEngineNode`, `RecorderNode`만 시작한다. `model_id`, 로컬 `profile_file`, `record_dir`를 launch argument로 받는다. 예를 들어 InterFuser 평가는 다음 순서로 준비한다.
+
+```bash
+catkin_make
+source devel/setup.bash
+rosrun validator_inference fetch_model_assets.py --model-id interfuser
+roslaunch validator_inference openloop_inference.launch model_id:=interfuser
+```
+
+PreprocessLayer가 필요한 model-specific image/LiDAR topic을 발행하도록 실행한 뒤, 별도 terminal에서 bag time을 공급한다.
+
+```bash
+source devel/setup.bash
+rosbag play --clock rosbag/2026-07-16-17-13-14.bag
+```
+
+launch 기본 CSV 위치는 프로젝트의 `records/openloop/`다. 별도의 timing topic은 없으며 `/inference_metric`의 각 메시지가 정확히 한 CSV row가 된다. SparseDrive V2의 shipped null calibration은 model/worker 생성 전에 거부된다.

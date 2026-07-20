@@ -47,3 +47,7 @@ catkin_install_python(PROGRAMS scripts/inference_engine_node.py
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../config/profile.json
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/config
 )
+
+install(DIRECTORY launch/
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+)
