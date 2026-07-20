@@ -42,6 +42,16 @@ class _BlockingModel:
         return ModelPrediction([[1.0, 2.0]], "test.BlockingModel")
 
 
+class _ImmediateModel:
+    def __init__(self, model_id="tfv6"):
+        self.selected_profile = SimpleNamespace(model_id=model_id)
+        self.calls = []
+
+    def forward(self, frame):
+        self.calls.append(frame)
+        return ModelPrediction([[1.0, 2.0]], "test.ImmediateModel")
+
+
 class _DiffusionModel:
     def __init__(self, model_id="diffusiondrive_v2"):
         self.selected_profile = SimpleNamespace(model_id=model_id)
@@ -108,6 +118,39 @@ def test_worker_rejects_second_submit_without_queueing_or_replacing_work():
     assert completion.rng_seed == 0
     assert worker.take_completed() is None
     assert model.calls == [first]
+
+
+def test_worker_preserves_completion_arriving_between_take_and_next_submit():
+    """A completion mailbox blocks a new forward until it is consumed.
+
+    This reproduces the timer interleaving where the engine sees no completion,
+    then the first forward completes immediately before that timer tries to
+    submit the next frame.  Admitting the second frame here would let it
+    overwrite the first one-slot mailbox result.
+    """
+    model = _ImmediateModel()
+    worker = InferenceWorker(model, "run-mailbox")
+    first = _frame(1)
+    second = _frame(2)
+
+    # Model the running first forward without scheduling a nondeterministic
+    # thread, then execute the exact take -> complete -> submit interleaving.
+    assert worker._forward_lock.acquire(blocking=False) is True
+    assert worker.take_completed() is None
+    worker._run_forward(first)
+
+    rejected = worker.try_submit(second)
+
+    assert rejected.accepted is False
+    assert rejected.reason == "busy_tick_skipped"
+    first_completion = worker.take_completed()
+    assert first_completion is not None
+    assert first_completion.frame is first
+
+    assert worker.try_submit(second).accepted is True
+    second_completion = _wait_completion(worker)
+    assert second_completion.frame is second
+    assert model.calls == [first, second]
 
 
 def test_diffusion_seed_is_stable_big_endian_uint64_and_forwarded_only_to_ddv2():

@@ -78,6 +78,14 @@ class InferenceWorker:
     def try_submit(self, frame: Any) -> SubmitResult:
         if not self._forward_lock.acquire(blocking=False):
             return SubmitResult(False, "busy_tick_skipped")
+        # Keep the one-slot completion mailbox lossless.  The engine can take
+        # a completion just before this call while the previous forward then
+        # finishes; in that interleaving the forward lock is free, but its
+        # completion still has to be published before another forward may run.
+        with self._completion_lock:
+            if self._completion is not None:
+                self._forward_lock.release()
+                return SubmitResult(False, "busy_tick_skipped")
         try:
             thread = Thread(target=self._run_forward, args=(frame,), daemon=True)
             thread.start()
