@@ -8,6 +8,7 @@ from typing import Any
 
 from validator_inference.assets import (
     DIFFUSION_DERIVATIVE_RELATIVE_PATH,
+    selector_flow_stages,
     source_checkout_path,
     verify_runtime_assets,
 )
@@ -28,6 +29,42 @@ SOURCE_SYMBOL = (
     "navsim.agents.diffusiondrivev2.diffusiondrivev2_model_sel_inference."
     "V2TransfuserModel.forward"
 )
+
+# The PDM-free derivative intentionally deletes only this evaluation vocabulary
+# parameter/buffer.  Every other official checkpoint key must still strict-match.
+PDM_REMOVED_CHECKPOINT_KEY = "_trajectory_head.vocab"
+
+
+def load_diffusiondrive_selector_state_dict(
+    network: Any,
+    raw_state: dict[str, Any],
+    *,
+    checkpoint_path: str | Path,
+) -> None:
+    """Strict-load the official selector checkpoint into the PDM-free derivative."""
+    normalized: dict[str, Any] = {}
+    for raw_key, value in raw_state.items():
+        key = str(raw_key)
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        if key.startswith("agent._transfuser_model."):
+            key = key[len("agent._transfuser_model.") :]
+        if key == PDM_REMOVED_CHECKPOINT_KEY:
+            continue
+        if key in normalized:
+            raise SourceRuntimeError(
+                f"model diffusiondrive_v2 checkpoint {checkpoint_path} has duplicate "
+                f"normalized key {key}"
+            )
+        normalized[key] = value
+
+    load_source_state_dict(
+        network,
+        normalized,
+        model_id="diffusiondrive_v2",
+        checkpoint_path=checkpoint_path,
+        documented_prefixes=(),
+    )
 
 
 class _DiffusionDriveSelectorRuntime:
@@ -59,6 +96,13 @@ class _DiffusionDriveSelectorRuntime:
             raise ModelRuntimeError(
                 f"model diffusiondrive_v2 derivative {derivative} lacks final learned selector return"
             )
+        try:
+            selector_flow_stages(derivative_text)
+        except Exception as error:
+            raise ModelRuntimeError(
+                f"model diffusiondrive_v2 derivative {derivative} violates learned "
+                f"selector structure: {error}"
+            ) from error
 
         prepend_source_path(checkout)
         try:
@@ -80,15 +124,10 @@ class _DiffusionDriveSelectorRuntime:
             network = model_module.V2TransfuserModel(config)
             checkpoint = torch.load(str(roles["checkpoint"]), map_location="cpu")
             raw_state = checkpoint.get("state_dict", checkpoint)
-            load_source_state_dict(
+            load_diffusiondrive_selector_state_dict(
                 network,
                 raw_state,
-                model_id="diffusiondrive_v2",
                 checkpoint_path=roles["checkpoint"],
-                documented_prefixes=(
-                    "agent._transfuser_model.",
-                    "_transfuser_model.",
-                ),
             )
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             network.to(device).eval()

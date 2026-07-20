@@ -25,19 +25,121 @@ from validator_inference.models.contracts import (
 
 SOURCE_SYMBOL = "lead.inference.open_loop_inference.OpenLoopInference.forward"
 TEMPORAL_LIDAR_SYMBOL = "lead.data_loader.carla_dataset_utils.rasterize_lidar"
+GROUND_REMOVAL_SYMBOL = "lead.common.ransac.remove_ground"
+
+
+def _rigid_transform_matrix(declaration: dict[str, Any]) -> np.ndarray:
+    try:
+        translation = np.asarray(declaration["translation_m"], dtype=np.float64)
+        quaternion = np.asarray(declaration["quaternion_xyzw"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ModelRuntimeError(
+            "model tfv6 requires full T_base_from_lidar translation/quaternion"
+        ) from error
+    if translation.shape != (3,) or quaternion.shape != (4,):
+        raise ModelRuntimeError(
+            "model tfv6 T_base_from_lidar requires translation[3] and quaternion[4]"
+        )
+    x, y, z, w = quaternion
+    norm = float(np.dot(quaternion, quaternion))
+    if norm <= np.finfo(float).eps:
+        raise ModelRuntimeError("model tfv6 T_base_from_lidar quaternion is zero")
+    scale = 2.0 / norm
+    matrix = np.asarray(
+        [
+            [
+                1.0 - scale * (y * y + z * z),
+                scale * (x * y - z * w),
+                scale * (x * z + y * w),
+                translation[0],
+            ],
+            [
+                scale * (x * y + z * w),
+                1.0 - scale * (x * x + z * z),
+                scale * (y * z - x * w),
+                translation[1],
+            ],
+            [
+                scale * (x * z - y * w),
+                scale * (y * z + x * w),
+                1.0 - scale * (x * x + y * y),
+                translation[2],
+            ],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return matrix
+
+
+def _transform_xyz(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    homogeneous = np.concatenate(
+        [points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1
+    )
+    return (transform @ homogeneous.T).T[:, :3].astype(np.float32)
+
+
+def _source_prefilter_tfv6_sweep(
+    points_base_ros: np.ndarray,
+    *,
+    expert_config: Any,
+    remove_ground: Callable[..., Any],
+) -> np.ndarray:
+    """Port LEAD base_agent.py:158-163 and 203-237 without heuristics."""
+    lidar_x = points_base_ros[:, 0]
+    lidar_y = points_base_ros[:, 1]
+    points = points_base_ros[
+        (np.abs(lidar_x) > expert_config.ego_extent_x)
+        & (np.abs(lidar_y) > expert_config.ego_extent_y)
+    ]
+
+    if expert_config.save_only_non_ground_lidar and len(points):
+        ground_mask = np.asarray(
+            remove_ground(points, expert_config, parallel=True), dtype=bool
+        )
+        if ground_mask.shape != (points.shape[0],):
+            raise ModelRuntimeError(
+                "model tfv6 pinned RANSAC returned an invalid ground mask"
+            )
+        points = points[~ground_mask]
+
+    if expert_config.save_lidar_only_inside_bev:
+        lidar_x = points[:, 0]
+        lidar_y = points[:, 1]
+        lidar_z = points[:, 2]
+        inside = (
+            (expert_config.min_x_meter <= lidar_x)
+            & (lidar_x <= expert_config.max_x_meter)
+            & (expert_config.min_y_meter <= lidar_y)
+            & (lidar_y <= expert_config.max_y_meter)
+            & (expert_config.min_height_lidar <= lidar_z)
+            & (lidar_z <= expert_config.max_height_lidar)
+        )
+        points = points[inside]
+    return points
 
 
 def prepare_tfv6_temporal_lidar(
     history: list[Any],
     *,
     training_config: Any,
+    expert_config: Any,
+    T_base_from_lidar: dict[str, Any],
     point_precision_xyz: tuple[float, float, float],
     read_points: Callable[..., Any],
+    remove_ground: Callable[..., Any],
     rasterize_lidar: Callable[..., Any],
     compress_float_image: Callable[..., Any],
     decompress_float_image: Callable[..., Any],
 ) -> np.ndarray:
-    """Reproduce LEAD SensorAgent's temporal LiDAR fidelity path."""
+    """Reproduce pinned LEAD prefilter, accumulation, raster and PNG stages.
+
+    ROS sensor points remain x-forward/y-left through mount transform,
+    per-sweep filtering, and newest-anchor alignment.  The conversion to the
+    pinned source's CARLA y-right convention happens exactly once immediately
+    before the source quantization/raster boundary.
+    """
+    base_from_lidar = _rigid_transform_matrix(T_base_from_lidar)
     merged = []
     for item in history:
         point_cloud = getattr(item, "point_cloud", None)
@@ -64,15 +166,24 @@ def prepare_tfv6_temporal_lidar(
         else:
             points = points.reshape(-1, 3)
             points = points[np.isfinite(points).all(axis=1)]
-        matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
-        homogeneous = np.concatenate(
-            [points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1
+        # Source-equivalent order from lead/common/base_agent.py:140-237:
+        # sensor->ego, ego footprint, exact RANSAC, then BEV/height bounds.
+        points_base = _transform_xyz(points, base_from_lidar)
+        points_base = _source_prefilter_tfv6_sweep(
+            points_base,
+            expert_config=expert_config,
+            remove_ground=remove_ground,
         )
-        aligned = (matrix @ homogeneous.T).T[:, :3].astype(np.float32)
-        aligned[:, 1] *= -1.0
+        # InputBuffer pairs map-to-base poses, so this maps sweep base/ego
+        # coordinates into the newest anchor base/ego coordinates.
+        matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
+        aligned = _transform_xyz(points_base, matrix)
         merged.append(aligned)
 
     points = np.concatenate(merged, axis=0)
+    # ROS x-forward/y-left -> pinned CARLA x-forward/y-right, exactly once.
+    points[:, 1] *= -1.0
+    # lead/inference/sensor_agent.py:386-413
     for axis, precision in enumerate(point_precision_xyz):
         points[:, axis] = np.round(points[:, axis] / precision) * precision
     raster = rasterize_lidar(config=training_config, lidar=points)[..., None]
@@ -91,10 +202,12 @@ class _LeadOpenLoopRuntime:
             inference_module = importlib.import_module("lead.inference.open_loop_inference")
             lidar_module = importlib.import_module("lead.data_loader.carla_dataset_utils")
             cache_module = importlib.import_module("lead.data_loader.training_cache")
+            ransac_module = importlib.import_module("lead.common.ransac")
             expert_config_module = importlib.import_module("lead.expert.config_expert")
             point_cloud_module = importlib.import_module("sensor_msgs.point_cloud2")
             require_module_from_checkout(inference_module, checkout, SOURCE_SYMBOL)
             require_module_from_checkout(lidar_module, checkout, TEMPORAL_LIDAR_SYMBOL)
+            require_module_from_checkout(ransac_module, checkout, GROUND_REMOVAL_SYMBOL)
         except Exception as error:
             raise ModelRuntimeError(
                 f"model tfv6 cannot import {SOURCE_SYMBOL} from {checkout}: "
@@ -120,7 +233,10 @@ class _LeadOpenLoopRuntime:
         self._compress_float_image = cache_module.compress_float_image
         self._decompress_float_image = cache_module.decompress_float_image
         self._read_points = point_cloud_module.read_points
+        self._remove_ground = ransac_module.remove_ground
         expert_config = expert_config_module.ExpertConfig()
+        self._expert_config = expert_config
+        self._T_base_from_lidar = profile["static_transforms"]["T_base_from_lidar"]
         self._point_precision_xyz = (
             float(expert_config.point_precision_x),
             float(expert_config.point_precision_y),
@@ -138,8 +254,11 @@ class _LeadOpenLoopRuntime:
         raster = prepare_tfv6_temporal_lidar(
             history,
             training_config=self._training_config,
+            expert_config=self._expert_config,
+            T_base_from_lidar=self._T_base_from_lidar,
             point_precision_xyz=self._point_precision_xyz,
             read_points=self._read_points,
+            remove_ground=self._remove_ground,
             rasterize_lidar=self._rasterize_lidar,
             compress_float_image=self._compress_float_image,
             decompress_float_image=self._decompress_float_image,

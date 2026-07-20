@@ -26,6 +26,13 @@ DIFFUSION_DERIVATIVE_RELATIVE_PATH = Path(
     "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel_inference.py"
 )
 DIFFUSION_SOURCE_COMMIT = "1cd12a1e155c34dcc471261835444c8d5587580b"
+DIFFUSION_SELECTOR_STAGES = (
+    "diffusion_denoising",
+    "coarse_scorer",
+    "top_32",
+    "fine_scorer",
+    "final_trajectory",
+)
 
 
 class AssetError(RuntimeError):
@@ -387,6 +394,111 @@ def _trajectory_head_derivative(
     return trajectory, class_preamble + constructor + "\n" + forward + "\n".join(retained[1:])
 
 
+def selector_flow_stages(source_text: str) -> tuple[str, ...]:
+    """Audit the generated method's complete learned-selector path with its AST."""
+    tree = ast.parse(source_text)
+    trajectory = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "TrajectoryHead"
+        ),
+        None,
+    )
+    if trajectory is None:
+        raise AssetError("DiffusionDrive V2 derivative has no TrajectoryHead")
+    method = next(
+        (
+            node
+            for node in trajectory.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "forward_test_rl_without_pdm"
+        ),
+        None,
+    )
+    if method is None:
+        raise AssetError(
+            "DiffusionDrive V2 derivative has no forward_test_rl_without_pdm"
+        )
+
+    def call_line(attribute: str) -> int:
+        lines = [
+            node.lineno
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == attribute
+        ]
+        if not lines:
+            raise AssetError(
+                f"DiffusionDrive V2 selector method is missing {attribute} stage"
+            )
+        return min(lines)
+
+    diffusion_line = call_line("diff_decoder")
+    coarse_line = call_line("scorer_decoder")
+    fine_line = call_line("fine_scorer_decoder")
+    top_lines = [
+        node.lineno
+        for node in ast.walk(method)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "topk" for target in node.targets)
+        and isinstance(node.value, ast.Constant)
+        and node.value.value == 32
+    ]
+    if not top_lines:
+        raise AssetError("DiffusionDrive V2 selector method must retain topk = 32")
+    top_line = min(top_lines)
+    select_topk_line = call_line("_select_topk")
+    if select_topk_line < top_line:
+        raise AssetError("DiffusionDrive V2 _select_topk occurs before topk = 32")
+
+    return_lines = [
+        node.lineno
+        for node in ast.walk(method)
+        if isinstance(node, ast.Return)
+        and ast.get_source_segment(source_text, node.value)
+        == '{"trajectory": traj_to_score[:, -1]}'
+    ]
+    append_lines = [
+        node.lineno
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "traj_to_score"
+    ]
+    cat_lines = [
+        node.lineno
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "torch"
+        and node.func.attr == "cat"
+    ]
+    if not return_lines or not append_lines or not cat_lines:
+        raise AssetError(
+            "DiffusionDrive V2 selector method lacks fine append/cat/final trajectory return"
+        )
+    return_line = min(return_lines)
+    if not (
+        diffusion_line
+        < coarse_line
+        < top_line
+        <= select_topk_line
+        < fine_line
+        < max(append_lines)
+        < max(cat_lines)
+        < return_line
+    ):
+        raise AssetError(
+            "DiffusionDrive V2 learned selector stages are not in source order"
+        )
+    return DIFFUSION_SELECTOR_STAGES
+
+
 def create_diffusiondrive_derivative(checkout: str | Path) -> Dict[str, str]:
     """Generate the version-pinned neural selector with evaluation code absent."""
     checkout = Path(checkout)
@@ -497,6 +609,7 @@ def create_diffusiondrive_derivative(checkout: str | Path) -> Dict[str, str]:
         raise AssetError(
             f"DiffusionDrive V2 generated derivative does not compile: {error}"
         ) from error
+    selector_flow_stages(text)
     destination.write_text(text, encoding="utf-8")
     return {
         "path": str(DIFFUSION_DERIVATIVE_RELATIVE_PATH),

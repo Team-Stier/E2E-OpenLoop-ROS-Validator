@@ -44,7 +44,7 @@ The anchor shape is (20, 8, 2), dtype float64 in the source file, and the model 
 | command/speed | CARLA command one-hot [LEFT, RIGHT, STRAIGHT, LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT] plus forward speed m/s | OptFeederNode |
 | route | previous/current/next ego-local points | OptFeederNode |
 
-The LiDAR raster uses x=[-32,64] m, y=[-40,40] m, 4 pixels/m, occupancy clip=5. InputBuffer pairs each of the ten chronological PointCloud2 messages with `T_anchor_lidar_from_sweep_lidar`, computed from the interpolated map-to-base poses against the newest causal anchor; a missing pose is `not_ready`. The TFv6 source boundary decodes finite `(x,y,z)` with ROS `sensor_msgs.point_cloud2.read_points`, aligns each sweep, changes ROS y-left to CARLA y-right, rounds x/y/z to the pinned LEAD 0.1 m point precision, calls LEAD `rasterize_lidar`, and applies LEAD's 16-bit PNG `compress_float_image`/`decompress_float_image` round-trip before tensor conversion.
+The LiDAR raster uses x=[-32,64] m, y=[-40,40] m, 4 pixels/m, occupancy clip=5. InputBuffer pairs each of the ten chronological PointCloud2 messages with the interpolated map-to-base pose transform into the newest causal anchor; a missing pose is `not_ready`. For every sweep, the TFv6 source boundary first applies the profile's full `T_base_from_lidar`, then ports the pinned LEAD `base_agent.py:140-237` order exactly: ego-footprint mask, `lead.common.ransac.remove_ground(..., parallel=True)`, and source BEV/height bounds. Only the surviving base/ego points are aligned into the newest anchor. ROS y-left is converted once to CARLA y-right immediately before the pinned 0.1 m quantization, LEAD `rasterize_lidar`, and LEAD 16-bit PNG `compress_float_image`/`decompress_float_image` round-trip.
 
 Fallback route points remain published in `Lidar3D-4`. Before TFv6 forward they are transformed by the recorded `T_base_from_lidar` (`base_link` parent, `Lidar3D-4` child, translation `[2,0,1.5]`, quaternion `[0,0,0,1]`) and only then converted to CARLA y-right coordinates.
 
@@ -102,6 +102,8 @@ The original SEL inference path performs these neural operations.
 5. Export the final selected candidate: traj_to_score[:, -1], shape B×8×3.
 
 PDM is excluded. The inference object neither imports nor initializes the PDM scorer/process pool, reads a metric cache, or returns reward_dict. That code belongs to the repository's evaluation branch, not to this project's waypoint inference path. The seed is deterministically derived from model ID, run ID, and reference stamp and is recorded.
+
+The official checkpoint contains 972 `agent._transfuser_model.*` entries. The generated PDM-free derivative intentionally has no evaluation-only `_trajectory_head.vocab`; loading removes only that named entry and requires an exact strict match for all remaining 971 entries. Any other missing or unexpected key is a load error with model/checkpoint context.
 
 The output has eight (x,y,heading) poses over 4.0 s at 0.5 s intervals in NAVSIM ego coordinates.
 

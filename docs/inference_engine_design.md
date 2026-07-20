@@ -10,7 +10,7 @@
 - ~model_id가 고른 하나의 profile만 로컬 [profile.json](../src/Validator_pkg/config/profile.json)에서 읽는다. 원격 profile 요청은 없다.
 - ModelAdapter는 없다. TFv6Model, InterFuserModel, DiffusionDriveV2InferenceModel, SparseDriveV2Model은 각각 원본 checkpoint의 입력 순서와 forward만 직접 가진다. 공통 wrapper가 모델 feature를 변환하지 않는다.
 - InputBuffer가 inference layer의 모든 subscriber를 소유한다. callback은 lock 아래 timestamped message만 보관한다. 다수 relay/subscriber node를 만들지 않는다.
-- per-frame image/LiDAR 변환은 외부 PreprocessLayer가 발행한다. 단, TFv6의 10 raw LiDAR sweep motion compensation은 reference stamp에 맞춰야 하므로 InputBuffer FIFO와 TFv6Model의 source temporal builder가 함께 처리한다.
+- per-frame image/LiDAR 변환은 외부 PreprocessLayer가 발행한다. 단, TFv6의 10 raw LiDAR sweep은 InputBuffer FIFO와 TFv6Model source temporal builder가 함께 처리한다. 각 raw sweep에는 먼저 profile의 full T_base_from_lidar와 pinned LEAD ego mask/RANSAC/bounds를 적용하고, 그 뒤 reference stamp 기준 motion compensation을 한다.
 - main loop는 bag time 기준 rospy.Timer 10 Hz다. worker queue는 없고 forward는 하나만 실행한다. busy tick은 기다리지 않고 busy_tick_skipped로 기록한다.
 - stale input은 inference를 막지 않는다. 하지만 모든 model input은 reference_stamp 이하의 가장 최신 sample만 사용한다. 미래 sample은 절대 사용하지 않는다.
 - reference stamp는 선택된 /driving_feature.header.stamp다. non-history input은 현재·직전 두 sample을 보관해 causal selection을 보장한다. TFv6 raw LiDAR는 10개 FIFO를 보관한다.
@@ -252,6 +252,8 @@ SelectedModel은 runtime에 선택된 concrete object를 뜻할 뿐 interface/ad
 ### 6.2 DiffusionDrive V2는 PDM을 쓰지 않는다
 
 공식 kmeans_navsim_traj_20.npy (20,8,2)는 checkpoint와 같은 models/diffusiondrive_v2/navsim_v2/에 둔다. DiffusionDriveV2InferenceModel은 source의 diffusion candidate generation, coarse top-32, three-stage learned fine selection을 그대로 사용하고 마지막 traj_to_score[:, -1] (8,3)만 반환한다.
+
+공식 checkpoint의 `agent._transfuser_model.*` 972개 중 PDM 제거 derivative에 의도적으로 없는 `_trajectory_head.vocab` 한 항목만 제거한 뒤, 나머지 971개는 `strict=True`로 완전 일치해야 한다. 그 외 missing/unexpected key는 허용하지 않는다.
 
 PDM import, PDM process pool, metric-cache, evaluator, reward_dict return은 inference class에 없다. 매 frame RNG seed는 sha256(model_id + reference_stamp_nsec + run_id)를 uint64로 줄인 값이며 metric/CSV에 기록한다.
 

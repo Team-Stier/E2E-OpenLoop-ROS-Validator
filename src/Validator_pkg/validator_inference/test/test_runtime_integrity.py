@@ -1,9 +1,14 @@
 """Regression tests for source-native runtime input integrity."""
 
+import ast
+import copy
 from dataclasses import dataclass
+import io
 from pathlib import Path
+import pickle
 import shutil
 from types import SimpleNamespace
+import zipfile
 
 import numpy as np
 import pytest
@@ -11,6 +16,7 @@ import pytest
 from validator_inference import assets
 from validator_inference import input_buffer
 from validator_inference.models import contracts
+from validator_inference.models import diffusiondrive_v2
 from validator_inference.models.sparsedrive_v2 import _resize_crop_matrix
 from validator_inference.models import tfv6
 
@@ -31,6 +37,10 @@ SourceRuntimeError = getattr(contracts, "SourceRuntimeError", RuntimeError)
 load_source_state_dict = getattr(contracts, "load_source_state_dict", None)
 model_target_xy = getattr(contracts, "model_target_xy", None)
 prepare_tfv6_temporal_lidar = getattr(tfv6, "prepare_tfv6_temporal_lidar", None)
+load_diffusiondrive_selector_state_dict = getattr(
+    diffusiondrive_v2, "load_diffusiondrive_selector_state_dict", None
+)
+selector_flow_stages = getattr(assets, "selector_flow_stages", None)
 
 
 @dataclass(frozen=True)
@@ -177,8 +187,19 @@ def test_tfv6_temporal_preparation_reads_xyz_aligns_quantizes_and_roundtrips():
     result = prepare_tfv6_temporal_lidar(
         history,
         training_config=object(),
+        expert_config=SimpleNamespace(
+            ego_extent_x=0.0,
+            ego_extent_y=0.0,
+            save_only_non_ground_lidar=False,
+            save_lidar_only_inside_bev=False,
+        ),
+        T_base_from_lidar={
+            "translation_m": [0.0, 0.0, 0.0],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
         point_precision_xyz=(0.1, 0.1, 0.1),
         read_points=read_points,
+        remove_ground=lambda *args, **kwargs: None,
         rasterize_lidar=rasterize,
         compress_float_image=compress,
         decompress_float_image=decompress,
@@ -194,6 +215,124 @@ def test_tfv6_temporal_preparation_reads_xyz_aligns_quantizes_and_roundtrips():
     np.testing.assert_allclose(raster_input[0], [0.1, -0.3, 0.3])
     np.testing.assert_allclose(raster_input[-1], [9.1, -0.3, 0.3])
     np.testing.assert_allclose(result, [0.2500038, 0.5000076])
+
+
+def test_tfv6_preaccumulation_applies_mount_ego_ransac_and_bounds_in_source_order():
+    """The ROS port must retain LEAD base_agent.py:140-237 before accumulation."""
+    assert prepare_tfv6_temporal_lidar is not None
+    events = []
+    raw_points = [
+        (0.0, 3.0, 0.0),       # inside ego after +2m mount; must stay removed
+        (3.0, 3.0, -1.5),      # base z=0 ground
+        (3.04, 3.04, 0.04),    # sole valid point; shows 0.1m quantization
+        (100.0, 3.0, 0.0),     # x outside source BEV
+        (3.0, 100.0, 0.0),     # y outside source BEV
+        (3.0, 3.0, 20.0),      # z outside source height
+    ]
+
+    history = [
+        AlignedPointCloudSweep(
+            PointCloud(0, Header(Stamp(0))),
+            np.asarray(
+                [[1, 0, 0, 10], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+                dtype=np.float64,
+            ),
+        ),
+        AlignedPointCloudSweep(
+            PointCloud(1, Header(Stamp(1))), np.eye(4, dtype=np.float64)
+        ),
+    ]
+    expert_config = SimpleNamespace(
+        ego_extent_x=2.4508416652679443,
+        ego_extent_y=1.0641621351242065,
+        save_only_non_ground_lidar=True,
+        save_lidar_only_inside_bev=True,
+        min_x_meter=-32.0,
+        max_x_meter=64.0,
+        min_y_meter=-40.0,
+        max_y_meter=40.0,
+        min_height_lidar=-4.0,
+        max_height_lidar=10.0,
+    )
+
+    def read_points(message, field_names, skip_nans):
+        return iter(raw_points)
+
+    def remove_ground(points, config, parallel):
+        events.append(("ransac", points.copy(), config, parallel))
+        return np.isclose(points[:, 2], 0.0)
+
+    def rasterize(config, lidar):
+        events.append(("raster", lidar.copy()))
+        return np.asarray([[0.5]], dtype=np.float32)
+
+    def compress(image, config):
+        events.append(("compress", image.copy()))
+        return b"16-bit-png"
+
+    def decompress(payload):
+        events.append(("decompress", payload))
+        return np.asarray([[[0.5000076]]], dtype=np.float32)
+
+    result = prepare_tfv6_temporal_lidar(
+        history,
+        training_config=object(),
+        expert_config=expert_config,
+        T_base_from_lidar={
+            "translation_m": [2.0, 0.0, 1.5],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+        point_precision_xyz=(0.1, 0.1, 0.1),
+        read_points=read_points,
+        remove_ground=remove_ground,
+        rasterize_lidar=rasterize,
+        compress_float_image=compress,
+        decompress_float_image=decompress,
+    )
+
+    assert [event[0] for event in events] == [
+        "ransac", "ransac", "raster", "compress", "decompress"
+    ]
+    # RANSAC sees base/ego coordinates (including the full +2,+0,+1.5 mount)
+    # after the exact source ego-footprint mask, and before bounds/alignment.
+    assert events[0][1][0] == pytest.approx([5.0, 3.0, 0.0])
+    assert all(not np.isclose(row[0], 2.0) for row in events[0][1])
+    assert events[0][3] is True
+    # Old sweep is aligned only after filtering; ROS y-left flips once at raster boundary.
+    np.testing.assert_allclose(
+        events[2][1],
+        [[15.0, -3.0, 1.5], [5.0, -3.0, 1.5]],
+        atol=1e-6,
+    )
+    assert result == pytest.approx(0.5000076)
+
+
+def test_tfv6_port_is_tied_to_pinned_lead_prefilter_and_png_helpers():
+    checkout = default_project_root() / "models/sources/lead"
+    if not checkout.is_dir():
+        pytest.skip("profile-pinned LEAD source has not been fetched")
+    assert shutil.which("git")
+    import subprocess
+
+    commit = subprocess.check_output(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+    ).strip()
+    assert commit == "730bc1a2f44d5f28312dd55f0ca958e94a24c038"
+    base_agent = (checkout / "lead/common/base_agent.py").read_text(encoding="utf-8")
+    sensor_agent = (checkout / "lead/inference/sensor_agent.py").read_text(encoding="utf-8")
+    cache = (checkout / "lead/data_loader/training_cache.py").read_text(encoding="utf-8")
+    for source_fragment in (
+        "common_utils.lidar_to_ego_coordinate(",
+        "(np.abs(lidar_x) > self.config_expert.ego_extent_x)",
+        "ground_mask = ransac.remove_ground(",
+        "self.config_expert.save_lidar_only_inside_bev",
+        "common_utils.align_lidar(",
+    ):
+        assert source_fragment in base_agent
+    assert "np.round(lidar[:, 0] / self.config_expert.point_precision_x)" in sensor_agent
+    assert "training_cache.compress_float_image(" in sensor_agent
+    assert "training_cache.decompress_float_image(" in sensor_agent
+    assert "(image * 65535.0).astype(np.uint16)" in cache
 
 
 def _point(x, y, frame="Lidar3D-4"):
@@ -307,6 +446,177 @@ def test_source_checkpoint_loader_rejects_mismatch_and_zero_match(
     assert str(tmp_path / "bad.ckpt") in str(caught.value)
 
 
+class _SchemaOnlyUnpickler(pickle.Unpickler):
+    """Read torch checkpoint key structure without materializing tensor storage."""
+
+    def find_class(self, module, name):
+        if module == "torch._utils" and name == "_rebuild_tensor_v2":
+            return lambda *args: None
+        if module == "torch" and name in {"FloatStorage", "LongStorage"}:
+            return type(name, (), {})
+        return super().find_class(module, name)
+
+    def persistent_load(self, persistent_id):
+        return None
+
+
+def _official_ddv2_schema_or_fixture():
+    checkpoint = Path(
+        "/private/tmp/task5-checkpoint-schema-review/diffusiondrivev2_sel.ckpt"
+    )
+    if checkpoint.is_file():
+        with zipfile.ZipFile(checkpoint) as archive:
+            data_pickle = next(
+                name for name in archive.namelist() if name.endswith("/data.pkl")
+            )
+            payload = _SchemaOnlyUnpickler(
+                io.BytesIO(archive.read(data_pickle))
+            ).load()
+        state = payload["state_dict"]
+        assert len(state) == 972
+        return {key: object() for key in state}, checkpoint
+    fixture_keys = [
+        f"agent._transfuser_model.fixture.layer_{index}.weight"
+        for index in range(971)
+    ]
+    fixture_keys.append("agent._transfuser_model._trajectory_head.vocab")
+    return {key: object() for key in fixture_keys}, Path("fixture.ckpt")
+
+
+class _NumpyTensor(np.ndarray):
+    def __new__(cls, value):
+        return np.asarray(value).view(cls)
+
+    def unsqueeze(self, axis):
+        return _NumpyTensor(np.expand_dims(self, axis))
+
+
+class _TorchSelectorSeam:
+    @staticmethod
+    def argmax(value, dim=-1):
+        return _NumpyTensor(np.argmax(np.asarray(value), axis=dim))
+
+    @staticmethod
+    def arange(size, device=None):
+        return _NumpyTensor(np.arange(size))
+
+    @staticmethod
+    def cat(values, dim=0):
+        return _NumpyTensor(np.concatenate(values, axis=dim))
+
+
+def _generated_selector_tail(source_text):
+    """Compile the generated method's entire learned-selector tail as a CPU seam."""
+    tree = ast.parse(source_text)
+    trajectory = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "TrajectoryHead"
+    )
+    method = next(
+        node
+        for node in trajectory.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "forward_test_rl_without_pdm"
+    )
+    start = next(
+        index
+        for index, statement in enumerate(method.body)
+        if "_get_scorer_inputs" in (ast.get_source_segment(source_text, statement) or "")
+    )
+    seam = ast.parse(
+        """def run_selector(self, diffusion_output):
+    bs = diffusion_output.shape[0]
+    device = None
+    bev_feature = None
+    bev_spatial_shape = None
+    agents_query = None
+    ego_query = None
+    status_encoding = None
+    global_img = None
+"""
+    ).body[0]
+    seam.body.extend(copy.deepcopy(method.body[start:]))
+    module = ast.fix_missing_locations(ast.Module(body=[seam], type_ignores=[]))
+    namespace = {"torch": _TorchSelectorSeam}
+    exec(compile(module, "<generated-ddv2-selector-seam>", "exec"), namespace)
+    return namespace["run_selector"]
+
+
+class _SelectorHeadSeam:
+    def __init__(self):
+        self.events = []
+        self.NC_head = self.EP_head = self.DAC_head = self.TTC_head = self.C_head = lambda value: value
+        self.fine_NC_head = self.fine_EP_head = self.fine_DAC_head = lambda value: value
+        self.fine_TTC_head = self.fine_C_head = lambda value: value
+        self.sigmoid = lambda value: value
+
+    def _get_scorer_inputs(self, diffusion_output, batch_size, group_count):
+        self.events.append("diffusion_denoising")
+        score = _NumpyTensor(
+            np.arange(1, group_count + 1, dtype=np.float64)[None, :, None]
+        )
+        return score, score, None
+
+    def scorer_decoder(self, *args):
+        self.events.append("coarse_scorer")
+        return [args[0]]
+
+    def _select_topk(self, **kwargs):
+        assert kwargs["topk"] == 32
+        self.events.append("top_32")
+        topk_idx = _NumpyTensor(np.arange(32)[None, :])
+        return kwargs["traj_feature"][:, :32], kwargs["noisy_traj_points_xy"][:, :32], None, topk_idx, None
+
+    def fine_scorer_decoder(self, *args):
+        self.events.append("fine_scorer")
+        score = _NumpyTensor(np.arange(1, 33, dtype=np.float64)[None, :, None])
+        return [score, score, score]
+
+
+def test_ddv2_loader_allows_only_removed_pdm_vocab_and_strictly_matches_971_keys():
+    assert load_diffusiondrive_selector_state_dict is not None
+    checkpoint_state, checkpoint_path = _official_ddv2_schema_or_fixture()
+    normalized_keys = [
+        key[len("agent._transfuser_model.") :]
+        for key in checkpoint_state
+        if key != "agent._transfuser_model._trajectory_head.vocab"
+    ]
+    network = _StateNetwork(normalized_keys)
+
+    load_diffusiondrive_selector_state_dict(
+        network, checkpoint_state, checkpoint_path=checkpoint_path
+    )
+
+    assert len(network.loaded[0]) == 971
+    assert network.loaded[1] is True
+    assert "_trajectory_head.vocab" not in network.loaded[0]
+
+
+@pytest.mark.parametrize("mutation", ["extra", "missing", "wrong_prefix"])
+def test_ddv2_loader_rejects_every_non_vocab_schema_mismatch(mutation):
+    assert load_diffusiondrive_selector_state_dict is not None
+    raw = {
+        "agent._transfuser_model.encoder.weight": object(),
+        "agent._transfuser_model.head.bias": object(),
+        "agent._transfuser_model._trajectory_head.vocab": object(),
+    }
+    network = _StateNetwork(["encoder.weight", "head.bias"])
+    if mutation == "extra":
+        raw["agent._transfuser_model.extra"] = object()
+    elif mutation == "missing":
+        raw.pop("agent._transfuser_model.head.bias")
+    else:
+        raw["not_documented.encoder.weight"] = raw.pop(
+            "agent._transfuser_model.encoder.weight"
+        )
+
+    with pytest.raises(SourceRuntimeError, match=r"diffusiondrive_v2.*schema.ckpt"):
+        load_diffusiondrive_selector_state_dict(
+            network, raw, checkpoint_path=Path("schema.ckpt")
+        )
+
+
 def test_diffusion_derivative_from_actual_pinned_checkout_is_pdm_free(tmp_path):
     assert DIFFUSION_SOURCE_COMMIT is not None
     source_checkout = default_project_root() / "models/sources/diffusiondrive_v2"
@@ -334,14 +644,21 @@ def test_diffusion_derivative_from_actual_pinned_checkout_is_pdm_free(tmp_path):
         "reward_dict",
     ):
         assert banned not in text
-    selector_line = next(
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() == 'return {"trajectory": traj_to_score[:, -1]}'
+    assert selector_flow_stages is not None
+    assert selector_flow_stages(text) == (
+        "diffusion_denoising",
+        "coarse_scorer",
+        "top_32",
+        "fine_scorer",
+        "final_trajectory",
     )
-    namespace = {}
-    exec("def selected(traj_to_score):\n    " + selector_line, namespace)
-    candidates = np.arange(2 * 4 * 8 * 3).reshape(2, 4, 8, 3)
-    np.testing.assert_array_equal(
-        namespace["selected"](candidates)["trajectory"], candidates[:, -1]
-    )
+    selector = _generated_selector_tail(text)
+    seam = _SelectorHeadSeam()
+    candidates = _NumpyTensor(np.arange(200 * 8 * 3).reshape(1, 200, 8, 3))
+
+    output = selector(seam, candidates)
+
+    assert seam.events == [
+        "diffusion_denoising", "coarse_scorer", "top_32", "fine_scorer"
+    ]
+    np.testing.assert_array_equal(output["trajectory"], candidates[:, 31])
