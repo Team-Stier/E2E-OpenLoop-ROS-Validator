@@ -10,6 +10,7 @@ import rospy
 from validator_inference.input_buffer import InferenceFrame
 from validator_inference.models.contracts import ModelPrediction
 from validator_inference.path_builder import PathMessageBuilder
+import validator_inference.worker as worker_module
 from validator_inference.worker import InferenceWorker, seed_from
 
 
@@ -57,6 +58,19 @@ class _FailingModel:
 
     def forward(self, frame):
         raise ValueError("bad source output")
+
+
+class _TimedDiffusionModel:
+    def __init__(self, error=None):
+        self.selected_profile = SimpleNamespace(model_id="diffusiondrive_v2")
+        self.error = error
+        self.seeds = []
+
+    def forward(self, frame, rng_seed):
+        self.seeds.append(rng_seed)
+        if self.error is not None:
+            raise self.error
+        return ModelPrediction([[1.0, 0.0, 0.0]], "test.TimedDiffusionModel")
 
 
 def _wait_completion(worker, timeout=5.0):
@@ -139,6 +153,42 @@ def test_worker_retains_model_context_on_error_and_releases_busy_state():
     assert worker.try_submit(frame).accepted is True
     second_completion = _wait_completion(worker)
     assert second_completion.error is not None
+
+
+@pytest.mark.parametrize("model_error", [None, ValueError("source failure")])
+def test_worker_measures_only_forward_after_diffusion_seed_preparation(
+    monkeypatch, model_error
+):
+    """Seed preparation consumes clock time but is excluded on both outcomes."""
+    clock_values = iter(
+        [10_000_000, 20_000_000, 100_000_000, 150_000_000]
+    )
+
+    monkeypatch.setattr(worker_module, "perf_counter_ns", lambda: next(clock_values))
+
+    def seeded_after_expensive_setup(run_id, model_id, reference_stamp_ns):
+        del run_id, model_id, reference_stamp_ns
+        worker_module.perf_counter_ns()
+        worker_module.perf_counter_ns()
+        return 77
+
+    monkeypatch.setattr(worker_module, "seed_from", seeded_after_expensive_setup)
+    model = _TimedDiffusionModel(error=model_error)
+    worker = InferenceWorker(model, "run-timed")
+
+    assert worker._forward_lock.acquire(blocking=False) is True
+    worker._run_forward(_frame(44))
+    completion = worker.take_completed()
+
+    assert model.seeds == [77]
+    assert completion.rng_seed == 77
+    assert completion.elapsed_ms == pytest.approx(50.0)
+    if model_error is None:
+        assert completion.error is None
+        assert completion.result is not None
+    else:
+        assert completion.result is None
+        assert isinstance(completion.error.__cause__, ValueError)
 
 
 def _transform(translation=(0.0, 0.0, 0.0), quaternion=(0.0, 0.0, 0.0, 1.0)):

@@ -96,7 +96,7 @@ class InferenceWorker:
         rng_seed = 0
         result = None  # type: Optional[ModelPrediction]
         worker_error = None  # type: Optional[WorkerExecutionError]
-        start_ns = perf_counter_ns()
+        elapsed_ms = 0.0
         try:
             if self._model_id == "diffusiondrive_v2":
                 rng_seed = seed_from(
@@ -104,23 +104,28 @@ class InferenceWorker:
                     self._model_id,
                     _stamp_ns(frame.reference_stamp),
                 )
-                result = self._model.forward(frame, rng_seed=rng_seed)
-            else:
-                result = self._model.forward(frame)
+
+            start_ns = perf_counter_ns()
+            try:
+                if self._model_id == "diffusiondrive_v2":
+                    result = self._model.forward(frame, rng_seed=rng_seed)
+                else:
+                    result = self._model.forward(frame)
+            finally:
+                elapsed_ms = (perf_counter_ns() - start_ns) / 1_000_000.0
+
             if not isinstance(result, ModelPrediction):
                 raise TypeError("forward must return ModelPrediction")
         except Exception as error:
             worker_error = WorkerExecutionError(self._model_id, str(error))
             worker_error.__cause__ = error
             result = None
-        finally:
-            end_ns = perf_counter_ns()
 
         completion = Completion(
             frame=frame,
             model_id=self._model_id,
             result=result,
-            elapsed_ms=(end_ns - start_ns) / 1_000_000.0,
+            elapsed_ms=elapsed_ms,
             rng_seed=rng_seed,
             error=worker_error,
         )
