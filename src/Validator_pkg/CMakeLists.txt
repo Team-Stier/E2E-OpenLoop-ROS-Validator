@@ -216,6 +216,7 @@ catkin_install_python(PROGRAMS
   scripts/left_bev_processor.py
   scripts/right_bev_processor.py
   scripts/lidar_bev_processor.py
+  scripts/bev_overlay_viewer.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

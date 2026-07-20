@@ -6,7 +6,7 @@ sub:
     /tf                              tf2_msgs/TFMessage (TFv6 only)
 
 pub:
-    /lidar3D/BEV                    mono8, 400x500 visualization BEV
+    /lidar3D/BEV                    mono8, 600x500 visualization BEV
     /lidar/tfv6/processed           32FC1, 384x320 density histogram
     /lidar/interfuser/processed     32FC3, 224x224 below/above/total
     /lidar/diffusiondrive_v2/processed
@@ -235,10 +235,27 @@ def capped_histogram(points_xy, x_edges, y_edges, maximum_count=5.0):
     return np.ascontiguousarray(histogram, dtype=np.float32)
 
 
-def prepare_visual_bev(points_vehicle):
-    """Build a conventional forward-up, vehicle-left-left visualization."""
-    x_edges = np.linspace(0.0, 50.0, 501, dtype=np.float32)
-    y_edges = np.linspace(-20.0, 20.0, 401, dtype=np.float32)
+def prepare_visual_bev(
+    points_vehicle,
+    forward_range=25.0,
+    lateral_range=30.0,
+    resolution=0.05,
+):
+    """Build a camera-aligned forward-up, vehicle-left-left visualization."""
+    output_height = int(round(forward_range / resolution))
+    output_width = int(round(lateral_range / resolution))
+    x_edges = np.linspace(
+        0.0,
+        forward_range,
+        output_height + 1,
+        dtype=np.float32,
+    )
+    y_edges = np.linspace(
+        -lateral_range / 2.0,
+        lateral_range / 2.0,
+        output_width + 1,
+        dtype=np.float32,
+    )
     histogram = capped_histogram(
         points_vehicle[:, :2],
         x_edges,
@@ -250,9 +267,10 @@ def prepare_visual_bev(points_vehicle):
     visual = np.rint(histogram[::-1, ::-1] * 255.0).astype(np.uint8)
 
     # Grid lines are visualization-only and never enter a model tensor.
-    for pixel_y in range(0, visual.shape[0], 50):
+    grid_step_pixels = max(1, int(round(5.0 / resolution)))
+    for pixel_y in range(0, visual.shape[0], grid_step_pixels):
         cv2.line(visual, (0, pixel_y), (visual.shape[1] - 1, pixel_y), 60, 1)
-    for pixel_x in range(0, visual.shape[1], 50):
+    for pixel_x in range(0, visual.shape[1], grid_step_pixels):
         cv2.line(visual, (pixel_x, 0), (pixel_x, visual.shape[0] - 1), 60, 1)
 
     return np.ascontiguousarray(visual)
@@ -471,6 +489,9 @@ class LidarBEVProcessor:
         ).lstrip("/")
         self.output_frame_id = rospy.get_param("~frame_id", "base_link")
         self.show_gui = bool(rospy.get_param("~show_gui", False))
+        self.forward_range = float(rospy.get_param("~forward_range", 25.0))
+        self.lateral_range = float(rospy.get_param("~lateral_range", 30.0))
+        self.resolution = float(rospy.get_param("~resolution", 0.05))
         self.ego_sync_slop = float(rospy.get_param("~ego_sync_slop", 0.1))
         self.tfv6_num_sweeps = int(rospy.get_param("~tfv6_num_sweeps", 5))
         self.tfv6_history_seconds = float(
@@ -483,6 +504,12 @@ class LidarBEVProcessor:
             rospy.get_param("~tfv6_ground_distance", 0.2)
         )
 
+        if self.forward_range <= 0.0:
+            raise ValueError("~forward_range must be positive")
+        if self.lateral_range <= 0.0:
+            raise ValueError("~lateral_range must be positive")
+        if self.resolution <= 0.0:
+            raise ValueError("~resolution must be positive")
         if self.ego_sync_slop < 0.0:
             raise ValueError("~ego_sync_slop must be non-negative")
         if self.tfv6_num_sweeps <= 0:
@@ -550,6 +577,15 @@ class LidarBEVProcessor:
         rospy.loginfo("LiDAR BEV processor initialized")
         rospy.loginfo("Input: %s", self.input_topic)
         rospy.loginfo("Visualization output: %s", self.visual_topic)
+        rospy.loginfo(
+            "Visualization area: %.1f m forward x %.1f m lateral at "
+            "%.2f m/pixel (%dx%d)",
+            self.forward_range,
+            self.lateral_range,
+            self.resolution,
+            int(round(self.lateral_range / self.resolution)),
+            int(round(self.forward_range / self.resolution)),
+        )
         rospy.loginfo(
             "Calibration %s: xyz=(%.2f, %.2f, %.2f), rpy=(%.1f, %.1f, %.1f)",
             self.config_path,
@@ -684,7 +720,12 @@ class LidarBEVProcessor:
         stamp = message.header.stamp.to_sec()
         self.reset_history_if_time_reversed(stamp)
 
-        visual = prepare_visual_bev(points_vehicle)
+        visual = prepare_visual_bev(
+            points_vehicle,
+            self.forward_range,
+            self.lateral_range,
+            self.resolution,
+        )
         self.publish_image(
             self.visual_publisher,
             visual,

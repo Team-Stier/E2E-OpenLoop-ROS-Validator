@@ -197,7 +197,7 @@ rosrun Validator_pkg image_adaptor.py _model_profiles:=sparsedrive_v2
 rosrun Validator_pkg image_adaptor.py _model_profiles:=all
 ```
 
-`camera_bev_stitcher`는 legacy 카메라 토픽 세 개를 동기화하고 `/image/BEV`로 발행한다. 따라서 모델이 stitched image를 사용하더라도 legacy left/right 토픽은 BEV 시각화를 위해 계속 발행한다.
+`camera_bev_stitcher`는 legacy 카메라 토픽 세 개를 동기화하고 `/image/BEV`로 발행한다. 출력은 전방 25 m, 좌우 총 30 m를 0.05 m/pixel로 표현한 600 x 500 `bgr8` 영상이다. 따라서 모델이 stitched image를 사용하더라도 legacy left/right 토픽은 BEV 시각화를 위해 계속 발행한다.
 
 #### 2.1.2 LiDAR topic contract
 
@@ -208,7 +208,7 @@ rosrun Validator_pkg image_adaptor.py _model_profiles:=all
 | `/lidar3D` | `sensor_msgs/PointCloud2` | 현재 LiDAR point cloud |
 | `/tf` | `tf2_msgs/TFMessage` | TFv6 5-sweep motion compensation (`map` → `base_link`) |
 
-시각화용 `/lidar3D/BEV`는 선택한 모델과 무관하게 항상 발행한다. 크기는 400 x 500, encoding은 `mono8`이다. 이 토픽은 visualizer용이며 모델 추론 입력으로 사용하지 않는다.
+시각화용 `/lidar3D/BEV`는 선택한 모델과 무관하게 항상 발행한다. 카메라 BEV와 동일하게 전방 25 m, 좌우 총 30 m를 0.05 m/pixel로 표현하며, 크기는 600 x 500이고 encoding은 `mono8`이다. 이 토픽은 visualizer용이며 모델 추론 입력으로 사용하지 않는다.
 
 모델 추론용 LiDAR는 모델별 tensor 모양과 값 범위가 달라 별도의 namespace로 발행한다.
 
@@ -232,6 +232,39 @@ roslaunch Validator_pkg camera_bev_pipeline.launch model_profiles:=tfv6 show_gui
 ```
 
 SparseDrive v2를 선택해도 `/lidar3D/BEV`는 시각화를 위해 발행하지만, SparseDrive 추론용 LiDAR 토픽은 만들지 않는다.
+
+#### 2.1.3 Camera/LiDAR BEV overlay validation
+
+`bev_overlay_viewer`는 `/image/BEV`와 `/lidar3D/BEV`를 header stamp 기준으로 동기화하고, LiDAR를 컬러로 변환해 카메라 위에 겹친 `/image/BEV_overlay`를 발행한다. 이 노드는 검증 전용이며 전처리 또는 모델 입력 토픽을 변경하지 않는다.
+
+| Output topic | Type | Purpose |
+| --- | --- | --- |
+| `/image/BEV_overlay` | `sensor_msgs/Image` (`bgr8`, 600 x 500) | synchronized camera/LiDAR overlay |
+| `/bev_overlay/header_delay_ms` | `std_msgs/Float32` | camera stamp - LiDAR stamp |
+| `/bev_overlay/arrival_delay_ms` | `std_msgs/Float32` | camera ROS arrival - LiDAR ROS arrival |
+
+음수 지연은 카메라가 LiDAR보다 먼저 기록되거나 도착했다는 뜻이고, 양수는 카메라가 나중이라는 뜻이다. arrival delay는 rosbag 재생 속도와 현재 컴퓨터의 처리 부하에도 영향을 받는다.
+
+전체 파이프라인과 오버레이 노드를 함께 실행한다.
+
+```bash
+roslaunch Validator_pkg camera_bev_pipeline.launch \
+  model_profiles:=all \
+  show_gui:=false \
+  enable_bev_overlay:=true
+```
+
+rosbag을 재생한 뒤 `rqt_image_view`에서 `/image/BEV_overlay`를 선택한다.
+
+```bash
+rqt_image_view
+```
+
+파이프라인을 별도로 실행한 상태에서는 오버레이 노드만 직접 실행할 수도 있다.
+
+```bash
+rosrun Validator_pkg bev_overlay_viewer.py
+```
 
 ### 2.2 inference layer
 `inference engine`, `recoder`로 구성됨.
