@@ -109,6 +109,7 @@ git commit -m "build: add ROS Noetic development container"
 - Create: `src/Validator_pkg/validator_msgs/msg/CameraCalibration.msg`
 - Create: `src/Validator_pkg/validator_msgs/msg/DrivingFeature.msg`
 - Create: `src/Validator_pkg/validator_msgs/msg/InferenceMetric.msg`
+- Create: `src/CMakeLists.txt`
 - Test: `src/Validator_pkg/validator_msgs/test/test_message_definitions.py`
 
 **Interfaces:**
@@ -184,7 +185,7 @@ string profile_sha256
 string calibration_profile_sha256
 ```
 
-Configure `add_message_files` with these three names, `generate_messages(DEPENDENCIES std_msgs)`, and `catkin_package(CATKIN_DEPENDS message_runtime std_msgs)` in `src/Validator_pkg/validator_msgs/CMakeLists.txt`. Declare `message_generation` for build and `message_runtime` for execution in `package.xml`.
+Configure `add_message_files` with these three names, `generate_messages(DEPENDENCIES std_msgs)`, and `catkin_package(CATKIN_DEPENDS message_runtime std_msgs)` in `src/Validator_pkg/validator_msgs/CMakeLists.txt`. Declare `message_generation` for build and `message_runtime` for execution in `package.xml`. Run `catkin_init_workspace src` to create `src/CMakeLists.txt`, which is the catkin workspace toplevel required by the build command.
 
 - [ ] **Step 4: Re-run the structural test and build messages**
 
