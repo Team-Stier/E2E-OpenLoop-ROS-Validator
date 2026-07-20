@@ -1,4 +1,9 @@
-"""InterFuser source-native neural forward boundary."""
+"""
+pinned InterFuser source model의 neural forward 경계.
+입력: 네 camera tensor, LiDAR histogram, CARLA status와 target point.
+출력(pub): 없음. Bx10 waypoint를 ModelPrediction으로 반환.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,9 @@
-"""SparseDrive V2 calibration-conditioned source boundary."""
+"""
+inline calibration projection condition을 사용하는 SparseDrive V2 source 경계.
+입력: left/front/right image, NAVSIM driving feature, profile calibration.
+출력(pub): 없음. Bx8 trajectory를 ModelPrediction으로 반환.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -31,10 +36,10 @@ FINAL_IMAGE_WH = (512.0, 256.0)
 def _resize_crop_matrix(width: int, height: int) -> np.ndarray:
     if width <= 0 or height <= 0:
         raise ModelInputError("SparseDrive image dimensions must be positive")
-    # The pinned builder is configured for a 1920x1080 canonical image,
-    # resizes that canvas to 512x288, then crops y=[32, 288].  Preprocess
-    # supplies each raw camera in that canonical geometry, so compose both
-    # stages instead of applying an aspect-preserving resize to raw pixels.
+    # pinned builder는 1920x1080 canonical image를 512x288로 resize한 뒤
+    # y=[32, 288]을 crop한다. Preprocess가 각 raw camera를 이 canonical
+    # geometry로 제공하므로 raw pixel에 aspect-preserving resize를 적용하지 않고
+    # 두 단계를 합성한다.
     scale_x = 512.0 / float(width)
     scale_y = 288.0 / float(height)
     return np.asarray(

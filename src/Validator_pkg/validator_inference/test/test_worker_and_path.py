@@ -121,20 +121,19 @@ def test_worker_rejects_second_submit_without_queueing_or_replacing_work():
 
 
 def test_worker_preserves_completion_arriving_between_take_and_next_submit():
-    """A completion mailbox blocks a new forward until it is consumed.
+    """완료 mailbox가 소비될 때까지 새 forward를 막는지 검사한다.
 
-    This reproduces the timer interleaving where the engine sees no completion,
-    then the first forward completes immediately before that timer tries to
-    submit the next frame.  Admitting the second frame here would let it
-    overwrite the first one-slot mailbox result.
+    engine이 완료를 보지 못한 뒤, 같은 timer가 다음 frame을 제출하기 직전에
+    첫 forward가 끝나는 interleaving을 재현한다. 여기서 두 번째 frame을 받으면
+    한 칸짜리 mailbox의 첫 결과를 덮어쓰게 된다.
     """
     model = _ImmediateModel()
     worker = InferenceWorker(model, "run-mailbox")
     first = _frame(1)
     second = _frame(2)
 
-    # Model the running first forward without scheduling a nondeterministic
-    # thread, then execute the exact take -> complete -> submit interleaving.
+    # 비결정적인 thread를 예약하지 않고 실행 중인 첫 forward를 모사한 뒤,
+    # 정확한 take -> complete -> submit interleaving을 실행한다.
     assert worker._forward_lock.acquire(blocking=False) is True
     assert worker.take_completed() is None
     worker._run_forward(first)
@@ -202,7 +201,7 @@ def test_worker_retains_model_context_on_error_and_releases_busy_state():
 def test_worker_measures_only_forward_after_diffusion_seed_preparation(
     monkeypatch, model_error
 ):
-    """Seed preparation consumes clock time but is excluded on both outcomes."""
+    """seed 준비 시간은 clock을 소비하지만 성공·실패 모두 측정에서 제외한다."""
     clock_values = iter(
         [10_000_000, 20_000_000, 100_000_000, 150_000_000]
     )

@@ -1,4 +1,9 @@
-"""DiffusionDrive V2 learned selector boundary without PDM evaluation."""
+"""
+PDM 평가를 제거하고 learned selector만 실행하는 DiffusionDrive V2 경계.
+입력: stitched camera, LiDAR BEV, NAVSIM driving feature, local anchor/checkpoint.
+출력(pub): 없음. 선택된 Bx8 trajectory를 ModelPrediction으로 반환.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -30,8 +35,8 @@ SOURCE_SYMBOL = (
     "V2TransfuserModel.forward"
 )
 
-# The PDM-free derivative intentionally deletes only this evaluation vocabulary
-# parameter/buffer.  Every other official checkpoint key must still strict-match.
+# PDM-free derivative는 이 evaluation vocabulary parameter/buffer만 의도적으로
+# 삭제한다. 그 외 모든 official checkpoint key는 strict-match해야 한다.
 PDM_REMOVED_CHECKPOINT_KEY = "_trajectory_head.vocab"
 
 
@@ -41,7 +46,7 @@ def load_diffusiondrive_selector_state_dict(
     *,
     checkpoint_path: str | Path,
 ) -> None:
-    """Strict-load the official selector checkpoint into the PDM-free derivative."""
+    """official selector checkpoint를 PDM-free derivative에 strict-load한다."""
     normalized: dict[str, Any] = {}
     for raw_key, value in raw_state.items():
         key = str(raw_key)

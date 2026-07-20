@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""ROS1 entrypoint for one selected open-loop inference runtime."""
+"""
+선택된 모델의 open-loop inference engine ROS1 진입점.
+입력: profile별 perception topic과 /driving_feature, 필요한 /route/target_point*, /tf.
+출력(pub): /waypoints, /inference_metric.
+구독(sub): InputBuffer가 위 입력 토픽을 단독 소유한다.
+"""
 
 from datetime import datetime, timezone
 from pathlib import Path

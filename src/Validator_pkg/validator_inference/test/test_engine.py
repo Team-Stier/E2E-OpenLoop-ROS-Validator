@@ -1,4 +1,4 @@
-"""Executable contracts for the 10 Hz inference engine composition."""
+"""10 Hz inference engine 조합의 실행 가능한 계약을 검사한다."""
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path

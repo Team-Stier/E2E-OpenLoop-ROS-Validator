@@ -1,4 +1,4 @@
-"""Tests for bounded causal inference input storage and TF pose history."""
+"""유한 인과 추론 입력 저장소와 TF pose 이력을 검사한다."""
 
 from dataclasses import dataclass
 

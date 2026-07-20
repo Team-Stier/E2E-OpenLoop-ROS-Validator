@@ -1,4 +1,9 @@
-"""Small result/error contracts shared by concrete model runtimes."""
+"""
+concrete model runtime이 공유하는 결과, 오류, 좌표·checkpoint 계약 유틸리티.
+입력: InferenceFrame 입력, profile static transform, checkpoint state dict.
+출력(pub): 없음. ModelPrediction 또는 명시적 오류를 반환.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -11,15 +16,15 @@ import numpy as np
 
 
 class ModelRuntimeError(RuntimeError):
-    """A selected source/checkpoint runtime cannot be loaded or invoked."""
+    """선택된 source/checkpoint runtime을 load하거나 호출할 수 없음을 나타낸다."""
 
 
 class SourceRuntimeError(ModelRuntimeError):
-    """A pinned source or checkpoint violates its executable contract."""
+    """pinned source 또는 checkpoint가 실행 계약을 위반했음을 나타낸다."""
 
 
 class ModelInputError(ValueError):
-    """An inference frame violates the selected source model's input contract."""
+    """inference frame이 선택 source model의 input 계약을 위반했음을 나타낸다."""
 
 
 @dataclass(frozen=True)
@@ -68,7 +73,7 @@ def require_module_from_checkout(module: Any, checkout: Path, symbol: str) -> No
 
 
 def ros_image_to_chw(value: Any) -> Any:
-    """Decode a ROS ``sensor_msgs/Image`` without importing cv_bridge."""
+    """cv_bridge를 import하지 않고 ROS ``sensor_msgs/Image``를 decode한다."""
     if not all(hasattr(value, name) for name in ("height", "width", "encoding", "data")):
         return value
     encoding = str(value.encoding).lower()
@@ -113,7 +118,7 @@ def ros_image_to_chw(value: Any) -> Any:
 def model_target_xy(
     value: Any, profile: dict[str, Any], *, carla_y_right: bool
 ) -> Any:
-    """Convert a Lidar3D-4 PointStamped into source ego/base coordinates."""
+    """Lidar3D-4 PointStamped를 source ego/base 좌표로 변환한다."""
     if not hasattr(value, "point"):
         return value
     try:
@@ -166,7 +171,7 @@ def load_source_state_dict(
     checkpoint_path: str | Path,
     documented_prefixes: tuple[str, ...],
 ) -> None:
-    """Normalize documented checkpoint prefixes and enforce an exact network match."""
+    """문서화된 checkpoint prefix를 정규화하고 정확한 network match를 강제한다."""
     normalized: dict[str, Any] = {}
     for raw_key, value in raw_state.items():
         key = str(raw_key)

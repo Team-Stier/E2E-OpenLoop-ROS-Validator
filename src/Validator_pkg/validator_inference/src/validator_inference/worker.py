@@ -1,4 +1,9 @@
-"""One-running-forward worker with a one-slot completion mailbox."""
+"""
+한 번에 하나의 model forward만 실행하고 completion을 한 칸 mailbox에 보관한다.
+입력: InferenceFrame과 concrete model.
+출력(pub): 없음. Completion을 engine이 꺼내도록 제공.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ class SubmitResult:
 
 
 class WorkerExecutionError(RuntimeError):
-    """A source-native model forward failed inside the worker."""
+    """worker 내부에서 source-native model forward가 실패했음을 나타낸다."""
 
     def __init__(self, model_id: str, message: str) -> None:
         self.model_id = model_id
@@ -36,7 +41,7 @@ class Completion:
 
 
 def seed_from(run_id: str, model_id: str, reference_stamp_ns: int) -> int:
-    """Return the profile-defined stable, unsigned 64-bit diffusion seed."""
+    """profile 계약의 안정적인 unsigned 64-bit diffusion seed를 반환한다."""
     raw = "{}:{}:{}".format(model_id, int(reference_stamp_ns), run_id).encode(
         "utf-8"
     )
@@ -65,7 +70,7 @@ def _model_id(model: Any) -> str:
 
 
 class InferenceWorker:
-    """Execute at most one model forward and never queue rejected work."""
+    """model forward를 최대 하나만 실행하고 거절된 작업은 queue에 넣지 않는다."""
 
     def __init__(self, model: Any, run_id: str) -> None:
         self._model = model
@@ -78,10 +83,9 @@ class InferenceWorker:
     def try_submit(self, frame: Any) -> SubmitResult:
         if not self._forward_lock.acquire(blocking=False):
             return SubmitResult(False, "busy_tick_skipped")
-        # Keep the one-slot completion mailbox lossless.  The engine can take
-        # a completion just before this call while the previous forward then
-        # finishes; in that interleaving the forward lock is free, but its
-        # completion still has to be published before another forward may run.
+        # 한 칸 completion mailbox가 유실되지 않게 지킨다. engine이 직전에
+        # completion을 꺼낸 뒤 이전 forward가 끝날 수 있다. 이 interleaving에서는
+        # forward lock이 비어도, 그 completion을 발행하기 전 새 forward를 실행하면 안 된다.
         with self._completion_lock:
             if self._completion is not None:
                 self._forward_lock.release()

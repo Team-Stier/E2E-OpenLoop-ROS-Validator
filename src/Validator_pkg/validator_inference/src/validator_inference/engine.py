@@ -1,4 +1,9 @@
-"""Compose causal snapshots, the one-slot worker, and ROS outcome messages."""
+"""
+causal snapshot, one-slot worker, ROS outcome metric을 조합하는 inference engine 본체.
+입력: InputBuffer snapshot, InferenceWorker completion, 선택된 profile.
+출력(pub): /waypoints, /inference_metric.
+구독(sub): 없음. 구독은 InputBuffer가 소유한다.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ def _profile_flags(selected_profile: Any) -> List[str]:
 
 
 class InferenceEngine:
-    """Publish exactly one eventual metric for each inference tick outcome."""
+    """각 inference tick outcome에 대해 최종 metric 하나만 발행한다."""
 
     def __init__(
         self,

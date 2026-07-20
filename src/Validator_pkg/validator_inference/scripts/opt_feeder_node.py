@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Publish model-specific non-perception inputs from MORAI ego telemetry."""
+"""
+/Ego_topic을 모델별 non-perception feature로 변환하는 OptFeeder ROS1 노드.
+입력: /Ego_topic, 로컬 profile.json.
+출력(pub): /driving_feature, 필요한 /route/target_point*.
+구독(sub): /Ego_topic 하나.
+"""
 
 from pathlib import Path
 
@@ -43,7 +48,7 @@ def _calibration_message(data: CameraCalibrationData) -> CameraCalibration:
 
 
 class OptFeederNode:
-    """Own the single ego subscriber and selected model's optional publishers."""
+    """단일 ego 구독과 선택 모델의 선택적 publisher를 소유한다."""
 
     def __init__(self) -> None:
         self._model_id = rospy.get_param("~model_id")

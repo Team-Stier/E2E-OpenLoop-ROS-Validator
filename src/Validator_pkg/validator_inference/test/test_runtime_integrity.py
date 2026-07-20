@@ -1,4 +1,4 @@
-"""Regression tests for source-native runtime input integrity."""
+"""원본 코드 기반 runtime 입력 무결성 회귀를 검사한다."""
 
 import ast
 import copy
@@ -218,7 +218,7 @@ def test_tfv6_temporal_preparation_reads_xyz_aligns_quantizes_and_roundtrips():
 
 
 def test_tfv6_preaccumulation_applies_mount_ego_ransac_and_bounds_in_source_order():
-    """The ROS port must retain LEAD base_agent.py:140-237 before accumulation."""
+    """ROS port는 accumulation 전에 LEAD base_agent.py:140-237을 유지해야 한다."""
     assert prepare_tfv6_temporal_lidar is not None
     events = []
     raw_points = [
@@ -293,12 +293,12 @@ def test_tfv6_preaccumulation_applies_mount_ego_ransac_and_bounds_in_source_orde
     assert [event[0] for event in events] == [
         "ransac", "ransac", "raster", "compress", "decompress"
     ]
-    # RANSAC sees base/ego coordinates (including the full +2,+0,+1.5 mount)
-    # after the exact source ego-footprint mask, and before bounds/alignment.
+    # RANSAC은 원본과 동일한 ego-footprint mask 뒤, bounds/alignment 전에
+    # 전체 +2,+0,+1.5 mount를 반영한 base/ego 좌표를 본다.
     assert events[0][1][0] == pytest.approx([5.0, 3.0, 0.0])
     assert all(not np.isclose(row[0], 2.0) for row in events[0][1])
     assert events[0][3] is True
-    # Old sweep is aligned only after filtering; ROS y-left flips once at raster boundary.
+    # 오래된 sweep은 filtering 뒤에만 align하고, ROS y-left는 raster 경계에서 한 번 뒤집는다.
     np.testing.assert_allclose(
         events[2][1],
         [[15.0, -3.0, 1.5], [5.0, -3.0, 1.5]],
@@ -447,7 +447,7 @@ def test_source_checkpoint_loader_rejects_mismatch_and_zero_match(
 
 
 class _SchemaOnlyUnpickler(pickle.Unpickler):
-    """Read torch checkpoint key structure without materializing tensor storage."""
+    """tensor storage를 실체화하지 않고 torch checkpoint key 구조를 읽는다."""
 
     def find_class(self, module, name):
         if module == "torch._utils" and name == "_rebuild_tensor_v2":
@@ -506,7 +506,7 @@ class _TorchSelectorSeam:
 
 
 def _generated_selector_tail(source_text):
-    """Compile the generated method's entire learned-selector tail as a CPU seam."""
+    """생성된 method의 learned-selector 뒷부분 전체를 CPU seam으로 컴파일한다."""
     tree = ast.parse(source_text)
     trajectory = next(
         node

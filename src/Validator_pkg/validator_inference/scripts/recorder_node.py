@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Subscribe to inference metrics and persist one CSV row per message."""
+"""
+inference metric을 평가별 CSV 한 행으로 기록하는 Recorder ROS1 노드.
+입력: /inference_metric.
+출력(pub): 없음. records/openloop/ CSV에 기록.
+구독(sub): /inference_metric 하나.
+"""
 
 from pathlib import Path
 
@@ -10,7 +15,7 @@ from validator_inference.csv_recorder import CsvRunWriter, default_record_dir
 
 
 class RecorderNode:
-    """The sole CSV writer for open-loop inference outcomes."""
+    """open-loop inference outcome을 기록하는 유일한 CSV writer 노드."""
 
     def __init__(self) -> None:
         model_id = rospy.get_param("~model_id")

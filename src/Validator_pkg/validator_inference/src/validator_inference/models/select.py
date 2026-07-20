@@ -1,4 +1,9 @@
-"""Select exactly one concrete model runtime from the local profile."""
+"""
+로컬 profile의 model_id로 정확히 하나의 concrete runtime을 선택한다.
+입력: SelectedProfile과 project root.
+출력(pub): 없음. 선택된 concrete model 객체.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 

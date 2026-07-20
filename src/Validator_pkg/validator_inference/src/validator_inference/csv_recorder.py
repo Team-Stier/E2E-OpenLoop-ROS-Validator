@@ -1,4 +1,9 @@
-"""Durable per-run CSV persistence for inference metric messages."""
+"""
+inference metric을 평가별 CSV로 내구성 있게 기록하는 순수 Python writer.
+입력: InferenceMetric과 record directory.
+출력(pub): 없음. records/openloop CSV 파일.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -54,7 +59,7 @@ _OUTCOME_ELAPSED = {
 
 
 def resolve_project_root(module_file: Optional[str | Path] = None) -> Path:
-    """Find the workspace root from source, devel, or install module paths."""
+    """source, devel, install module path에서 workspace root를 찾는다."""
     file_path = Path(module_file or __file__).resolve()
     for candidate in (file_path.parent, *file_path.parents):
         if (candidate / "src/Validator_pkg/config/profile.json").is_file():
@@ -87,7 +92,7 @@ def _json_list(value: Any) -> str:
 
 
 class CsvRunWriter:
-    """Create one startup CSV and append exactly one row per metric."""
+    """startup CSV 하나를 만들고 metric마다 정확히 한 행을 추가한다."""
 
     def __init__(
         self,

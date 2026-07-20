@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Fetch and verify source/checkpoint assets for one local model profile."""
+"""
+선택된 로컬 model profile의 source/checkpoint asset을 내려받고 검증하는 CLI.
+입력: --model-id, 로컬 profile.json, models/ 경로.
+출력(pub): 없음. 검증된 asset-manifest.json만 models/ 아래에 생성.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 

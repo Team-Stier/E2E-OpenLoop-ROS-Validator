@@ -1,4 +1,9 @@
-"""Deterministic non-perception inputs for the supported driving models."""
+"""
+지원 모델의 non-perception driving feature와 fallback target을 결정적으로 만든다.
+입력: ego velocity/acceleration, 선택된 profile calibration.
+출력(pub): 없음. DrivingFeatureData와 fallback target 값.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 
 class FeatureContractError(ValueError):
-    """Raised when a model feature cannot satisfy its declared contract."""
+    """model feature가 선언된 계약을 만족하지 못할 때 발생한다."""
 
 
 @dataclass(frozen=True)
@@ -184,7 +189,7 @@ def build_driving_feature_data(
     ay: float = 0.0,
     profile_data: Optional[Mapping[str, Any]] = None,
 ) -> DrivingFeatureData:
-    """Build model-native status and optional static/runtime compatibility data."""
+    """model-native status와 선택적 static/runtime compatibility data를 만든다."""
 
     _require_model(model_id)
 
@@ -218,7 +223,7 @@ def build_driving_feature_data(
 
 
 def build_fallback_targets(model_id: str) -> Tuple[FallbackTarget, ...]:
-    """Return only the route topics consumed by the selected model."""
+    """선택 모델이 소비하는 route topic만 반환한다."""
 
     _require_model(model_id)
     if model_id == "tfv6":

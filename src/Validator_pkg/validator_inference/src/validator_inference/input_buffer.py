@@ -1,4 +1,9 @@
-"""Bounded, causal ROS message storage and map-to-base pose interpolation."""
+"""
+inference 입력 토픽을 bounded FIFO에 저장하고 causal snapshot과 TF pose를 구성한다.
+입력: profile별 perception topic, /driving_feature, 필요한 /route/target_point*, /tf.
+출력(pub): 없음. InferenceFrame/NotReady를 engine에 반환.
+구독(sub): 위 입력 토픽을 이 객체가 단독 소유한다.
+"""
 
 from __future__ import annotations
 
@@ -65,14 +70,14 @@ class PoseSample:
 
 @dataclass(frozen=True)
 class AlignedPointCloudSweep:
-    """One stamped cloud plus its rigid alignment into the newest sweep."""
+    """timestamp가 있는 cloud와 최신 sweep으로의 rigid alignment 쌍."""
 
     point_cloud: Any
     T_anchor_lidar_from_sweep_lidar: np.ndarray
 
 
 def _stamp_ns(stamp: Any) -> int:
-    """Return integer nanoseconds from rospy.Time-compatible values."""
+    """rospy.Time-compatible 값에서 integer nanoseconds를 반환한다."""
     to_nsec = getattr(stamp, "to_nsec", None)
     if callable(to_nsec):
         return int(to_nsec())
@@ -92,7 +97,7 @@ def _message_stamp_ns(message: Any) -> int:
 
 
 def _ros_message_types() -> Dict[str, Any]:
-    """Import only the ROS message classes allowed by the profile contract."""
+    """profile 계약이 허용한 ROS message class만 import한다."""
     from geometry_msgs.msg import PointStamped
     from sensor_msgs.msg import Image, PointCloud2
     from tf2_msgs.msg import TFMessage
@@ -108,7 +113,7 @@ def _ros_message_types() -> Dict[str, Any]:
 
 
 class InputBuffer:
-    """Keep bounded input FIFOs and form stable causal snapshots."""
+    """bounded input FIFO를 유지하고 안정적인 causal snapshot을 만든다."""
 
     def __init__(
         self,
@@ -148,7 +153,7 @@ class InputBuffer:
         *,
         subscriber_factory: Any = None,
     ) -> "InputBuffer":
-        """Build profile FIFOs and own every inference-layer subscription."""
+        """profile FIFO를 만들고 모든 inference-layer subscription을 소유한다."""
         data = getattr(profile, "data", profile)
         required = list(data.get("required_inputs", ()))
         requirements = data.get("buffer_requirements", {})
@@ -377,7 +382,7 @@ class InputBuffer:
 
 
 class TfPoseHistory:
-    """Thread-safe timestamped pose history with bounded-gap interpolation."""
+    """bounded-gap interpolation을 제공하는 thread-safe timestamp pose history."""
 
     def __init__(self, max_bracket_gap_ms: float, max_samples: int = 256) -> None:
         if max_bracket_gap_ms < 0:
@@ -440,7 +445,7 @@ def _milliseconds(nanoseconds: int) -> float:
 
 
 def _pose_matrix(pose: PoseSample) -> np.ndarray:
-    """Return T_map_from_base for one interpolated pose."""
+    """interpolated pose 하나의 T_map_from_base를 반환한다."""
     x, y, z, w = pose.quaternion_xyzw
     norm = x * x + y * y + z * z + w * w
     if norm <= np.finfo(float).eps:

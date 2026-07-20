@@ -1,4 +1,4 @@
-"""Launch and lightweight end-to-end contracts for open-loop inference."""
+"""오픈루프 추론 launch와 경량 종단간 계약을 검사한다."""
 
 import csv
 from importlib.util import module_from_spec, spec_from_file_location

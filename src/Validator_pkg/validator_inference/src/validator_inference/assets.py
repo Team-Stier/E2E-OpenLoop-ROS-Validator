@@ -1,4 +1,9 @@
-"""Deterministic local bootstrap and verification for model runtime assets."""
+"""
+모델 source/checkpoint asset의 로컬 bootstrap, hash 검증, manifest 생성을 담당한다.
+입력: 선택된 profile, models/ 아래의 source 및 asset 파일.
+출력(pub): 없음. 검증된 asset-manifest.json을 로컬에 생성.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +41,7 @@ DIFFUSION_SELECTOR_STAGES = (
 
 
 class AssetError(RuntimeError):
-    """Raised for missing, corrupt, or revision-incompatible runtime assets."""
+    """runtime asset이 없거나 손상됐거나 revision과 맞지 않을 때 발생한다."""
 
 
 def default_project_root() -> Path:
@@ -125,7 +130,7 @@ def verify_runtime_assets(
     *,
     verify_source: bool = True,
 ) -> Dict[str, Any]:
-    """Verify declared assets without downloading and return stable manifest metadata."""
+    """다운로드 없이 선언된 asset을 검증하고 안정적인 manifest metadata를 반환한다."""
     root = Path(project_root).resolve() if project_root else default_project_root()
     model_id = profile.get("id", "<unknown>")
     assets = []
@@ -174,7 +179,7 @@ def _manifest_path(profile: Dict[str, Any], project_root: str | Path) -> Path:
 def write_asset_manifest(
     profile: Dict[str, Any], metadata: Dict[str, Any], project_root: str | Path | None = None
 ) -> Path:
-    """Write canonical JSON only from already verified metadata."""
+    """이미 검증된 metadata만으로 canonical JSON을 기록한다."""
     root = Path(project_root).resolve() if project_root else default_project_root()
     payload = {
         "model_id": profile["id"],
@@ -395,7 +400,7 @@ def _trajectory_head_derivative(
 
 
 def selector_flow_stages(source_text: str) -> tuple[str, ...]:
-    """Audit the generated method's complete learned-selector path with its AST."""
+    """생성된 method의 전체 learned-selector 경로를 AST로 점검한다."""
     tree = ast.parse(source_text)
     trajectory = next(
         (
@@ -500,7 +505,7 @@ def selector_flow_stages(source_text: str) -> tuple[str, ...]:
 
 
 def create_diffusiondrive_derivative(checkout: str | Path) -> Dict[str, str]:
-    """Generate the version-pinned neural selector with evaluation code absent."""
+    """evaluation code를 제거한 version-pinned neural selector를 생성한다."""
     checkout = Path(checkout)
     try:
         observed_commit = subprocess.check_output(
@@ -584,7 +589,7 @@ def create_diffusiondrive_derivative(checkout: str | Path) -> Dict[str, str]:
         1,
     )
     header = (
-        '"""Generated evaluation-free open-loop derivative.\n\n'
+        '"""생성된 evaluation-free open-loop derivative.\n\n'
         f"Exact upstream commit: {DIFFUSION_SOURCE_COMMIT}. Do not edit in place.\n"
         '"""\n'
     )
@@ -626,7 +631,7 @@ def fetch_runtime_assets(
     refresh_source: bool = False,
     downloader: Callable[[str, str | Path], Any] = urlretrieve,
 ) -> Path:
-    """Fetch one selected model's declared source/assets and write a verified manifest."""
+    """선택 모델의 선언된 source/asset을 가져와 검증된 manifest를 기록한다."""
     root = Path(project_root).resolve() if project_root else default_project_root()
     if profile.get("id") != model_id:
         raise AssetError(

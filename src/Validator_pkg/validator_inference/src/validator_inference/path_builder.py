@@ -1,4 +1,9 @@
-"""Convert source-model ego trajectories to ROS paths in the LiDAR frame."""
+"""
+모델 ego trajectory를 Lidar3D-4 frame의 ROS Path로 변환한다.
+입력: 모델 trajectory, profile T_base_from_lidar, reference stamp.
+출력(pub): 없음. nav_msgs/Path를 반환.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 

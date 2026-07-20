@@ -1,4 +1,9 @@
-"""LEAD TFv6 official ``noradar_resnet34`` source boundary."""
+"""
+공식 LEAD TFv6 noradar_resnet34 ensemble의 source forward 경계.
+입력: panorama, pose-aligned 10-sweep LiDAR, status, 세 target point.
+출력(pub): 없음. 8개 CARLA-relative waypoint를 ModelPrediction으로 반환.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -85,7 +90,7 @@ def _source_prefilter_tfv6_sweep(
     expert_config: Any,
     remove_ground: Callable[..., Any],
 ) -> np.ndarray:
-    """Port LEAD base_agent.py:158-163 and 203-237 without heuristics."""
+    """heuristic 없이 LEAD base_agent.py:158-163, 203-237을 port한다."""
     lidar_x = points_base_ros[:, 0]
     lidar_y = points_base_ros[:, 1]
     points = points_base_ros[
@@ -132,7 +137,7 @@ def prepare_tfv6_temporal_lidar(
     compress_float_image: Callable[..., Any],
     decompress_float_image: Callable[..., Any],
 ) -> np.ndarray:
-    """Reproduce pinned LEAD prefilter, accumulation, raster and PNG stages.
+    """pinned LEAD의 prefilter, accumulation, raster, PNG 단계를 재현한다.
 
     ROS sensor points remain x-forward/y-left through mount transform,
     per-sweep filtering, and newest-anchor alignment.  The conversion to the
@@ -166,24 +171,24 @@ def prepare_tfv6_temporal_lidar(
         else:
             points = points.reshape(-1, 3)
             points = points[np.isfinite(points).all(axis=1)]
-        # Source-equivalent order from lead/common/base_agent.py:140-237:
-        # sensor->ego, ego footprint, exact RANSAC, then BEV/height bounds.
+        # lead/common/base_agent.py:140-237과 같은 순서:
+        # sensor->ego, ego footprint, 정확한 RANSAC, 그 다음 BEV/height bounds.
         points_base = _transform_xyz(points, base_from_lidar)
         points_base = _source_prefilter_tfv6_sweep(
             points_base,
             expert_config=expert_config,
             remove_ground=remove_ground,
         )
-        # InputBuffer pairs map-to-base poses, so this maps sweep base/ego
-        # coordinates into the newest anchor base/ego coordinates.
+        # InputBuffer가 map-to-base pose를 연결했으므로 sweep base/ego 좌표를
+        # 최신 anchor의 base/ego 좌표로 변환한다.
         matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
         aligned = _transform_xyz(points_base, matrix)
         merged.append(aligned)
 
     points = np.concatenate(merged, axis=0)
-    # ROS x-forward/y-left -> pinned CARLA x-forward/y-right, exactly once.
+    # ROS x-forward/y-left를 pinned CARLA x-forward/y-right로 정확히 한 번 변환한다.
     points[:, 1] *= -1.0
-    # lead/inference/sensor_agent.py:386-413
+    # lead/inference/sensor_agent.py:386-413의 quantize/raster/PNG 단계.
     for axis, precision in enumerate(point_precision_xyz):
         points[:, axis] = np.round(points[:, axis] / precision) * precision
     raster = rasterize_lidar(config=training_config, lidar=points)[..., None]
@@ -285,7 +290,7 @@ class _LeadOpenLoopRuntime:
 
 
 class TFv6Model:
-    """Concrete wrapper for the pinned LEAD open-loop ensemble."""
+    """pinned LEAD open-loop ensemble의 concrete wrapper."""
 
     def __init__(
         self,

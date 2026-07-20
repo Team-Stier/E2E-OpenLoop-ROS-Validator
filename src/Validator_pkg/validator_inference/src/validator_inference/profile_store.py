@@ -1,4 +1,9 @@
-"""Load and validate the selected local inference profile."""
+"""
+로컬 profile.json에서 선택 모델을 읽고 runtime 계약을 검증한다.
+입력: profile 경로와 model_id.
+출력(pub): 없음. SelectedProfile 또는 ProfileError.
+구독(sub): 없음.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +16,7 @@ from typing import Any
 
 
 class ProfileError(ValueError):
-    """Raised when a local inference profile is unsupported or incomplete."""
+    """로컬 inference profile이 지원되지 않거나 불완전할 때 발생한다."""
 
 
 @dataclass(frozen=True)
