@@ -15,7 +15,7 @@
 - Every outcome is published as `validator_msgs/InferenceMetric`; its `elapsed_ms` is milliseconds for a completed forward and `-1.0` when no forward ran. `RecorderNode` writes it to a startup-created CSV.
 - Use `Lidar3D-4` for ROS path and temporary target-point frames.
 - Omit NAVSIM PDM, metric-cache, and `reward_dict` from DiffusionDrive V2 waypoint inference.
-- TFv6 uses the source padding format for four empty radar returns: `4 x 75 x 5`, with sensor IDs 0–3; record it as compatibility behavior.
+- TFv6 uses the official `noradar_resnet34` release.  It requires panorama, ten LiDAR sweeps with paired poses, command/speed, and previous/current/next target points; it has no radar model input.  Its optional `DrivingFeature` radar fields remain empty with `rows=0` and `cols=0`, with no padding operation or `synthetic_radar_empty` flag.  The LEAD SHA `730bc1a2f44d5f28312dd55f0ca958e94a24c038` is a verified-compatible public `cvpr2026` pin, not a claim about private training provenance.
 - Keep SparseDrive V2 calibration as nullable inline profile fields. Do not create a separate calibration file.
 
 ---
@@ -29,14 +29,16 @@
 
 **Interfaces:**
 
-- Consumes: official TFv6 radar padding and DiffusionDrive V2 SEL trajectory-return contracts.
+- Consumes: official TFv6 no-radar and DiffusionDrive V2 SEL trajectory-return contracts.
 - Produces: selected-profile startup data for `OptFeederNode`, `InputBuffer`, and each model object.
 
 - [ ] **Step 1: Write the profile assertions**
 
 ```python
-assert tfv6["readiness"]["state"] == "compatibility_ready_after_weights"
-assert tfv6["radar_compatibility"]["tensor_shape"] == [4, 75, 5]
+assert tfv6["reference_variant"] == "ln2697/tfv6 noradar_resnet34"
+assert tfv6["source"]["commit"] == "730bc1a2f44d5f28312dd55f0ca958e94a24c038"
+assert tfv6["radar_input"]["enabled"] is False
+assert tfv6["radar_input"]["config_field"] == "use_radar_detection=false"
 assert "pdm_metric_cache" not in str(diffusiondrive_v2)
 assert diffusiondrive_v2["output"]["published_forward_output"] == "trajectory"
 assert sparsedrive_v2["static_runtime_inputs"]["camera_calibration"]["source"] == "profile_inline"
@@ -44,7 +46,7 @@ assert sparsedrive_v2["static_runtime_inputs"]["camera_calibration"]["source"] =
 
 - [ ] **Step 2: Edit the profile with exact contracts**
 
-Set TFv6 radar to an approved source-padding compatibility contract: four empty raw sensor arrays are padded to 75 rows, the fifth feature is sensor ID 0–3, and `synthetic_radar_empty` is recorded. Remove radar from readiness blockers.
+Set TFv6 to the official `noradar_resnet34` contract under verified-compatible public LEAD `cvpr2026` pin `730bc1a2f44d5f28312dd55f0ca958e94a24c038`.  It requires panorama, ten LiDAR sweeps with paired poses, command/speed, and previous/current/next target points, but no radar input.  Keep optional `DrivingFeature` radar empty with `rows=0` and `cols=0`; do not synthesize padded radar data and do not record `synthetic_radar_empty`.  Record that the source SHA is compatibility evidence rather than a provable private training commit.
 
 Set DiffusionDrive V2's `trajectory_anchor` to `models/diffusiondrive_v2/navsim_v2/kmeans_navsim_traj_20.npy` with SHA-256 `2d341e525d7882ee5e916c67d37bea571e4c793cf801f0fff3eff59d38b20d98`. Remove PDM cache from assets and inputs; declare the direct source trajectory expression `traj_to_score[:, -1]`.
 
@@ -55,7 +57,7 @@ Replace SparseDrive V2's calibration file path with `static_runtime_inputs.camer
 Run:
 
 ```bash
-python3 -c 'import json; p=json.load(open("src/Validator_pkg/config/profile.json")); q={x["id"]:x for x in p["profiles"]}; assert q["tfv6"]["readiness"]["state"]=="compatibility_ready_after_weights"; assert "pdm_metric_cache" not in str(q["diffusiondrive_v2"]); assert q["sparsedrive_v2"]["static_runtime_inputs"]["camera_calibration"]["source"]=="profile_inline"; print("PROFILE_OK")'
+python3 -c 'import json; p=json.load(open("src/Validator_pkg/config/profile.json")); q={x["id"]:x for x in p["profiles"]}; t=q["tfv6"]; assert t["reference_variant"]=="ln2697/tfv6 noradar_resnet34"; assert t["source"]["commit"]=="730bc1a2f44d5f28312dd55f0ca958e94a24c038"; assert t["radar_input"]["enabled"] is False; assert "pdm_metric_cache" not in str(q["diffusiondrive_v2"]); assert q["sparsedrive_v2"]["static_runtime_inputs"]["camera_calibration"]["source"]=="profile_inline"; print("PROFILE_OK")'
 ```
 
 Expected: `PROFILE_OK`.
@@ -81,11 +83,11 @@ git commit -m "docs: finalize inference model profile contracts"
 
 - [ ] **Step 1: Correct readiness and asset statements**
 
-Replace TFv6 real-radar blocking language with the explicit source-padded compatibility input. Replace DiffusionDrive V2 PDM blocking language with the direct source trajectory-return path. Describe the official anchor as a required binary asset stored next to the checkpoint, not as a user-supplied artifact.
+Replace TFv6 real-radar blocking language with the official no-radar `noradar_resnet34` input contract: panorama, ten LiDAR sweeps/poses, command/speed, and previous/current/next target points only.  Optional `DrivingFeature` radar stays empty (`rows=0`, `cols=0`) and no synthetic padding or compatibility flag is allowed.  Preserve the source-pin nuance: the public LEAD `cvpr2026` SHA is verified-compatible, not evidence of a private training commit.  Replace DiffusionDrive V2 PDM blocking language with the direct source trajectory-return path. Describe the official anchor as a required binary asset stored next to the checkpoint, not as a user-supplied artifact.
 
 - [ ] **Step 2: Correct OptFeeder and calibration ownership**
 
-Make `OptFeederNode` publish all model-required non-image/non-LiDAR fields: ego features, fallback route, TFv6 synthetic radar, and SparseDrive inline calibration. Remove every reference to a separate SparseDrive calibration JSON asset.
+Make `OptFeederNode` publish all model-required non-image/non-LiDAR fields: ego features, fallback route, and SparseDrive inline calibration.  For TFv6 the optional radar portion of `DrivingFeature` is empty (`rows=0`, `cols=0`); it is not a synthetic-radar producer. Remove every reference to a separate SparseDrive calibration JSON asset.
 
 - [ ] **Step 3: Preserve renderable diagrams**
 
@@ -184,7 +186,7 @@ Run:
 git diff -- README.md docs/inference_engine_design.md docs/model_io_contracts.md src/Validator_pkg/config/profile.json
 ```
 
-Expected: no PDM dependency, official anchor colocated with its model, inline nullable SparseDrive calibration, and source-padded TFv6 radar behavior.
+Expected: no PDM dependency, official anchor colocated with its model, inline nullable SparseDrive calibration, and the official no-radar TFv6 behavior (empty optional radar fields, no padding or compatibility flag).
 
 - [ ] **Step 4: Commit any uncommitted planned files**
 
