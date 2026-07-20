@@ -1,0 +1,8 @@
+services:
+  ros1-noetic:
+    build: .
+    image: e2e-openloop-ros-validator:ros-noetic
+    working_dir: /workspace/E2E-OpenLoop-ROS-Validator
+    volumes:
+      - .:/workspace/E2E-OpenLoop-ROS-Validator
+    tty: true
