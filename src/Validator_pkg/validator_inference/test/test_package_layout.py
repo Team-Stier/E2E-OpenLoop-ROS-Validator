@@ -6,7 +6,7 @@ def _repository_root() -> Path:
     return next(
         parent
         for parent in Path(__file__).resolve().parents
-        if (parent / "Dockerfile").is_file() and (parent / "src").is_dir()
+        if (parent / "README.md").is_file() and (parent / "src").is_dir()
     )
 
 

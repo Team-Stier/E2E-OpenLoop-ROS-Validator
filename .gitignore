@@ -24,3 +24,8 @@ __pycache__/
 .codex/
 .agents/
 graphify-out/
+
+# Local Docker TDD environment
+Dockerfile
+docker-compose.yml
+.dockerignore
