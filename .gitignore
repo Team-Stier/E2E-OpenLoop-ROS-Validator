@@ -1,6 +1,7 @@
 # ROS Catkin 빌드 산출물 제외
 build/
 devel/
+install/
 logs/
 .catkin_workspace
 rosbag/*.bag
@@ -16,3 +17,10 @@ records/openloop/*.csv
 /models/
 .coterm/
 __pycache__/
+
+# Local agent/skill work products and generated analysis output
+.superpowers/
+.worktrees/
+.codex/
+.agents/
+graphify-out/
