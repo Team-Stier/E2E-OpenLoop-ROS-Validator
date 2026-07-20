@@ -25,3 +25,11 @@ catkin_package(
     tf2_ros
     validator_msgs
 )
+
+catkin_install_python(PROGRAMS scripts/opt_feeder_node.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../config/profile.json
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/config
+)
