@@ -31,16 +31,16 @@
 | Path | Responsibility |
 | --- | --- |
 | `src/Validator_pkg/validator_msgs/` | Compile `CameraCalibration`, `DrivingFeature`, and `InferenceMetric` ROS messages. The physical location is under `Validator_pkg`; its ROS package name remains `validator_msgs`. |
-| `src/Validator_pkg/package.xml`, `CMakeLists.txt`, `setup.py` | Define catkin package `validator_inference` and install Python nodes. |
-| `src/Validator_pkg/src/validator_inference/profile_store.py` | Load, validate, hash, and select the one local profile. |
-| `src/Validator_pkg/src/validator_inference/input_buffer.py` | Own subscriber callbacks, bounded histories, causal snapshotting, and TF interpolation. |
-| `src/Validator_pkg/src/validator_inference/opt_features.py` | Convert `EgoVehicleStatus` into command/kinematic/radar/calibration feature values. |
-| `src/Validator_pkg/src/validator_inference/worker.py` | One-forward, no-queue worker and one-slot completion mailbox. |
-| `src/Validator_pkg/src/validator_inference/models/*.py` | Four concrete checkpoint loaders and source-native forward paths. |
-| `src/Validator_pkg/src/validator_inference/path_builder.py` | Convert selected-model trajectory to `Lidar3D-4` `nav_msgs/Path`. |
-| `src/Validator_pkg/scripts/*.py` | ROS-node composition, asset bootstrap, and node entry points. |
-| `src/Validator_pkg/launch/openloop_inference.launch` | Start OptFeeder, engine, and recorder with sim time. |
-| `src/Validator_pkg/test/` | Deterministic unit and ROS integration coverage. |
+| `src/Validator_pkg/validator_inference/package.xml`, `CMakeLists.txt`, `setup.py` | Define catkin package `validator_inference` and install Python nodes. |
+| `src/Validator_pkg/validator_inference/src/validator_inference/profile_store.py` | Load, validate, hash, and select the one local profile. |
+| `src/Validator_pkg/validator_inference/src/validator_inference/input_buffer.py` | Own subscriber callbacks, bounded histories, causal snapshotting, and TF interpolation. |
+| `src/Validator_pkg/validator_inference/src/validator_inference/opt_features.py` | Convert `EgoVehicleStatus` into command/kinematic/radar/calibration feature values. |
+| `src/Validator_pkg/validator_inference/src/validator_inference/worker.py` | One-forward, no-queue worker and one-slot completion mailbox. |
+| `src/Validator_pkg/validator_inference/src/validator_inference/models/*.py` | Four concrete checkpoint loaders and source-native forward paths. |
+| `src/Validator_pkg/validator_inference/src/validator_inference/path_builder.py` | Convert selected-model trajectory to `Lidar3D-4` `nav_msgs/Path`. |
+| `src/Validator_pkg/validator_inference/scripts/*.py` | ROS-node composition, asset bootstrap, and node entry points. |
+| `src/Validator_pkg/validator_inference/launch/openloop_inference.launch` | Start OptFeeder, engine, and recorder with sim time. |
+| `src/Validator_pkg/validator_inference/test/` | Deterministic unit and ROS integration coverage. |
 | `docs/inference_engine_design.md`, `docs/model_io_contracts.md`, `README.md` | Keep the shipped implementation and run command aligned with the executable contract. |
 
 ### Task 0: Create a reproducible ROS1 Noetic Docker test environment
@@ -67,8 +67,9 @@ Expected: nonzero exit because the project image has not been built.
 FROM ros:noetic-ros-base-focal
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential python3-catkin-tools python3-numpy python3-pip python3-pytest \
+    build-essential python3-catkin-tools python3-numpy python3-pip python3-pytest ros-noetic-tf2-ros \
     python3-rospkg python3-rosdep git && \
+    ln -s /usr/bin/pytest-3 /usr/local/bin/pytest && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace/E2E-OpenLoop-ROS-Validator
 ENTRYPOINT ["/ros_entrypoint.sh"]
@@ -203,15 +204,15 @@ git commit -m "feat: add inference ROS message contracts"
 ### Task 2: Bootstrap the `validator_inference` catkin package and local profile store
 
 **Files:**
-- Create: `src/Validator_pkg/package.xml`
-- Create: `src/Validator_pkg/CMakeLists.txt`
-- Create: `src/Validator_pkg/setup.py`
-- Create: `src/Validator_pkg/src/validator_inference/__init__.py`
-- Create: `src/Validator_pkg/src/validator_inference/profile_store.py`
-- Create: `src/Validator_pkg/test/test_profile_store.py`
+- Create: `src/Validator_pkg/validator_inference/package.xml`
+- Create: `src/Validator_pkg/validator_inference/CMakeLists.txt`
+- Create: `src/Validator_pkg/validator_inference/setup.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/__init__.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/profile_store.py`
+- Create: `src/Validator_pkg/validator_inference/test/test_profile_store.py`
 
 **Interfaces:**
-- Consumes: local `config/profile.json`, `~model_id`, and optional `~profile_file` ROS parameters.
+- Consumes: local sibling `../config/profile.json`, `~model_id`, and optional `~profile_file` ROS parameters.
 - Produces: immutable `SelectedProfile(model_id, data, profile_sha256, calibration_profile_sha256)` from `load_selected_profile`.
 
 - [ ] **Step 1: Write failing profile-store tests**
@@ -235,7 +236,7 @@ def test_sparse_profile_rejects_partial_inline_calibration(profile_path):
 
 - [ ] **Step 2: Run the tests and confirm imports fail**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_profile_store.py -q`
+Run: `docker compose run --rm ros1-noetic bash -lc 'PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_profile_store.py -q'`
 
 Expected: `ModuleNotFoundError: No module named 'validator_inference'`.
 
@@ -268,22 +269,22 @@ def load_selected_profile(profile_path: str | Path, model_id: str) -> SelectedPr
 
 - [ ] **Step 4: Run unit tests and package configuration**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_profile_store.py -q && catkin_make --pkg validator_inference`
+Run: `docker compose run --rm ros1-noetic bash -lc 'PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_profile_store.py -q && catkin_make --force-cmake --pkg validator_msgs validator_inference'`
 
 Expected: all profile tests pass and catkin configures `validator_inference`.
 
 - [ ] **Step 5: Commit package bootstrap**
 
 ```bash
-git add src/Validator_pkg/package.xml src/Validator_pkg/CMakeLists.txt src/Validator_pkg/setup.py src/Validator_pkg/src src/Validator_pkg/test/test_profile_store.py
+git add src/Validator_pkg/validator_inference/package.xml src/Validator_pkg/validator_inference/CMakeLists.txt src/Validator_pkg/validator_inference/setup.py src/Validator_pkg/validator_inference/src src/Validator_pkg/validator_inference/test/test_profile_store.py
 git commit -m "feat: bootstrap local inference profile runtime"
 ```
 
 ### Task 3: Implement bounded causal input storage and TF pose lookup
 
 **Files:**
-- Create: `src/Validator_pkg/src/validator_inference/input_buffer.py`
-- Create: `src/Validator_pkg/test/test_input_buffer.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/input_buffer.py`
+- Create: `src/Validator_pkg/validator_inference/test/test_input_buffer.py`
 
 **Interfaces:**
 - Consumes: `InputSpec(key, topic, ros_type, fifo_depth)`, ROS messages with `header.stamp`, and `/tf` transforms.
@@ -311,7 +312,7 @@ def test_tfv6_requires_exactly_ten_past_sweeps():
 
 - [ ] **Step 2: Run the tests and confirm failure**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_input_buffer.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_input_buffer.py -q`
 
 Expected: `ModuleNotFoundError` for `validator_inference.input_buffer`.
 
@@ -357,23 +358,23 @@ def test_pose_interpolation_rejects_a_gap_over_profile_limit():
     assert history.interpolate(time_from_sec(0.25)) is None
 ```
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_input_buffer.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_input_buffer.py -q`
 
 Expected: all causal, age, ten-sweep, and TF-gap tests pass.
 
 - [ ] **Step 5: Commit the input buffer**
 
 ```bash
-git add src/Validator_pkg/src/validator_inference/input_buffer.py src/Validator_pkg/test/test_input_buffer.py
+git add src/Validator_pkg/validator_inference/src/validator_inference/input_buffer.py src/Validator_pkg/validator_inference/test/test_input_buffer.py
 git commit -m "feat: add causal inference input buffer"
 ```
 
 ### Task 4: Implement the OptFeeder feature contract
 
 **Files:**
-- Create: `src/Validator_pkg/src/validator_inference/opt_features.py`
-- Create: `src/Validator_pkg/scripts/opt_feeder_node.py`
-- Create: `src/Validator_pkg/test/test_opt_features.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/opt_features.py`
+- Create: `src/Validator_pkg/validator_inference/scripts/opt_feeder_node.py`
+- Create: `src/Validator_pkg/validator_inference/test/test_opt_features.py`
 
 **Interfaces:**
 - Consumes: `morai_msgs/EgoVehicleStatus`, selected profile, and `T_base_from_lidar` from `/tf`.
@@ -400,7 +401,7 @@ def test_sparse_calibration_is_copied_from_the_selected_profile(ego):
 
 - [ ] **Step 2: Run the test and confirm failure**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_opt_features.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_opt_features.py -q`
 
 Expected: import failure for `validator_inference.opt_features`.
 
@@ -430,28 +431,28 @@ def build_fallback_target(stamp: rospy.Time, x_m: float) -> PointStamped:
 
 - [ ] **Step 4: Re-run tests and verify installed node entry point**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_opt_features.py -q && python3 -m py_compile src/Validator_pkg/scripts/opt_feeder_node.py`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_opt_features.py -q && python3 -m py_compile src/Validator_pkg/validator_inference/scripts/opt_feeder_node.py`
 
 Expected: all feature tests pass and compilation exits `0`.
 
 - [ ] **Step 5: Commit OptFeeder**
 
 ```bash
-git add src/Validator_pkg/src/validator_inference/opt_features.py src/Validator_pkg/scripts/opt_feeder_node.py src/Validator_pkg/test/test_opt_features.py
+git add src/Validator_pkg/validator_inference/src/validator_inference/opt_features.py src/Validator_pkg/validator_inference/scripts/opt_feeder_node.py src/Validator_pkg/validator_inference/test/test_opt_features.py
 git commit -m "feat: publish required non-perception model inputs"
 ```
 
 ### Task 5: Add concrete checkpoint runtime and reproducible asset bootstrap
 
 **Files:**
-- Create: `src/Validator_pkg/src/validator_inference/assets.py`
-- Create: `src/Validator_pkg/src/validator_inference/models/tfv6.py`
-- Create: `src/Validator_pkg/src/validator_inference/models/interfuser.py`
-- Create: `src/Validator_pkg/src/validator_inference/models/diffusiondrive_v2.py`
-- Create: `src/Validator_pkg/src/validator_inference/models/sparsedrive_v2.py`
-- Create: `src/Validator_pkg/src/validator_inference/models/select.py`
-- Create: `src/Validator_pkg/scripts/fetch_model_assets.py`
-- Create: `src/Validator_pkg/test/test_assets_and_model_selection.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/assets.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/models/tfv6.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/models/interfuser.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/models/diffusiondrive_v2.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/models/sparsedrive_v2.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/models/select.py`
+- Create: `src/Validator_pkg/validator_inference/scripts/fetch_model_assets.py`
+- Create: `src/Validator_pkg/validator_inference/test/test_assets_and_model_selection.py`
 
 **Interfaces:**
 - Consumes: selected profile `source`/`runtime_assets`, `models/sources/{lead,interfuser,diffusiondrive_v2,sparsedrive_v2}` at pinned commits, and checkpoint assets at profile paths.
@@ -477,7 +478,7 @@ def test_asset_check_reports_path_and_expected_hash(tmp_path):
 
 - [ ] **Step 2: Run the tests and confirm failure**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_assets_and_model_selection.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_assets_and_model_selection.py -q`
 
 Expected: imports fail because assets and models do not exist.
 
@@ -523,23 +524,23 @@ class DiffusionDriveV2InferenceModel:
 
 - [ ] **Step 5: Run model selection and asset failure coverage**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_assets_and_model_selection.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_assets_and_model_selection.py -q`
 
 Expected: factory tests pass and the missing asset error names the exact path and hash.
 
 - [ ] **Step 6: Commit concrete runtime preparation**
 
 ```bash
-git add src/Validator_pkg/src/validator_inference/assets.py src/Validator_pkg/src/validator_inference/models src/Validator_pkg/scripts/fetch_model_assets.py src/Validator_pkg/test/test_assets_and_model_selection.py
+git add src/Validator_pkg/validator_inference/src/validator_inference/assets.py src/Validator_pkg/validator_inference/src/validator_inference/models src/Validator_pkg/validator_inference/scripts/fetch_model_assets.py src/Validator_pkg/validator_inference/test/test_assets_and_model_selection.py
 git commit -m "feat: add source-native model runtimes"
 ```
 
 ### Task 6: Add no-queue worker, deterministic seed, and coordinate-correct path builder
 
 **Files:**
-- Create: `src/Validator_pkg/src/validator_inference/worker.py`
-- Create: `src/Validator_pkg/src/validator_inference/path_builder.py`
-- Create: `src/Validator_pkg/test/test_worker_and_path.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/worker.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/path_builder.py`
+- Create: `src/Validator_pkg/validator_inference/test/test_worker_and_path.py`
 
 **Interfaces:**
 - Consumes: `InferenceFrame`, one concrete model object's `forward`, `run_id`, profile output transform, and `T_base_from_lidar`.
@@ -564,7 +565,7 @@ def test_carla_path_flips_y_then_uses_inverse_base_from_lidar():
 
 - [ ] **Step 2: Run the tests and confirm failure**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_worker_and_path.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_worker_and_path.py -q`
 
 Expected: imports fail.
 
@@ -587,23 +588,23 @@ def try_submit(self, frame: InferenceFrame) -> SubmitResult:
 
 - [ ] **Step 4: Run worker/path tests**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_worker_and_path.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_worker_and_path.py -q`
 
 Expected: tests show no second concurrent forward and both coordinate conventions produce `Lidar3D-4` paths.
 
 - [ ] **Step 5: Commit worker and path builder**
 
 ```bash
-git add src/Validator_pkg/src/validator_inference/worker.py src/Validator_pkg/src/validator_inference/path_builder.py src/Validator_pkg/test/test_worker_and_path.py
+git add src/Validator_pkg/validator_inference/src/validator_inference/worker.py src/Validator_pkg/validator_inference/src/validator_inference/path_builder.py src/Validator_pkg/validator_inference/test/test_worker_and_path.py
 git commit -m "feat: add one-slot inference worker and path export"
 ```
 
 ### Task 7: Compose `InferenceEngineNode` and publish every outcome
 
 **Files:**
-- Create: `src/Validator_pkg/src/validator_inference/engine.py`
-- Create: `src/Validator_pkg/scripts/inference_engine_node.py`
-- Create: `src/Validator_pkg/test/test_engine.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/engine.py`
+- Create: `src/Validator_pkg/validator_inference/scripts/inference_engine_node.py`
+- Create: `src/Validator_pkg/validator_inference/test/test_engine.py`
 
 **Interfaces:**
 - Consumes: `SelectedProfile`, `InputBuffer`, `InferenceWorker`, `PathMessageBuilder`, ROS clock time, and `DrivingFeature.header.stamp` as reference stamp.
@@ -633,7 +634,7 @@ def test_completion_publishes_path_time_and_completed_metric(engine_with_complet
 
 - [ ] **Step 2: Run the tests and confirm failure**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_engine.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_engine.py -q`
 
 Expected: import failure for `validator_inference.engine`.
 
@@ -659,23 +660,23 @@ def on_timer_tick(self, _event: rospy.timer.TimerEvent) -> None:
 
 - [ ] **Step 4: Run engine tests**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_engine.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_engine.py -q`
 
-Expected: all three outcomes publish exactly one metric; only completion publishes a Float64 elapsed time.
+Expected: all three outcomes publish exactly one metric; only completion has a measured nonnegative `elapsed_ms`.
 
 - [ ] **Step 5: Commit engine composition**
 
 ```bash
-git add src/Validator_pkg/src/validator_inference/engine.py src/Validator_pkg/scripts/inference_engine_node.py src/Validator_pkg/test/test_engine.py
+git add src/Validator_pkg/validator_inference/src/validator_inference/engine.py src/Validator_pkg/validator_inference/scripts/inference_engine_node.py src/Validator_pkg/validator_inference/test/test_engine.py
 git commit -m "feat: publish open-loop inference outcomes"
 ```
 
 ### Task 8: Implement startup CSV recording
 
 **Files:**
-- Create: `src/Validator_pkg/src/validator_inference/csv_recorder.py`
-- Create: `src/Validator_pkg/scripts/recorder_node.py`
-- Create: `src/Validator_pkg/test/test_csv_recorder.py`
+- Create: `src/Validator_pkg/validator_inference/src/validator_inference/csv_recorder.py`
+- Create: `src/Validator_pkg/validator_inference/scripts/recorder_node.py`
+- Create: `src/Validator_pkg/validator_inference/test/test_csv_recorder.py`
 
 **Interfaces:**
 - Consumes: `/inference_metric` only.
@@ -698,7 +699,7 @@ def test_metric_creates_one_row_without_a_secondary_timing_topic(tmp_path, metri
 
 - [ ] **Step 2: Run the test and confirm failure**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_csv_recorder.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_csv_recorder.py -q`
 
 Expected: import failure for `validator_inference.csv_recorder`.
 
@@ -734,22 +735,22 @@ def append_metric(self, metric: InferenceMetric) -> None:
 
 - [ ] **Step 4: Run CSV tests**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_csv_recorder.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_csv_recorder.py -q`
 
 Expected: each metric produces one durable row; no secondary timing subscriber exists.
 
 - [ ] **Step 5: Commit recorder implementation**
 
 ```bash
-git add src/Validator_pkg/src/validator_inference/csv_recorder.py src/Validator_pkg/scripts/recorder_node.py src/Validator_pkg/test/test_csv_recorder.py
+git add src/Validator_pkg/validator_inference/src/validator_inference/csv_recorder.py src/Validator_pkg/validator_inference/scripts/recorder_node.py src/Validator_pkg/validator_inference/test/test_csv_recorder.py
 git commit -m "feat: record inference metrics to per-run CSV"
 ```
 
 ### Task 9: Add launch/run documentation and deterministic rosbag smoke coverage
 
 **Files:**
-- Create: `src/Validator_pkg/launch/openloop_inference.launch`
-- Create: `src/Validator_pkg/test/test_openloop_smoke.py`
+- Create: `src/Validator_pkg/validator_inference/launch/openloop_inference.launch`
+- Create: `src/Validator_pkg/validator_inference/test/test_openloop_smoke.py`
 - Modify: `README.md`
 - Modify: `docs/inference_engine_design.md`
 - Modify: `docs/model_io_contracts.md`
@@ -765,7 +766,7 @@ from pathlib import Path
 
 
 def test_launch_uses_sim_time_and_starts_all_three_nodes():
-    launch = Path("src/Validator_pkg/launch/openloop_inference.launch").read_text()
+    launch = Path("src/Validator_pkg/validator_inference/launch/openloop_inference.launch").read_text()
     assert '<param name="/use_sim_time" value="true"/>' in launch
     assert 'type="opt_feeder_node.py"' in launch
     assert 'type="inference_engine_node.py"' in launch
@@ -774,7 +775,7 @@ def test_launch_uses_sim_time_and_starts_all_three_nodes():
 
 - [ ] **Step 2: Run the test and confirm failure**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/test/test_openloop_smoke.py -q`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_inference/test/test_openloop_smoke.py -q`
 
 Expected: `FileNotFoundError` because the launch file does not exist.
 
@@ -812,14 +813,14 @@ The smoke test launches with a fake concrete model and published preprocessed fi
 
 - [ ] **Step 4: Run launch, unit, and smoke verification**
 
-Run: `PYTHONPATH=src/Validator_pkg/src pytest src/Validator_pkg/validator_msgs/test src/Validator_pkg/test -q && catkin_make --pkg validator_msgs && catkin_make --pkg validator_inference && git diff --check`
+Run: `PYTHONPATH=src/Validator_pkg/validator_inference/src pytest src/Validator_pkg/validator_msgs/test src/Validator_pkg/validator_inference/test -q && catkin_make --pkg validator_msgs && catkin_make --pkg validator_inference && git diff --check`
 
 Expected: all tests pass, both packages build, and `git diff --check` prints no whitespace errors.
 
 - [ ] **Step 5: Commit runnable integration**
 
 ```bash
-git add src/Validator_pkg/launch src/Validator_pkg/test/test_openloop_smoke.py README.md docs/inference_engine_design.md docs/model_io_contracts.md
+git add src/Validator_pkg/validator_inference/launch src/Validator_pkg/validator_inference/test/test_openloop_smoke.py README.md docs/inference_engine_design.md docs/model_io_contracts.md
 git commit -m "feat: add reproducible open-loop inference launch"
 ```
 

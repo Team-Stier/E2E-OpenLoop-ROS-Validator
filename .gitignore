@@ -14,3 +14,5 @@ records/openloop/*.csv
 
 # Downloaded model weights and their auxiliary binary assets
 models/
+.coterm/
+__pycache__/

@@ -332,23 +332,26 @@ string calibration_profile_sha256
 
 ~~~text
 src/Validator_pkg/
+  config/profile.json
   validator_msgs/
     msg/CameraCalibration.msg
     msg/DrivingFeature.msg
     msg/InferenceMetric.msg
-  scripts/opt_feeder_node.py
-  scripts/inference_engine_node.py
-  scripts/recorder_node.py
-  src/validator_inference/profile_store.py
-  src/validator_inference/input_buffer.py
-  src/validator_inference/worker.py
-  src/validator_inference/path_builder.py
-  src/validator_inference/models/tfv6.py
-  src/validator_inference/models/interfuser.py
-  src/validator_inference/models/diffusiondrive_v2.py
-  src/validator_inference/models/sparsedrive_v2.py
-  launch/openloop_inference.launch
-  test/
+  validator_inference/
+    package.xml
+    scripts/opt_feeder_node.py
+    scripts/inference_engine_node.py
+    scripts/recorder_node.py
+    src/validator_inference/profile_store.py
+    src/validator_inference/input_buffer.py
+    src/validator_inference/worker.py
+    src/validator_inference/path_builder.py
+    src/validator_inference/models/tfv6.py
+    src/validator_inference/models/interfuser.py
+    src/validator_inference/models/diffusiondrive_v2.py
+    src/validator_inference/models/sparsedrive_v2.py
+    launch/openloop_inference.launch
+    test/
 ~~~
 
 DiagnosticArray는 fixed CSV schema가 아니므로 쓰지 않는다. InferenceMetric만 row event다.
