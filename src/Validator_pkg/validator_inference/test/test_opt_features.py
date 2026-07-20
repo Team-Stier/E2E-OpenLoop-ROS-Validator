@@ -30,17 +30,13 @@ def _sparse_profile(cameras):
     }
 
 
-def test_tfv6_builds_lanefollow_status_and_source_padded_empty_radar():
+def test_tfv6_builds_lanefollow_status_without_radar_for_official_checkpoint():
     feature = build_driving_feature_data("tfv6", vx=7.25)
 
     assert feature.status_feature == (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 7.25)
-    assert feature.tfv6_radar_rows == 300
-    assert feature.tfv6_radar_cols == 5
-    assert len(feature.tfv6_radar) == 1500
-    assert feature.tfv6_radar[0:5] == (0.0, 0.0, 0.0, 0.0, 0.0)
-    assert feature.tfv6_radar[74 * 5 : 75 * 5] == (0.0, 0.0, 0.0, 0.0, 0.0)
-    assert feature.tfv6_radar[75 * 5 : 76 * 5] == (0.0, 0.0, 0.0, 0.0, 1.0)
-    assert feature.tfv6_radar[225 * 5 : 226 * 5] == (0.0, 0.0, 0.0, 0.0, 3.0)
+    assert feature.tfv6_radar == ()
+    assert feature.tfv6_radar_rows == 0
+    assert feature.tfv6_radar_cols == 0
     assert feature.source == "fallback"
 
 

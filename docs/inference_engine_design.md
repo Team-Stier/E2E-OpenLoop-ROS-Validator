@@ -23,7 +23,7 @@
 | 소유 객체/layer | 책임 | 하지 않는 일 |
 | --- | --- | --- |
 | PreprocessLayer | profile별 single-frame image resize/crop/stitch와 LiDAR histogram/BEV tensor 발행 | engine history·CSV·worker 관리 |
-| OptFeederNode | /Ego_topic에서 model-native status, command fallback, route fallback, TFv6 empty-radar, SparseDrive inline calibration을 /driving_feature에 발행 | image/LiDAR subscriber 보유 |
+| OptFeederNode | /Ego_topic에서 model-native status, command fallback, route fallback, SparseDrive inline calibration을 /driving_feature에 발행. TFv6 optional radar field는 비운다 | image/LiDAR subscriber 보유 |
 | InputBuffer | 모든 input subscriber, timestamp history, TFv6 10-sweep FIFO, causal snapshot | feature를 다른 모델 형식으로 재가공 |
 | 선택 모델 객체 | 원본 checkpoint load와 native forward; TFv6만 source temporal LiDAR builder | topic subscribe/publish/CSV |
 | RecorderNode | metric event를 CSV 한 행으로 기록 | inference 결과 선택/재계산 |
@@ -193,7 +193,6 @@ classDiagram
         -LocalProfileStore profile_store
         +on_ego_status(message) void
         +build_status_feature(ego) DrivingFeature
-        +build_empty_tf_v6_radar() float32[]
         +build_fallback_route_points() PointStamped[]
         +validate_inline_calibration() void
     }
@@ -240,12 +239,13 @@ SelectedModel은 runtime에 선택된 concrete object를 뜻할 뿐 interface/ad
 
 ## 6. 확정된 P0 계약
 
-### 6.1 TFv6 history와 empty radar
+### 6.1 TFv6 history와 official no-radar checkpoint
 
 - first 10 LiDAR sweep 구간은 not_ready이며 CSV에 남긴다. 임의 history padding을 하지 않는다.
 - 이후 history의 stale sweep은 사용하고 age/history span을 기록한다.
-- bag에는 radar가 없으므로 OptFeederNode가 원본 filter_and_pad_radars와 동일한 결과를 만든다: 4 sensor × 75 row, 각 row는 [0, 0, 0, 0, sensor_id], concatenate 후 (300, 5)이다.
-- 이는 original padding을 재현한 synthetic empty observation이고 synthetic_radar_empty flag를 모든 TFv6 row에 기록한다. official radar-free checkpoint와 동등하다고 주장하지 않는다.
+- `model_id=tfv6`는 공식 Hugging Face `noradar_resnet34` config와 `model_0030_1.pth`, `model_0030_2.pth` ensemble을 사용한다. config의 `use_radar_detection=false` 경로에서는 pinned `OpenLoopInference`가 radar feature를 만들거나 읽지 않는다.
+- 소스는 public `cvpr2026` branch의 검증된 checkpoint-compatible pin `730bc1a2f44d5f28312dd55f0ca958e94a24c038`이다. Hugging Face config가 private training commit SHA까지 제공하는 것은 아니므로 그 provenance를 주장하지 않는다.
+- OptFeederNode는 `DrivingFeature.tfv6_radar`를 빈 vector, rows=0, cols=0으로 발행한다. synthetic radar와 compatibility flag는 생성하지 않는다. ROS message의 optional radar fields는 향후 checkpoint 호환성을 위해 유지한다.
 
 ### 6.2 DiffusionDrive V2는 PDM을 쓰지 않는다
 
@@ -280,7 +280,7 @@ p_lidar = inverse(T_base_from_lidar) * p_base
 
 | 모델 | /driving_feature 내용 | route fallback |
 | --- | --- | --- |
-| TFv6 | CARLA command[6], forward speed, (300,5) synthetic radar | LANEFOLLOW; previous/current/next = 5/15/30 m forward |
+| TFv6 | CARLA command[6], forward speed; radar vector empty, rows=cols=0 | LANEFOLLOW; previous/current/next = 5/15/30 m forward |
 | InterFuser | CARLA command[6], forward speed | LANEFOLLOW; 15 m forward |
 | DiffusionDrive V2 | NAVSIM command[4], ego velocity[2], ego acceleration[2] | STRAIGHT |
 | SparseDrive V2 | NAVSIM status[8], validated inline calibration | STRAIGHT |
@@ -360,12 +360,12 @@ DiagnosticArray는 fixed CSV schema가 아니므로 쓰지 않는다. InferenceM
 
 | 모델 | 결정된 실행 경로 | user가 채울 값 | 구현 후 실행 조건 |
 | --- | --- | --- | --- |
-| TFv6 | 10-sweep + source-padded empty radar | 없음 | weights, 10 sweep warm-up, paired TF pose |
+| TFv6 | official `noradar_resnet34` two-weight ensemble + 10-sweep | 없음 | config/weights, 10 sweep warm-up, paired TF pose |
 | InterFuser | official single-frame forward | 없음 | checkpoint |
 | DiffusionDrive V2 | official anchor + PDM-free source inference path | 없음 | checkpoint, anchor, backbone |
 | SparseDrive V2 | official calibration-conditioned forward | inline camera calibration | checkpoint assets와 세 camera calibration 완성 |
 
-따라서 이 설계를 구현·smoke test한 뒤 사용자가 직접 넣는 runtime 정보는 SparseDrive V2 profile 내부 calibration 값뿐이다. checkpoint, backbone, vocabulary, official anchor, PDM 제거, radar padding, route fallback, shape/coordinate/timing 계약은 구현 책임이다.
+따라서 이 설계를 구현·smoke test한 뒤 사용자가 직접 넣는 runtime 정보는 SparseDrive V2 profile 내부 calibration 값뿐이다. checkpoint, backbone, vocabulary, official anchor, PDM 제거, TFv6 official no-radar 경로, route fallback, shape/coordinate/timing 계약은 구현 책임이다.
 
 이 문서의 범위는 rosbag open-loop evaluator다. /waypoints만 발행하며 controller나 safety supervisor를 포함하지 않으므로 실차 주행 배포 설계는 아니다.
 
@@ -373,6 +373,6 @@ DiagnosticArray는 fixed CSV schema가 아니므로 쓰지 않는다. InferenceM
 
 1. InputBuffer unit test: causal selection, stale acceptance, future sample exclusion, TFv6 10 FIFO warm-up, pose interpolation gap, age record.
 2. worker integration test: queue depth 0, busy tick metric, one-slot completion mailbox, exactly one success metric with elapsed_ms.
-3. OptFeederNode test: command order, ego-frame velocity/acceleration, route fallback frame, TFv6 (300,5), inline calibration validation.
+3. OptFeederNode test: command order, ego-frame velocity/acceleration, route fallback frame, TFv6 empty radar fields, inline calibration validation.
 4. Recorder test: node-start CSV, one row for every outcome, metric field-to-column mapping, and no secondary timing topic.
 5. per-model mock forward test followed by actual checkpoint smoke inference. DiffusionDrive V2 smoke test asserts no PDM import/process pool/metric-cache access.

@@ -17,7 +17,7 @@ This document describes the tensor/data contract between the external Preprocess
 
 | Model | Source revision | Required local assets |
 | --- | --- | --- |
-| TFv6 | autonomousvision/lead 5f7199bfe89c220f105a8c52fb9df1168eee202; checkpoint ln2697/tfv6 tfv6_resnet34 | config.json; model_0030_0.pth; model_0030_1.pth; model_0030_2.pth |
+| TFv6 | autonomousvision/lead `730bc1a2f44d5f28312dd55f0ca958e94a24c038` (verified checkpoint-compatible public `cvpr2026` pin); checkpoint ln2697/tfv6 `noradar_resnet34` | config.json; model_0030_1.pth; model_0030_2.pth |
 | InterFuser | opendilab/InterFuser f0be8ea294c49a59febaa032dd6da40b475e3657 | official_carla/interfuser.pth.tar |
 | DiffusionDrive V2 | hustvl/DiffusionDriveV2 1cd12a1e155c34dcc471261835444c8d5587580b | diffusiondrivev2_sel.ckpt; kmeans_navsim_traj_20.npy; ResNet-34 backbone |
 | SparseDrive V2 | swc-17/SparseDriveV2 696ef77924eb9e0a4b4047d013a50e9854bfa026 | checkpoint; path/velocity/trajectory vocabularies; ResNet-34 backbone |
@@ -43,24 +43,14 @@ The anchor shape is (20, 8, 2), dtype float64 in the source file, and the model 
 | LiDAR | ten chronological raw sweeps become B×1×320×384 raster | InputBuffer FIFO plus TFv6 source builder |
 | command/speed | CARLA command one-hot [LEFT, RIGHT, STRAIGHT, LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT] plus forward speed m/s | OptFeederNode |
 | route | previous/current/next ego-local points | OptFeederNode |
-| radar | B×300×5 | OptFeederNode |
 
 The LiDAR raster uses x=[-32,64] m, y=[-40,40] m, 4 pixels/m, occupancy clip=5. Ten sweeps are transformed through the pose history to the newest causal anchor. ROS y-left is converted to the checkpoint's CARLA y-right before rasterization.
 
-### 3.2 Empty-radar compatibility contract
+### 3.2 Official no-radar contract
 
-The selected config has four radar sensors and 75 radar rows per sensor. There is no official radar-free checkpoint mode. The current bag has no radar, so OptFeederNode invokes the source-equivalent padding path with four empty N×4 arrays.
+The selected official `noradar_resnet34/config.json` sets `use_radar_detection: false`. At public source pin `730bc1a2f44d5f28312dd55f0ca958e94a24c038`, `OpenLoopInference` loads all `model*.pth` members, so the official two-member ensemble is `model_0030_1.pth` and `model_0030_2.pth`. The no-radar path builds and reads no radar feature. OptFeederNode therefore leaves `DrivingFeature.tfv6_radar` empty with rows=cols=0 and records no synthetic-radar compatibility flag.
 
-~~~text
-per sensor: zeros(75, 4) + sensor-id column
-sensor 0 rows: [0, 0, 0, 0, 0]
-sensor 1 rows: [0, 0, 0, 0, 1]
-sensor 2 rows: [0, 0, 0, 0, 2]
-sensor 3 rows: [0, 0, 0, 0, 3]
-concatenate: (300, 5)
-~~~
-
-This is a syntactically correct source-preprocessed empty observation, not an accuracy-equivalent radar-free model. Every TFv6 metric row carries synthetic_radar_empty.
+This source SHA is the exact verified compatible public `cvpr2026` pin. The Hugging Face config contains no provenance SHA for a private training commit, so this document does not claim that identity. Runtime asset SHA-256 values are computed and recorded after download rather than invented in the profile.
 
 ### 3.3 Output
 
@@ -147,7 +137,7 @@ The model returns B×8×3 NAVSIM ego SE2 poses over 4.0 s at 0.5 s intervals. NA
 
 | Model | Current bag | Extra user data | Compatibility state |
 | --- | --- | --- | --- |
-| TFv6 | image/LiDAR/ego/TF available; radar absent | none | executable with recorded synthetic empty radar |
+| TFv6 | image/LiDAR/ego/TF available; official selected checkpoint requires no radar | none | executable after official config/two weights and 10-sweep warm-up |
 | InterFuser | required dynamic inputs available after preprocessing | none | executable after checkpoint download |
 | DiffusionDrive V2 | required dynamic inputs available after preprocessing | none | executable after official assets download |
 | SparseDrive V2 | images and ego available; calibration absent | inline profile calibration for all three cameras | blocked until calibration is complete |
@@ -161,4 +151,3 @@ After the model assets are downloaded and the implementation passes its smoke te
 - [InterFuser source](https://github.com/opendilab/InterFuser)
 - [DiffusionDrive V2 source](https://github.com/hustvl/DiffusionDriveV2)
 - [SparseDrive V2 source](https://github.com/swc-17/SparseDriveV2)
-

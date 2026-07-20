@@ -75,7 +75,7 @@ flowchart TD
     I["/image/BEV\n=================\nsensor_msgs/Image"]
 
     R((opt feeder))
-    DF["/driving_feature\n=========================\nvalidator_msgs/DrivingFeature\nstatus, optional TFv6 radar, optional calibration"]
+    DF["/driving_feature\n=========================\nvalidator_msgs/DrivingFeature\nstatus, unused optional radar fields, optional calibration"]
     TP["/route/target_point\n=========================\ngeometry_msgs/PointStamped"]
     
     D-->G
@@ -132,7 +132,7 @@ raw data를 가공하여 `inference engine`과 `visualizer`에 서빙하는 계�
 `opt feeder`, `inference engine`, `recoder`로 구성됨.
 4개 모델에 대한 추론 루프. 모델의 추론 결과 waypoints를 발행한다.
 `recoder`는 추론 시간과 매 10 Hz tick의 상태를 CSV로 기록한다. `inference_completed`, `not_ready`, `busy_tick_skipped`가 모두 기록되며, 평가마다 `records/openloop/`에 timestamp·model ID가 포함된 새 CSV가 생성된다.
-- `opt feeder`는 `/Ego_topic`과 로컬 `profile.json`을 읽어 velocity/acceleration, profile-specific driving feature, fallback command를 `/driving_feature`로 발행한다. TFv6는 source-padded empty radar를, SparseDrive V2는 profile 내부 calibration을 같은 message에 담는다. InterFuser처럼 target point가 필요한 profile에는 `/route/target_point`도 발행한다.
+- `opt feeder`는 `/Ego_topic`과 로컬 `profile.json`을 읽어 velocity/acceleration, profile-specific driving feature, fallback command를 `/driving_feature`로 발행한다. 선택된 TFv6 `noradar_resnet34` checkpoint는 radar를 읽지 않으므로 radar vector와 shape을 비워 발행하고, SparseDrive V2는 profile 내부 calibration을 같은 message에 담는다. TFv6/InterFuser처럼 target point가 필요한 profile에는 해당 `/route/target_point*`를 발행한다.
 - `inference engine`의 `InputBuffer`는 profile 입력을 저장하고 10 Hz causal snapshot을 selected model에 전달한다. 각 input은 `/driving_feature.header.stamp` 이하의 최신 sample만 사용하며, non-history input은 current/previous 두 개를, TFv6만 raw `/lidar3D` 10-sweep FIFO와 timestamp별 pose history를 유지한다.
 - `InferenceWorker`는 한 번에 하나의 model forward만 실행한다. worker가 busy인 tick은 대기시키지 않고 `busy_tick_skipped`로 기록하고, 완료 결과는 one-slot mailbox로 다음 tick에 publish한다.
 - 책임: opt feeder의 auxiliary input 생성, 추론 루프 구동 및 waypoints 발행, 추론 시간과 입력 age를 포함한 평가 기록.

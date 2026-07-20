@@ -91,7 +91,7 @@
       "source_topic": "/Ego_topic",
       "driving_feature_topic": "/driving_feature",
       "driving_feature_ros_type": "validator_msgs/DrivingFeature",
-      "driving_feature_contract": "Header stamp is copied from EgoVehicleStatus. status_feature contains the selected profile's exact ordered status vector. tfv6_radar is populated only for TFv6 with source-padded empty radar observations. camera_calibrations contains the selected profile's validated inline calibration only for SparseDrive V2.",
+      "driving_feature_contract": "Header stamp is copied from EgoVehicleStatus. status_feature contains the selected profile's exact ordered status vector. The selected official TFv6 no-radar checkpoint leaves optional tfv6_radar empty with rows=cols=0. camera_calibrations contains the selected profile's validated inline calibration only for SparseDrive V2.",
       "route_target_topics": {
         "current": "/route/target_point",
         "previous": "/route/target_point_previous",
@@ -116,18 +116,20 @@
     {
       "id": "tfv6",
       "model_entrypoint": "TFv6Model",
-      "reference_variant": "ln2697/tfv6 tfv6_resnet34, CARLA 3-camera checkpoint ensemble",
+      "reference_variant": "ln2697/tfv6 noradar_resnet34",
       "source": {
         "repository": "https://github.com/autonomousvision/lead",
-        "commit": "5f7199bfe89c220f105a8c52fb9df1168eee202",
+        "commit": "730bc1a2f44d5f28312dd55f0ca958e94a24c038",
+        "compatible_public_branch": "cvpr2026",
+        "provenance_note": "Exact verified public source pin compatible with the CVPR checkpoint release; the Hugging Face config does not identify a private training commit.",
         "checkpoint_repository": "https://huggingface.co/ln2697/tfv6",
         "checkpoint_revision": "main"
       },
+      "asset_checksum_policy": "compute_and_record_after_download",
       "runtime_assets": [
-        {"role": "checkpoint_config", "path": "models/tfv6/tfv6_resnet34/config.json", "source_path": "tfv6_resnet34/config.json"},
-        {"role": "ensemble_weight", "path": "models/tfv6/tfv6_resnet34/model_0030_0.pth", "source_path": "tfv6_resnet34/model_0030_0.pth", "sha256": "7ce71a2e70a9e75c0bf60d842ee2e7976ffff94f4a96e3763de0fe550ec780ce"},
-        {"role": "ensemble_weight", "path": "models/tfv6/tfv6_resnet34/model_0030_1.pth", "source_path": "tfv6_resnet34/model_0030_1.pth", "sha256": "fe3c9fe315fedfd5a9fc0d859e405028c28ff8f60b7edcd86613cd0a7c8d3cd6"},
-        {"role": "ensemble_weight", "path": "models/tfv6/tfv6_resnet34/model_0030_2.pth", "source_path": "tfv6_resnet34/model_0030_2.pth", "sha256": "197947ff0f20e58d52e38aae87617296335d3482af8b59a27efb37a3422678bc"}
+        {"role": "checkpoint_config", "path": "models/tfv6/noradar_resnet34/config.json", "source_path": "noradar_resnet34/config.json", "sha256": null},
+        {"role": "ensemble_weight", "path": "models/tfv6/noradar_resnet34/model_0030_1.pth", "source_path": "noradar_resnet34/model_0030_1.pth", "sha256": null},
+        {"role": "ensemble_weight", "path": "models/tfv6/noradar_resnet34/model_0030_2.pth", "source_path": "noradar_resnet34/model_0030_2.pth", "sha256": null}
       ],
       "buffer_requirements": {
         "latest_inputs": ["camera_main", "driving_feature", "route_target_point", "route_target_point_previous", "route_target_point_next"],
@@ -138,15 +140,15 @@
       "required_inputs": [
         {"key": "camera_main", "topic": "/image/tfv6/panorama", "ros_type": "sensor_msgs/Image", "preprocess_contract": "RGB uint8 CHW-equivalent panorama, left-front-right order, 384x1152. The selected checkpoint's original CARLA rig is three 384x384 views; current bag views are deterministically resized into those slots."},
         {"key": "lidar_raw", "topic": "/lidar3D", "ros_type": "sensor_msgs/PointCloud2", "preprocess_contract": "10 chronological raw sweeps; transform each Lidar3D-4 sweep through base_link into the newest sweep anchor using map-to-base_link pose history; convert ROS x-forward/y-left to the checkpoint's CARLA x-forward/y-right; rasterize the merged points as 1x320x384 using x=[-32,64], y=[-40,40], 4 px/m, clip=5."},
-        {"key": "driving_feature", "topic": "/driving_feature", "ros_type": "validator_msgs/DrivingFeature", "preprocess_contract": "status fields are CARLA 6-way command [LEFT, RIGHT, STRAIGHT, LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT] and forward speed in m/s. LANEFOLLOW fallback is [0,0,0,1,0,0]. tfv6_radar is the exact source-padded empty observation described by radar_compatibility."},
+        {"key": "driving_feature", "topic": "/driving_feature", "ros_type": "validator_msgs/DrivingFeature", "preprocess_contract": "status fields are CARLA 6-way command [LEFT, RIGHT, STRAIGHT, LANEFOLLOW, CHANGELANELEFT, CHANGELANERIGHT] and forward speed in m/s. LANEFOLLOW fallback is [0,0,0,1,0,0]. The official noradar_resnet34 config does not build or read a radar feature; optional radar fields remain empty with rows=cols=0."},
         {"key": "route_target_point", "topic": "/route/target_point", "ros_type": "geometry_msgs/PointStamped", "preprocess_contract": "current route point transformed from Lidar3D-4 to checkpoint CARLA ego coordinates and normalized by [200,50] inside the original planning decoder."},
         {"key": "route_target_point_previous", "topic": "/route/target_point_previous", "ros_type": "geometry_msgs/PointStamped", "preprocess_contract": "previous route point; selected checkpoint has use_previous_tp=true."},
         {"key": "route_target_point_next", "topic": "/route/target_point_next", "ros_type": "geometry_msgs/PointStamped", "preprocess_contract": "next route point; selected checkpoint has use_next_tp=true."}
       ],
-      "radar_compatibility": {"enabled": true, "owner": "OptFeederNode", "source_equivalent_operation": "Pass four empty raw radar arrays with shape (0,4) to the original per-sensor filter_and_pad_radars routine. It produces four (75,4) zero blocks and appends sensor_id 0,1,2,3 as column 5.", "per_sensor_tensor_shape": [75, 5], "tensor_shape_after_concatenation": [300, 5], "compatibility_flag": "synthetic_radar_empty", "benchmark_equivalence": "not an official radar-free checkpoint"},
+      "radar_input": {"enabled": false, "checkpoint_variant": "official_noradar_resnet34", "config_field": "use_radar_detection=false", "runtime_behavior": "The pinned OpenLoopInference source does not build or read radar features for this checkpoint."},
       "output": {"coordinate_frame": "CARLA ego-relative", "ros_frame_id": "Lidar3D-4", "coordinate_conversion": "x_ros=x_carla, y_ros=-y_carla before static base-to-lidar transform", "waypoint_count": 8, "interval_s": 0.25},
-      "readiness": {"state": "compatibility_ready_after_weights_and_history_warmup", "blocking_inputs": ["lidar_raw history and paired TF pose", "camera_main", "driving_feature", "route_target_point", "route_target_point_previous", "route_target_point_next"], "never_skip_for_stale": true},
-      "integration_gaps": ["The selected checkpoint has no official radar-free mode. This profile executes the source padding rule with empty radar observations and records synthetic_radar_empty for every result."]
+      "readiness": {"state": "ready_after_weights_and_history_warmup", "blocking_inputs": ["lidar_raw history and paired TF pose", "camera_main", "driving_feature", "route_target_point", "route_target_point_previous", "route_target_point_next"], "never_skip_for_stale": true},
+      "integration_gaps": []
     },
     {
       "id": "interfuser",

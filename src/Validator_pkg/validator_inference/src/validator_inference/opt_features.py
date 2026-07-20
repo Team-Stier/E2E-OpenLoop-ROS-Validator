@@ -61,17 +61,6 @@ def _require_model(model_id: str) -> None:
         raise FeatureContractError(f"unsupported model_id: {model_id}")
 
 
-def build_empty_tf_v6_radar() -> Tuple[float, ...]:
-    """Return the original TFv6 padding result for four empty radar sensors."""
-
-    return tuple(
-        value
-        for sensor_id in range(4)
-        for _ in range(75)
-        for value in (0.0, 0.0, 0.0, 0.0, float(sensor_id))
-    )
-
-
 def _numeric_tuple(
     camera_name: str,
     field_name: str,
@@ -213,7 +202,6 @@ def build_driving_feature_data(
             float(ay),
         )
 
-    radar = build_empty_tf_v6_radar() if model_id == "tfv6" else ()
     calibrations = (
         _sparse_calibrations(profile_data)
         if model_id == "sparsedrive_v2"
@@ -222,9 +210,9 @@ def build_driving_feature_data(
     return DrivingFeatureData(
         model_id=model_id,
         status_feature=status,
-        tfv6_radar=radar,
-        tfv6_radar_rows=300 if radar else 0,
-        tfv6_radar_cols=5 if radar else 0,
+        tfv6_radar=(),
+        tfv6_radar_rows=0,
+        tfv6_radar_cols=0,
         camera_calibrations=calibrations,
     )
 

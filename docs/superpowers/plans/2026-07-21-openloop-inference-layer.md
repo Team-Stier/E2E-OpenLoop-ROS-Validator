@@ -20,7 +20,7 @@
 - Publish every outcome to `/inference_metric` as `validator_msgs/InferenceMetric`; `elapsed_ms` is measured milliseconds only for `inference_completed` and is `-1.0` for `not_ready` or `busy_tick_skipped`.
 - `RecorderNode` creates `<project-root>/records/openloop/inference_{YYYYMMDDTHHMMSS+0900}_{model_id}.csv` immediately at node startup and writes exactly one row per metric message.
 - Use `Lidar3D-4` for every `nav_msgs/Path` and temporary target-point header. Convert model output through `T_base_from_lidar` exactly as declared in the profile.
-- TFv6 synthetic radar is source padding of four empty raw radar arrays to `(300, 5)`, not an official radar-free checkpoint. Every TFv6 metric includes `synthetic_radar_empty`.
+- `model_id=tfv6` uses official `noradar_resnet34` config with the two `model_0030_1/2.pth` ensemble members and verified compatible public `cvpr2026` pin `730bc1a2f44d5f28312dd55f0ca958e94a24c038`; no radar feature or compatibility flag is built.
 - DiffusionDrive V2 returns its source selector result `traj_to_score[:, -1]`; it imports neither PDM, metric-cache, evaluator, nor `reward_dict`.
 - SparseDrive V2 starts only after its three inline calibration records are complete. The only user-provided runtime values after installation are those profile calibration numbers.
 
@@ -34,7 +34,7 @@
 | `src/Validator_pkg/validator_inference/package.xml`, `CMakeLists.txt`, `setup.py` | Define catkin package `validator_inference` and install Python nodes. |
 | `src/Validator_pkg/validator_inference/src/validator_inference/profile_store.py` | Load, validate, hash, and select the one local profile. |
 | `src/Validator_pkg/validator_inference/src/validator_inference/input_buffer.py` | Own subscriber callbacks, bounded histories, causal snapshotting, and TF interpolation. |
-| `src/Validator_pkg/validator_inference/src/validator_inference/opt_features.py` | Convert `EgoVehicleStatus` into command/kinematic/radar/calibration feature values. |
+| `src/Validator_pkg/validator_inference/src/validator_inference/opt_features.py` | Convert `EgoVehicleStatus` into command/kinematic/calibration feature values. |
 | `src/Validator_pkg/validator_inference/src/validator_inference/worker.py` | One-forward, no-queue worker and one-slot completion mailbox. |
 | `src/Validator_pkg/validator_inference/src/validator_inference/models/*.py` | Four concrete checkpoint loaders and source-native forward paths. |
 | `src/Validator_pkg/validator_inference/src/validator_inference/path_builder.py` | Convert selected-model trajectory to `Lidar3D-4` `nav_msgs/Path`. |
@@ -383,10 +383,11 @@ git commit -m "feat: add causal inference input buffer"
 - [ ] **Step 1: Write failing feature-vector tests**
 
 ```python
-def test_tf_v6_feature_uses_lane_follow_and_source_empty_radar(ego):
+def test_tf_v6_feature_uses_lane_follow_without_radar(ego):
     feature = build_driving_feature("tfv6", ego, profile("tfv6"))
     assert feature.status_feature == [0, 0, 0, 1, 0, 0, 12.5]
-    assert numpy.asarray(feature.tfv6_radar).reshape(300, 5)[225, 4] == 3
+    assert feature.tfv6_radar == []
+    assert feature.tfv6_radar_rows == feature.tfv6_radar_cols == 0
 
 
 def test_navsim_feature_is_command_velocity_acceleration(ego):
@@ -408,11 +409,6 @@ Expected: import failure for `validator_inference.opt_features`.
 - [ ] **Step 3: Implement deterministic feature creation and node publication**
 
 ```python
-def build_empty_tf_v6_radar() -> list[float]:
-    return [value for sensor_id in range(4) for _ in range(75)
-            for value in (0.0, 0.0, 0.0, 0.0, float(sensor_id))]
-
-
 def build_navsim_status(ego: EgoVehicleStatus) -> list[float]:
     return [0.0, 1.0, 0.0, 0.0,
             ego.velocity.x, ego.velocity.y,
@@ -504,7 +500,7 @@ def build_selected_model(profile: SelectedProfile) -> object:
     }[profile.model_id](profile)
 ```
 
-`fetch_model_assets.py --model-id <id>` clones each profile repository to `models/sources/<id>` at its exact profile commit, downloads every profile asset into its declared `path`, checks every non-null SHA-256, and writes `models/<id>/asset-manifest.json` containing role/path/hash/source/commit. For DiffusionDrive it copies the official `kmeans_navsim_traj_20.npy` source file into `models/diffusiondrive_v2/navsim_v2/`; it never downloads PDM metric-cache. For TFv6 it checks out `lead` and downloads all three ensemble weights. The script exits nonzero on one missing asset or hash mismatch.
+`fetch_model_assets.py --model-id <id>` clones each profile repository to `models/sources/<id>` at its exact profile commit, downloads every profile asset into its declared `path`, checks every non-null SHA-256, computes and records declared post-download hashes, and writes `models/<id>/asset-manifest.json` containing role/path/hash/source/commit. For DiffusionDrive it copies the official `kmeans_navsim_traj_20.npy` source file into `models/diffusiondrive_v2/navsim_v2/`; it never downloads PDM metric-cache. For TFv6 it checks out the verified compatible public `cvpr2026` pin and downloads `noradar_resnet34` config plus the two ensemble weights. The script exits nonzero on one missing asset or hash mismatch.
 
 - [ ] **Step 4: Implement each source-native forward boundary**
 
@@ -520,7 +516,7 @@ class DiffusionDriveV2InferenceModel:
         return ModelPrediction(trajectory=trajectory[:, -1])
 ```
 
-`TFv6Model.forward` uses the checked-out LEAD source temporal LiDAR builder with `frame.inputs["lidar_raw_history"]`, source-padded `(300,5)` radar, the panorama image, speed/command, and three route points in that source's input order. `InterFuserModel.forward` directly calls its checked-out agent model with the four published camera tensors, BEV, command/speed, and current target point. `SparseDriveV2Model.forward` directly constructs the source data dictionary with three image tensors, NAVSIM status, and `lidar2img` calculated from the inline calibration messages; it applies no calibration/image concatenation. `DiffusionDriveV2InferenceModel` is the explicitly named source derivative that removes PDM imports, process pool construction, metric cache, evaluator invocation, and `reward_dict`, retaining the checkpoint's diffusion/coarse/top-32/three-stage fine selector. All imports are made only after `verify_runtime_assets` reports success.
+`TFv6Model.forward` uses the checked-out LEAD source temporal LiDAR builder with `frame.inputs["lidar_raw_history"]`, the panorama image, speed/command, and three route points in that source's input order. The selected official `noradar_resnet34` config does not build or read radar features. `InterFuserModel.forward` directly calls its checked-out agent model with the four published camera tensors, BEV, command/speed, and current target point. `SparseDriveV2Model.forward` directly constructs the source data dictionary with three image tensors, NAVSIM status, and `lidar2img` calculated from the inline calibration messages; it applies no calibration/image concatenation. `DiffusionDriveV2InferenceModel` is the explicitly named source derivative that removes PDM imports, process pool construction, metric cache, evaluator invocation, and `reward_dict`, retaining the checkpoint's diffusion/coarse/top-32/three-stage fine selector. All imports are made only after `verify_runtime_assets` reports success.
 
 - [ ] **Step 5: Run model selection and asset failure coverage**
 
@@ -830,8 +826,8 @@ git commit -m "feat: add reproducible open-loop inference launch"
 
 - Local selected profile, no remote fetch: Task 2.
 - `InputBuffer` subscriptions, causal inputs, ages, 10-sweep TFv6 history, and no stale skip: Task 3 and Task 7.
-- `/Ego_topic` feature publication, fallback command/route, TFv6 empty radar, and inline Sparse calibration: Task 4.
-- Four source-native models, exact assets, TFv6 radar behavior, DDV2 PDM-free selector, and anchor colocation: Task 5.
+- `/Ego_topic` feature publication, fallback command/route, TFv6 empty optional radar fields, and inline Sparse calibration: Task 4.
+- Four source-native models, exact assets, TFv6 official no-radar behavior, DDV2 PDM-free selector, and anchor colocation: Task 5.
 - One worker/no queue, busy metric, deterministic DDV2 seed, model-coordinate export: Task 6.
 - 10 Hz engine and topic semantics: Task 7.
 - Startup timestamped per-run CSV and one-row-per-metric rule: Task 8.
