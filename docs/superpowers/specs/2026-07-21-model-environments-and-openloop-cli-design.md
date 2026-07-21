@@ -203,7 +203,8 @@ A tracked `model_environments.json` is the source of truth for:
 - required imports and model-specific setup actions;
 - runtime asset and calibration preflight policy.
 
-The target is Ubuntu 20.04-compatible Linux x86_64. Lock files are produced by
+The target is Ubuntu 20.04-compatible Linux x86_64, represented to `uv` as
+`x86_64-manylinux_2_31` so resolved wheels cannot require a newer glibc. Lock files are produced by
 the pinned `uv` with hashes enabled and synchronized with hash verification and
 no dependency re-resolution. The manifest records the compile and sync
 arguments so lock regeneration is reviewable. PyTorch indexes are fixed to

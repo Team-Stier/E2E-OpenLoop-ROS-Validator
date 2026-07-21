@@ -15,7 +15,7 @@
 - Create `openloop`: clean-checkout Bash bootstrap that always invokes the source CLI with `/usr/bin/python3`.
 - Create `src/Validator_pkg/validator_inference/config/model_environments.json`: exact environment, CUDA, setup-action, and lock metadata for the four supported models.
 - Create `src/Validator_pkg/validator_inference/requirements/*.in`: human-maintained direct runtime inputs.
-- Create `src/Validator_pkg/validator_inference/requirements/*.lock`: `uv 0.11.14` generated, hash-checked Linux x86_64 resolutions.
+- Create `src/Validator_pkg/validator_inference/requirements/*.lock`: `uv 0.11.14` generated, hash-checked `x86_64-manylinux_2_31` resolutions.
 - Create `src/Validator_pkg/validator_inference/src/validator_inference/quaternion_math.py`: NumPy-only quaternion slerp.
 - Create `src/Validator_pkg/validator_inference/src/validator_inference/model_environment.py`: manifest schema, paths, state, fingerprints, preflight, and sanitized process environment.
 - Create `src/Validator_pkg/validator_inference/src/validator_inference/environment_setup.py`: candidate lifecycle, `uv` execution, ROS overlay, host checks, verification, and pruning.
@@ -135,7 +135,7 @@ def test_manifest_defines_exact_supported_models(manifest):
         assert torchvision in requirement_text
 ```
 
-Also test unknown model rejection, unknown keys, invalid SHA values, invalid CUDA policy, absolute/escaping paths, exact `uv_version == "0.11.14"`, Linux x86_64 platform, ordered official PyTorch/PyPI indexes, and lock/input existence.
+Also test unknown model rejection, unknown keys, invalid SHA values, invalid CUDA policy, absolute/escaping paths, exact `uv_version == "0.11.14"`, platform `x86_64-manylinux_2_31`, ordered official PyTorch/PyPI indexes, and lock/input existence.
 
 - [ ] **Step 2: Verify red state**
 
@@ -155,7 +155,7 @@ Construct argv arrays, never shell strings. Venv creation is `uv venv --no-proje
 
 - [ ] **Step 4: Add all four inputs and generated locks**
 
-Every `.in` includes exact torch/torchvision pins and target-Python builds of `PyYAML`, `rospkg`, `catkin_pkg`, `netifaces`, and `python-dateutil`. TFv6 also pins torchaudio 2.5.0+cu124, NumPy 1.26, timm 1.0.19, transformers 4.46.3, and torchmetrics 0.11; DiffusionDrive pins protobuf 4.25.3, diffusers, and einops; SparseDrive pins protobuf 3.20.* and its upstream direct dependencies. DiffusionDrive and SparseDrive replace the unhashable upstream Git reference with `nuplan-devkit @ https://github.com/motional/nuplan-devkit/archive/ce3c323af01c0d7ec5672f7832ef53f9c679aab0.tar.gz`; `uv pip compile --generate-hashes` must record archive SHA256 `5ab521c1af439902fd8e3df2619da75a03ade5814b35cd37c4c920fd45455e62`. Generate each lock with the manifest-recorded `uv 0.11.14`, Python patch, `--python-platform x86_64-unknown-linux-gnu`, official CUDA wheel index, PyPI secondary index, `--generate-hashes`, and fixed `--exclude-newer` timestamp. Check the generated lock contains hashes for every installable line.
+Every `.in` includes exact torch/torchvision pins and target-Python builds of `PyYAML`, `rospkg`, `catkin_pkg`, `netifaces`, and `python-dateutil`. TFv6 also pins torchaudio 2.5.0+cu124, NumPy 1.26, timm 1.0.19, transformers 4.46.3, and torchmetrics 0.11; DiffusionDrive pins protobuf 4.25.3, diffusers, and einops; SparseDrive pins protobuf 3.20.* and its upstream direct dependencies. DiffusionDrive and SparseDrive replace the unhashable upstream Git reference with `nuplan-devkit @ https://github.com/motional/nuplan-devkit/archive/ce3c323af01c0d7ec5672f7832ef53f9c679aab0.tar.gz`; `uv pip compile --generate-hashes` must record archive SHA256 `5ab521c1af439902fd8e3df2619da75a03ade5814b35cd37c4c920fd45455e62`. Generate each lock with the manifest-recorded `uv 0.11.14`, Python patch, `--python-platform x86_64-manylinux_2_31`, official CUDA wheel index, PyPI secondary index, `--generate-hashes`, and fixed `--exclude-newer` timestamp. Check the generated lock contains hashes for every installable line.
 
 - [ ] **Step 5: Pass manifest and lock tests**
 
