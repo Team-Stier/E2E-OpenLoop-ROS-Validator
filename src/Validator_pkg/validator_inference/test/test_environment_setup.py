@@ -6,10 +6,12 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import typing
 from typing import Any, Callable
 
 import pytest
@@ -17,12 +19,15 @@ import pytest
 from validator_inference import environment_setup
 from validator_inference.environment_setup import (
     PURE_ROS_PACKAGES,
+    EnvironmentPreflight,
+    EnvironmentPreflightDependencies,
     EnvironmentSetupError,
     RosOverlayFile,
     RosOverlayManifest,
     activate_candidate,
     build_ros_overlay,
     create_candidate,
+    preflight_environment,
     prune_inactive_builds,
     verify_ros_overlay,
 )
@@ -1413,3 +1418,630 @@ def test_prune_inactive_builds_returns_empty_for_absent_builds(tmp_path: Path):
     paths = environment_paths(tmp_path, "interfuser")
     assert prune_inactive_builds(paths) == ()
     assert not paths.model_root.exists()
+
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+_PREFLIGHT_WARNING = (
+    "CUDA GPU is not available; continuing because {model_id} declares "
+    "cuda_policy=recommended"
+)
+
+
+class _RecordingPreflightRunner:
+    """호스트 probe의 argv와 subprocess keyword를 기록하는 fake runner다."""
+
+    def __init__(
+        self,
+        *,
+        uv_output: str = "uv 0.11.14 (x86_64-unknown-linux-gnu)\n",
+        nvcc_output: str = "Cuda compilation tools, release 11.8, V11.8.89\n",
+        gcc_output: str = "9.4.0\n",
+        gxx_output: str = "9.4.0\n",
+    ) -> None:
+        self.uv_output = uv_output
+        self.nvcc_output = nvcc_output
+        self.gcc_output = gcc_output
+        self.gxx_output = gxx_output
+        self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+        self.failure: BaseException | None = None
+
+    def __call__(self, argv: list[str] | tuple[str, ...], **kwargs: Any):
+        assert isinstance(argv, (list, tuple))
+        command = tuple(argv)
+        self.calls.append((command, dict(kwargs)))
+        if self.failure is not None:
+            raise self.failure
+        executable = Path(command[0]).name
+        if executable == "uv" and command[1:] == ("--version",):
+            stdout = self.uv_output
+        elif executable == "nvcc" and command[1:] == ("--version",):
+            stdout = self.nvcc_output
+        elif executable == "gcc" and command[1:] == (
+            "-dumpfullversion",
+            "-dumpversion",
+        ):
+            stdout = self.gcc_output
+        elif executable == "g++" and command[1:] == (
+            "-dumpfullversion",
+            "-dumpversion",
+        ):
+            stdout = self.gxx_output
+        else:
+            raise AssertionError(f"unexpected preflight command: {command!r}")
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+
+def _write_executable(path: Path) -> Path:
+    """fake command를 기존 executable regular file로 만든다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _complete_sparse_calibration(profile_path: Path) -> None:
+    """SparseDrive 테스트 profile의 세 카메라 calibration을 완성한다."""
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    sparse = next(item for item in payload["profiles"] if item["id"] == "sparsedrive_v2")
+    cameras = sparse["static_runtime_inputs"]["camera_calibration"]["cameras"]
+    identity = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    for camera in cameras:
+        camera["K_original_3x3"] = [
+            800.0,
+            0.0,
+            320.0,
+            0.0,
+            800.0,
+            240.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+        camera["distortion_model"] = "plumb_bob"
+        camera["distortion_coefficients"] = [0.0] * 5
+        camera["T_lidar_from_camera_4x4"] = identity
+    profile_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _preflight_project(tmp_path: Path, *, complete_sparse: bool = True) -> Path:
+    """권위 manifest, lock, input과 profile을 가진 최소 project tree를 만든다."""
+    root = tmp_path / "project"
+    package_root = root / "src" / "Validator_pkg" / "validator_inference"
+    package_config = package_root / "config"
+    package_config.mkdir(parents=True)
+    shutil.copy2(
+        _REPOSITORY_ROOT
+        / "src"
+        / "Validator_pkg"
+        / "validator_inference"
+        / "config"
+        / "model_environments.json",
+        package_config / "model_environments.json",
+    )
+    shutil.copytree(
+        _REPOSITORY_ROOT
+        / "src"
+        / "Validator_pkg"
+        / "validator_inference"
+        / "requirements",
+        package_root / "requirements",
+    )
+    profile_root = root / "src" / "Validator_pkg" / "config"
+    profile_root.mkdir()
+    profile_path = profile_root / "profile.json"
+    shutil.copy2(
+        _REPOSITORY_ROOT / "src" / "Validator_pkg" / "config" / "profile.json",
+        profile_path,
+    )
+    if complete_sparse:
+        _complete_sparse_calibration(profile_path)
+    return root
+
+
+def _preflight_host(
+    tmp_path: Path,
+    *,
+    gpu_available: bool = True,
+) -> tuple[EnvironmentPreflightDependencies, _RecordingPreflightRunner, dict[str, str]]:
+    """실제 host와 독립적인 Ubuntu/ROS/CUDA probe bundle을 만든다."""
+    host = tmp_path / "host"
+    ros_root = host / "opt" / "ros" / "noetic"
+    ros_python_root = ros_root / "lib" / "python3" / "dist-packages"
+    ros_python_root.mkdir(parents=True)
+    (ros_root / "setup.bash").write_text("# fake noetic setup\n", encoding="utf-8")
+    for package in EXPECTED_ROS_PACKAGES:
+        (ros_python_root / package).mkdir()
+
+    command_root = host / "commands"
+    commands = {
+        "uv": str(_write_executable(command_root / "uv")),
+        "catkin_make": str(_write_executable(command_root / "catkin_make")),
+        "roscore": str(_write_executable(command_root / "roscore")),
+    }
+    cuda_root = host / "usr" / "local" / "cuda-11.8"
+    nvcc = _write_executable(cuda_root / "bin" / "nvcc")
+    gcc = _write_executable(host / "usr" / "bin" / "gcc")
+    gxx = _write_executable(host / "usr" / "bin" / "g++")
+    environment = {
+        "ROS_DISTRO": "noetic",
+        "CUDA_HOME": str(cuda_root),
+    }
+    dependencies = EnvironmentPreflightDependencies(
+        platform_system=lambda: "Linux",
+        platform_machine=lambda: "x86_64",
+        read_os_release=lambda: {"ID": "ubuntu", "VERSION_ID": "20.04"},
+        getenv=environment.get,
+        which=commands.get,
+        gpu_available=lambda: gpu_available,
+        ros_root=ros_root,
+        ros_python_root=ros_python_root,
+        cuda_root=cuda_root,
+        nvcc_path=nvcc,
+        gcc_path=gcc,
+        gxx_path=gxx,
+    )
+    return dependencies, _RecordingPreflightRunner(), environment
+
+
+def _assert_probe_call_contract(runner: _RecordingPreflightRunner) -> None:
+    """모든 host command가 shell 없는 bounded read probe인지 고정한다."""
+    assert runner.calls
+    for argv, kwargs in runner.calls:
+        assert isinstance(argv, tuple)
+        assert kwargs == {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "timeout": 10.0,
+        }
+
+
+def test_preflight_public_result_is_frozen_and_read_only(tmp_path: Path):
+    """preflight가 exact 공개 결과를 반환하고 project를 변경하지 않는다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path, gpu_available=False)
+
+    result = preflight_environment(
+        root, "interfuser", runner=runner, dependencies=dependencies
+    )
+
+    assert tuple(field.name for field in dataclasses.fields(EnvironmentPreflight)) == (
+        "root",
+        "package_root",
+        "manifest",
+        "definition",
+        "selected_profile",
+        "paths",
+        "uv_path",
+        "warnings",
+    )
+    assert result.root == root
+    assert result.package_root == root / "src" / "Validator_pkg" / "validator_inference"
+    assert result.manifest.manifest_path == result.package_root / "config" / "model_environments.json"
+    assert result.definition.model_id == "interfuser"
+    assert result.selected_profile.model_id == "interfuser"
+    assert result.paths == environment_paths(root, "interfuser")
+    assert result.uv_path == Path(dependencies.which("uv"))
+    assert result.warnings == (_PREFLIGHT_WARNING.format(model_id="interfuser"),)
+    assert not (root / ".venvs").exists()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.warnings = ()  # type: ignore[misc]
+    _assert_probe_call_contract(runner)
+
+
+def test_preflight_public_type_hints_resolve_without_eager_profile_import():
+    """격리 runtime에서도 공개 result annotation을 runtime에 해석할 수 있다."""
+    hints = typing.get_type_hints(EnvironmentPreflight)
+
+    assert tuple(hints) == (
+        "root",
+        "package_root",
+        "manifest",
+        "definition",
+        "selected_profile",
+        "paths",
+        "uv_path",
+        "warnings",
+    )
+    assert all(value is not None for value in hints.values())
+
+
+def test_default_gpu_probe_requires_accessible_driver_and_device_nodes(
+    tmp_path: Path,
+):
+    """proc metadata만 남은 container를 usable CUDA GPU로 오인하지 않는다."""
+    driver_root = tmp_path / "proc" / "driver" / "nvidia" / "gpus"
+    (driver_root / "0000:01:00.0").mkdir(parents=True)
+    device_root = tmp_path / "dev"
+    device_root.mkdir()
+    control = device_root / "nvidiactl"
+    gpu = device_root / "nvidia0"
+    control.write_text("control\n", encoding="utf-8")
+
+    assert not environment_setup._default_gpu_available(driver_root, device_root)
+
+    gpu.write_text("gpu\n", encoding="utf-8")
+    assert environment_setup._default_gpu_available(driver_root, device_root)
+
+    gpu.chmod(0)
+    assert not environment_setup._default_gpu_available(driver_root, device_root)
+
+
+def test_preflight_rejects_command_not_executable_by_current_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """mode bit이 있어도 현재 process가 실행할 수 없는 command를 거부한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    uv_path = Path(dependencies.which("uv"))
+    real_access = os.access
+
+    def deny_uv(path: str | Path, mode: int) -> bool:
+        if Path(path) == uv_path and mode == os.X_OK:
+            return False
+        return real_access(path, mode)
+
+    monkeypatch.setattr(environment_setup.os, "access", deny_uv)
+
+    with pytest.raises(EnvironmentSetupError, match="executable regular file"):
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("model_id", "gpu_available", "expected_warnings", "expected_commands"),
+    (
+        ("interfuser", False, 1, ("uv",)),
+        ("tfv6", True, 0, ("uv",)),
+        ("diffusiondrive_v2", False, 1, ("uv",)),
+        ("sparsedrive_v2", True, 0, ("uv", "nvcc", "gcc", "g++")),
+    ),
+)
+def test_preflight_applies_each_model_cuda_policy(
+    tmp_path: Path,
+    model_id: str,
+    gpu_available: bool,
+    expected_warnings: int,
+    expected_commands: tuple[str, ...],
+):
+    """네 모델의 required/recommended/extension 정책을 그대로 집행한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(
+        tmp_path, gpu_available=gpu_available
+    )
+
+    result = preflight_environment(
+        root, model_id, runner=runner, dependencies=dependencies
+    )
+
+    assert len(result.warnings) == expected_warnings
+    assert tuple(Path(call[0][0]).name for call in runner.calls) == expected_commands
+    assert not (root / ".venvs").exists()
+
+
+@pytest.mark.parametrize("model_id", ("tfv6", "sparsedrive_v2"))
+def test_preflight_blocks_required_cuda_policies_before_cuda_tool_commands(
+    tmp_path: Path, model_id: str
+):
+    """required 계열은 GPU 부재를 nvcc/build/download 전에 차단한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path, gpu_available=False)
+
+    with pytest.raises(EnvironmentSetupError, match="CUDA GPU is required") as caught:
+        preflight_environment(root, model_id, runner=runner, dependencies=dependencies)
+
+    assert caught.value.action == "host_preflight"
+    assert tuple(Path(call[0][0]).name for call in runner.calls) == ("uv",)
+    assert not (root / ".venvs").exists()
+
+
+def test_preflight_rejects_unknown_model_without_running_commands(tmp_path: Path):
+    """unknown model ID는 loader와 host command보다 먼저 거부한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+
+    with pytest.raises(EnvironmentSetupError, match="unsupported model_id") as caught:
+        preflight_environment(root, "unknown", runner=runner, dependencies=dependencies)
+
+    assert caught.value.action == "host_preflight"
+    assert runner.calls == []
+
+
+def test_preflight_rejects_unknown_injected_cuda_policy(tmp_path: Path):
+    """검증 seam이 반환한 알 수 없는 CUDA 정책도 fail closed 한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    original_select = dependencies.select_definition
+
+    def select_unknown(manifest: Any, model_id: str):
+        return dataclasses.replace(
+            original_select(manifest, model_id), cuda_policy="future_policy"
+        )
+
+    dependencies = dataclasses.replace(
+        dependencies, select_definition=select_unknown
+    )
+    with pytest.raises(EnvironmentSetupError, match="unsupported cuda_policy"):
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    assert runner.calls == []
+
+
+def test_preflight_rejects_profile_manifest_source_mismatch_before_host_probe(
+    tmp_path: Path,
+):
+    """profile source pin과 environment pin 불일치는 host probe 전에 차단한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    original_load_profile = dependencies.load_profile
+
+    def load_mismatched(path: Path, model_id: str):
+        selected = original_load_profile(path, model_id)
+        selected.data["source"]["commit"] = "0" * 40
+        return selected
+
+    dependencies = dataclasses.replace(dependencies, load_profile=load_mismatched)
+    with pytest.raises(EnvironmentSetupError, match="source commit does not match"):
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("dependency_changes", "message"),
+    (
+        ({"platform_system": lambda: "Darwin"}, "Linux"),
+        ({"read_os_release": lambda: {"ID": "debian", "VERSION_ID": "12"}}, "Ubuntu 20.04"),
+        ({"read_os_release": lambda: {"ID": "ubuntu", "VERSION_ID": "22.04"}}, "Ubuntu 20.04"),
+        ({"platform_machine": lambda: "aarch64"}, "x86_64"),
+    ),
+)
+def test_preflight_rejects_unsupported_host_before_uv(
+    tmp_path: Path, dependency_changes: dict[str, Any], message: str
+):
+    """Linux Ubuntu 20.04 x86_64 외 host는 uv 실행 전에 거부한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    dependencies = dataclasses.replace(dependencies, **dependency_changes)
+
+    with pytest.raises(EnvironmentSetupError, match=message) as caught:
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    assert caught.value.action == "host_preflight"
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("uv_output", "message"),
+    (
+        ("uv 0.11.13\n", "uv 0.11.14"),
+        ("uv 0.11.14rc1\n", "uv 0.11.14"),
+        ("unexpected\n", "uv 0.11.14"),
+    ),
+)
+def test_preflight_requires_exact_uv_version(
+    tmp_path: Path, uv_output: str, message: str
+):
+    """uv version probe는 0.11.14 token만 허용한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    runner.uv_output = uv_output
+
+    with pytest.raises(EnvironmentSetupError, match=message):
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    _assert_probe_call_contract(runner)
+    assert len(runner.calls) == 1
+
+
+def test_preflight_requires_existing_uv_executable_without_running_runner(
+    tmp_path: Path,
+):
+    """lookup된 uv가 없거나 executable이 아니면 subprocess를 호출하지 않는다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    dependencies = dataclasses.replace(
+        dependencies, which=lambda command: None if command == "uv" else dependencies.which(command)
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="uv executable"):
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("break_host", "message"),
+    (
+        ("ros_distro", "ROS_DISTRO=noetic"),
+        ("setup", "setup.bash"),
+        ("package", "ROS Python package"),
+        ("catkin_make", "catkin_make"),
+        ("roscore", "roscore"),
+    ),
+)
+def test_preflight_requires_noetic_setup_tools_and_exact_package_dirs(
+    tmp_path: Path, break_host: str, message: str
+):
+    """Noetic environment, tools와 14개 package directory를 모두 검증한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, environment = _preflight_host(tmp_path)
+    if break_host == "ros_distro":
+        environment["ROS_DISTRO"] = "melodic"
+    elif break_host == "setup":
+        (dependencies.ros_root / "setup.bash").unlink()
+    elif break_host == "package":
+        (dependencies.ros_python_root / EXPECTED_ROS_PACKAGES[-1]).rmdir()
+    else:
+        old_which = dependencies.which
+        dependencies = dataclasses.replace(
+            dependencies,
+            which=lambda command, missing=break_host: (
+                None if command == missing else old_which(command)
+            ),
+        )
+
+    with pytest.raises(EnvironmentSetupError, match=message):
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    assert tuple(Path(call[0][0]).name for call in runner.calls) == ("uv",)
+
+
+def test_sparse_calibration_blocks_before_every_subprocess_probe(tmp_path: Path):
+    """불완전 Sparse calibration은 uv/nvcc/asset 작업 전 ProfileError를 정규화한다."""
+    root = _preflight_project(tmp_path, complete_sparse=False)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+
+    with pytest.raises(EnvironmentSetupError, match="camera front requires nonempty") as caught:
+        preflight_environment(
+            root, "sparsedrive_v2", runner=runner, dependencies=dependencies
+        )
+    assert caught.value.action == "host_preflight"
+    assert runner.calls == []
+    assert not (root / ".venvs").exists()
+
+
+@pytest.mark.parametrize(
+    ("blocker", "message", "expected_commands"),
+    (
+        ("cuda_home", "CUDA_HOME", ("uv",)),
+        ("cuda_root", "CUDA Toolkit", ("uv",)),
+        ("nvcc", "nvcc", ("uv",)),
+        ("nvcc_version", "release 11.8", ("uv", "nvcc")),
+        ("gcc", "/usr/bin/gcc", ("uv", "nvcc")),
+        ("compiler_version", "compatible", ("uv", "nvcc", "gcc", "g++")),
+    ),
+)
+def test_sparse_host_blockers_run_in_read_only_order(
+    tmp_path: Path,
+    blocker: str,
+    message: str,
+    expected_commands: tuple[str, ...],
+):
+    """Sparse Toolkit/nvcc/compiler blocker를 build나 asset 작업 전에 순서대로 찾는다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, environment = _preflight_host(tmp_path)
+    if blocker == "cuda_home":
+        environment["CUDA_HOME"] = "/wrong/cuda"
+    elif blocker == "cuda_root":
+        shutil.rmtree(dependencies.cuda_root)
+    elif blocker == "nvcc":
+        dependencies.nvcc_path.unlink()
+    elif blocker == "nvcc_version":
+        runner.nvcc_output = "Cuda compilation tools, release 12.1, V12.1.0\n"
+    elif blocker == "gcc":
+        dependencies.gcc_path.unlink()
+    else:
+        runner.gxx_output = "12.1.0\n"
+
+    with pytest.raises(EnvironmentSetupError, match=message):
+        preflight_environment(
+            root, "sparsedrive_v2", runner=runner, dependencies=dependencies
+        )
+    assert tuple(Path(call[0][0]).name for call in runner.calls) == expected_commands
+    assert not (root / ".venvs").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        OSError("exec denied"),
+        subprocess.CalledProcessError(1, ["uv", "--version"]),
+        subprocess.TimeoutExpired(["uv", "--version"], 10.0),
+    ),
+)
+def test_preflight_normalizes_subprocess_failures(
+    tmp_path: Path, failure: BaseException
+):
+    """runner의 OS/exit/timeout 오류를 deterministic host_preflight로 변환한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    runner.failure = failure
+
+    with pytest.raises(EnvironmentSetupError, match="uv version probe failed") as caught:
+        preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+    assert caught.value.action == "host_preflight"
+
+
+def test_preflight_never_invokes_mutating_setup_commands_or_creates_paths(
+    tmp_path: Path,
+):
+    """성공 preflight도 downloader, catkin, uv venv/sync, asset mutator를 호출하지 않는다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path, gpu_available=False)
+    before = {
+        path.relative_to(root): (path.stat().st_mode, path.stat().st_size, path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+    }
+
+    preflight_environment(root, "interfuser", runner=runner, dependencies=dependencies)
+
+    after = {
+        path.relative_to(root): (path.stat().st_mode, path.stat().st_size, path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+    }
+    assert before == after
+    assert [call[0][1:] for call in runner.calls] == [("--version",)]
+    assert not (root / ".venvs").exists()
+
+
+def test_real_host_interfuser_preflight_is_nonmutating_when_prerequisites_exist():
+    """실제 Ubuntu/Noetic/uv tree에서도 InterFuser 점검이 project를 바꾸지 않는다."""
+    dependencies = EnvironmentPreflightDependencies()
+    release = dependencies.read_os_release()
+    uv_path = shutil.which("uv")
+    ros_commands = {
+        "catkin_make": dependencies.ros_root / "bin" / "catkin_make",
+        "roscore": dependencies.ros_root / "bin" / "roscore",
+    }
+    required_paths = (
+        dependencies.ros_root / "setup.bash",
+        dependencies.ros_python_root,
+        *(dependencies.ros_python_root / package for package in EXPECTED_ROS_PACKAGES),
+        *ros_commands.values(),
+    )
+    if (
+        dependencies.platform_system() != "Linux"
+        or dependencies.platform_machine() != "x86_64"
+        or release.get("ID") != "ubuntu"
+        or release.get("VERSION_ID") != "20.04"
+        or uv_path is None
+        or any(not path.exists() for path in required_paths)
+    ):
+        pytest.skip("real Ubuntu 20.04, ROS Noetic, and uv prerequisites unavailable")
+
+    command_paths = {
+        "uv": uv_path,
+        **{name: str(path) for name, path in ros_commands.items()},
+    }
+    dependencies = dataclasses.replace(
+        dependencies,
+        getenv=lambda key: "noetic" if key == "ROS_DISTRO" else os.environ.get(key),
+        which=command_paths.get,
+        gpu_available=lambda: False,
+    )
+    environment_root = _REPOSITORY_ROOT / ".venvs"
+    before = environment_root.lstat() if environment_root.exists() else None
+
+    result = preflight_environment(
+        _REPOSITORY_ROOT,
+        "interfuser",
+        runner=subprocess.run,
+        dependencies=dependencies,
+    )
+
+    after = environment_root.lstat() if environment_root.exists() else None
+    assert result.definition.model_id == "interfuser"
+    assert result.warnings == (_PREFLIGHT_WARNING.format(model_id="interfuser"),)
+    assert before == after

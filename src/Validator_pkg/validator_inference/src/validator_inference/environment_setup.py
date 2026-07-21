@@ -1,7 +1,7 @@
 """
-모델 환경 candidate와 순수 Python ROS overlay의 원자적 lifecycle을 관리한다.
-입력: 검증된 environment paths, build ID, ROS Python source tree와 overlay 경로.
-출력(pub): 없음. candidate directory, overlay manifest와 활성화·정리 결과를 반환한다.
+모델 환경 host preflight와 candidate/순수 Python ROS overlay lifecycle을 관리한다.
+입력: project/model, 검증된 environment paths, build ID와 ROS Python source tree.
+출력(pub): 읽기 전용 host 점검 결과, candidate와 overlay lifecycle 결과를 반환한다.
 구독(sub): 없음.
 """
 
@@ -14,22 +14,45 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import shlex
 import shutil
 import stat
+import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass
-from typing import Any, Iterator, Mapping, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from validator_inference.model_environment import (
+    EXPECTED_UV_VERSION,
     ROS_OVERLAY_MANIFEST_FILENAME,
     SUPPORTED_MODEL_IDS,
+    EnvironmentConfigError,
+    EnvironmentManifest,
     EnvironmentPaths,
+    ModelEnvironmentDefinition,
+    environment_paths,
+    load_environment_manifest,
+    select_model_environment,
     sha256_file,
 )
+if TYPE_CHECKING:
+    from validator_inference.profile_store import SelectedProfile
+else:
+    SelectedProfile = Any
 
 
 PURE_ROS_PACKAGES = (
@@ -61,6 +84,61 @@ _MAX_MANIFEST_RECORDS = 4096
 _MAX_PATH_STRING_LENGTH = 4096
 _MAX_OVERLAY_FILE_BYTES = 64 * 1024 * 1024
 _READ_BLOCK_SIZE = 1024 * 1024
+_HOST_PREFLIGHT_ACTION = "host_preflight"
+_HOST_COMMAND_TIMEOUT_SECONDS = 10.0
+_SUPPORTED_CUDA_POLICIES = {"required", "recommended", "extension_required"}
+_UV_VERSION_OUTPUT = re.compile(r"uv ([^\s]+)(?:\s+.*)?\Z")
+_NVCC_11_8_OUTPUT = re.compile(r"\brelease 11\.8(?:,|\s|\Z)")
+_COMPILER_VERSION_OUTPUT = re.compile(
+    r"([0-9]+)(?:\.([0-9]+))?(?:\.([0-9]+))?\Z"
+)
+_SPARSE_COMPILER_MIN_MAJOR = 6
+_SPARSE_COMPILER_MAX_MAJOR = 11
+
+
+def _read_host_os_release() -> Mapping[str, str]:
+    """표준 os-release를 shell 실행 없이 key/value mapping으로 읽는다."""
+    values: dict[str, str] = {}
+    payload = Path("/etc/os-release").read_text(encoding="utf-8")
+    for line in payload.splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        parsed = shlex.split(raw_value, comments=False, posix=True)
+        if len(parsed) == 1:
+            values[key] = parsed[0]
+    return values
+
+
+def _default_gpu_available(
+    driver_gpu_root: Path = Path("/proc/driver/nvidia/gpus"),
+    device_root: Path = Path("/dev"),
+) -> bool:
+    """driver metadata와 접근 가능한 NVIDIA device node를 함께 확인한다."""
+    try:
+        if not driver_gpu_root.is_dir() or not any(driver_gpu_root.iterdir()):
+            return False
+        control = device_root / "nvidiactl"
+        if not control.exists() or not os.access(control, os.R_OK | os.W_OK):
+            return False
+        devices = (
+            entry
+            for entry in device_root.iterdir()
+            if re.fullmatch(r"nvidia[0-9]+", entry.name)
+        )
+        return any(
+            device.exists() and os.access(device, os.R_OK | os.W_OK)
+            for device in devices
+        )
+    except OSError:
+        return False
+
+
+def _load_profile_for_preflight(path: Path, model_id: str) -> "SelectedProfile":
+    """profile dependency를 preflight 호출 경계에서만 import해 runtime closure를 보존한다."""
+    from validator_inference.profile_store import load_selected_profile
+
+    return load_selected_profile(path, model_id)
 
 
 class EnvironmentSetupError(RuntimeError):
@@ -89,6 +167,59 @@ class RosOverlayManifest:
     packages: tuple[str, ...]
     files: tuple[RosOverlayFile, ...]
     manifest_path: Path
+
+
+@dataclass(frozen=True)
+class EnvironmentPreflightDependencies:
+    """host probe와 권위 loader를 테스트에서 대체할 수 있는 읽기 전용 bundle이다."""
+
+    platform_system: Callable[[], str] = field(
+        default_factory=lambda: platform.system
+    )
+    platform_machine: Callable[[], str] = field(
+        default_factory=lambda: platform.machine
+    )
+    read_os_release: Callable[[], Mapping[str, str]] = field(
+        default_factory=lambda: _read_host_os_release
+    )
+    getenv: Callable[[str], Optional[str]] = field(
+        default_factory=lambda: os.environ.get
+    )
+    which: Callable[[str], Optional[str]] = field(
+        default_factory=lambda: shutil.which
+    )
+    gpu_available: Callable[[], bool] = field(
+        default_factory=lambda: _default_gpu_available
+    )
+    load_manifest: Callable[[Path], EnvironmentManifest] = field(
+        default_factory=lambda: load_environment_manifest
+    )
+    select_definition: Callable[
+        [EnvironmentManifest, str], ModelEnvironmentDefinition
+    ] = field(default_factory=lambda: select_model_environment)
+    load_profile: Callable[[Path, str], SelectedProfile] = field(
+        default_factory=lambda: _load_profile_for_preflight
+    )
+    ros_root: Path = Path("/opt/ros/noetic")
+    ros_python_root: Path = Path("/opt/ros/noetic/lib/python3/dist-packages")
+    cuda_root: Path = Path("/usr/local/cuda-11.8")
+    nvcc_path: Path = Path("/usr/local/cuda-11.8/bin/nvcc")
+    gcc_path: Path = Path("/usr/bin/gcc")
+    gxx_path: Path = Path("/usr/bin/g++")
+
+
+@dataclass(frozen=True)
+class EnvironmentPreflight:
+    """검증된 model definition, host executable과 경고를 보관한다."""
+
+    root: Path
+    package_root: Path
+    manifest: EnvironmentManifest
+    definition: ModelEnvironmentDefinition
+    selected_profile: SelectedProfile
+    paths: EnvironmentPaths
+    uv_path: Path
+    warnings: Tuple[str, ...]
 
 
 def _raise(action: str, message: str) -> None:
@@ -341,6 +472,378 @@ def _ensure_real_directory(path: Path, action: str, context: str) -> None:
     except OSError as exc:
         raise EnvironmentSetupError(action, f"cannot create {context}: {path}") from exc
     _require_real_directory(path, action, context)
+
+
+def _require_preflight_regular_file(path: Path, context: str) -> None:
+    """preflight 입력이 symlink가 아닌 기존 regular file인지 확인한다."""
+    with _open_regular_file(path, _HOST_PREFLIGHT_ACTION, context):
+        pass
+
+
+def _require_executable_file(path: Any, context: str) -> Path:
+    """lookup한 command가 canonical absolute executable regular file인지 확인한다."""
+    candidate = _canonical_absolute_posix_path(
+        path, context, _HOST_PREFLIGHT_ACTION
+    )
+    try:
+        metadata = candidate.stat()
+    except FileNotFoundError as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, f"{context} executable is missing: {candidate}"
+        ) from exc
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, f"cannot inspect {context}: {candidate}"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(candidate, os.X_OK):
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"{context} must be an executable regular file: {candidate}",
+        )
+    return candidate
+
+
+def _lookup_preflight_executable(
+    dependencies: EnvironmentPreflightDependencies,
+    command: str,
+    context: str,
+) -> Path:
+    """PATH lookup 실패를 deterministic host_preflight 오류로 바꾼다."""
+    try:
+        value = dependencies.which(command)
+    except (OSError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, f"cannot locate {context} executable"
+        ) from exc
+    if value is None:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"{context} executable was not found on PATH",
+        )
+    return _require_executable_file(value, context)
+
+
+def _run_preflight_probe(
+    runner: Callable[..., Any], argv: Sequence[str], context: str
+) -> str:
+    """bounded read-only command를 shell 없이 실행하고 stdout을 반환한다."""
+    command = [str(part) for part in argv]
+    try:
+        result = runner(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_HOST_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, f"{context} failed"
+        ) from exc
+    if getattr(result, "returncode", 0) != 0:
+        _raise(_HOST_PREFLIGHT_ACTION, f"{context} failed")
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str):
+        _raise(_HOST_PREFLIGHT_ACTION, f"{context} returned invalid stdout")
+    return stdout.strip()
+
+
+def _validate_host_platform(
+    dependencies: EnvironmentPreflightDependencies,
+) -> None:
+    """지원 host를 Linux Ubuntu 20.04 x86_64로 제한한다."""
+    try:
+        system = dependencies.platform_system()
+    except (OSError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, "cannot determine host operating system"
+        ) from exc
+    if system != "Linux":
+        _raise(_HOST_PREFLIGHT_ACTION, "host must be Linux")
+    try:
+        release = dependencies.read_os_release()
+    except (OSError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, "cannot read host os-release"
+        ) from exc
+    if not isinstance(release, Mapping):
+        _raise(_HOST_PREFLIGHT_ACTION, "host os-release must be a mapping")
+    if release.get("ID") != "ubuntu" or release.get("VERSION_ID") != "20.04":
+        _raise(_HOST_PREFLIGHT_ACTION, "host must be Ubuntu 20.04")
+    try:
+        machine = dependencies.platform_machine()
+    except (OSError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, "cannot determine host machine architecture"
+        ) from exc
+    if machine != "x86_64":
+        _raise(_HOST_PREFLIGHT_ACTION, "host machine must be x86_64")
+
+
+def _validate_uv(
+    manifest: EnvironmentManifest,
+    dependencies: EnvironmentPreflightDependencies,
+    runner: Callable[..., Any],
+) -> Path:
+    """PATH의 uv executable과 exact manifest version을 검증한다."""
+    uv_path = _lookup_preflight_executable(dependencies, "uv", "uv")
+    output = _run_preflight_probe(runner, (str(uv_path), "--version"), "uv version probe")
+    match = _UV_VERSION_OUTPUT.fullmatch(output)
+    if (
+        manifest.uv_version != EXPECTED_UV_VERSION
+        or match is None
+        or match.group(1) != EXPECTED_UV_VERSION
+    ):
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"uv {EXPECTED_UV_VERSION} is required; got {output or '<empty>'}",
+        )
+    return uv_path
+
+
+def _validate_ros_noetic(
+    dependencies: EnvironmentPreflightDependencies,
+) -> None:
+    """sourced Noetic shell, setup, tools와 exact overlay package dirs를 확인한다."""
+    try:
+        ros_distro = dependencies.getenv("ROS_DISTRO")
+    except (OSError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, "cannot read ROS_DISTRO"
+        ) from exc
+    if ros_distro != "noetic":
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            "ROS_DISTRO=noetic is required; source /opt/ros/noetic/setup.bash",
+        )
+    ros_root = _canonical_absolute_posix_path(
+        dependencies.ros_root, "ROS Noetic root", _HOST_PREFLIGHT_ACTION
+    )
+    ros_python_root = _canonical_absolute_posix_path(
+        dependencies.ros_python_root,
+        "ROS Noetic Python root",
+        _HOST_PREFLIGHT_ACTION,
+    )
+    _require_real_directory(ros_root, _HOST_PREFLIGHT_ACTION, "ROS Noetic root")
+    _require_preflight_regular_file(
+        ros_root / "setup.bash", "ROS Noetic setup.bash"
+    )
+    _require_real_directory(
+        ros_python_root, _HOST_PREFLIGHT_ACTION, "ROS Noetic Python root"
+    )
+    for package in PURE_ROS_PACKAGES:
+        _require_real_directory(
+            ros_python_root / package,
+            _HOST_PREFLIGHT_ACTION,
+            f"ROS Python package {package}",
+        )
+    _lookup_preflight_executable(dependencies, "catkin_make", "catkin_make")
+    _lookup_preflight_executable(dependencies, "roscore", "roscore")
+
+
+def _probe_gpu(dependencies: EnvironmentPreflightDependencies) -> bool:
+    """injected GPU probe의 실패와 잘못된 결과를 fail closed 한다."""
+    try:
+        available = dependencies.gpu_available()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, "cannot determine CUDA GPU availability"
+        ) from exc
+    if type(available) is not bool:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            "CUDA GPU probe must return a boolean",
+        )
+    return available
+
+
+def _parse_compiler_version(output: str, context: str) -> tuple[int, int, int]:
+    """GCC machine-readable version을 비교 가능한 세 정수로 변환한다."""
+    match = _COMPILER_VERSION_OUTPUT.fullmatch(output)
+    if match is None:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"{context} returned an invalid compiler version: {output or '<empty>'}",
+        )
+    return tuple(int(component or 0) for component in match.groups())  # type: ignore[return-value]
+
+
+def _validate_sparse_host(
+    dependencies: EnvironmentPreflightDependencies,
+    runner: Callable[..., Any],
+) -> None:
+    """SparseDrive extension에 필요한 exact Toolkit, nvcc와 compiler를 검증한다."""
+    cuda_root = _canonical_absolute_posix_path(
+        dependencies.cuda_root, "CUDA Toolkit root", _HOST_PREFLIGHT_ACTION
+    )
+    try:
+        cuda_home = dependencies.getenv("CUDA_HOME")
+    except (OSError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, "cannot read CUDA_HOME"
+        ) from exc
+    if cuda_home != str(cuda_root):
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"CUDA_HOME must be exactly {cuda_root}",
+        )
+    _require_real_directory(
+        cuda_root, _HOST_PREFLIGHT_ACTION, "CUDA Toolkit 11.8"
+    )
+    nvcc_path = _canonical_absolute_posix_path(
+        dependencies.nvcc_path, "nvcc", _HOST_PREFLIGHT_ACTION
+    )
+    if nvcc_path != cuda_root / "bin" / "nvcc":
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"nvcc must be exactly {cuda_root / 'bin' / 'nvcc'}",
+        )
+    nvcc_path = _require_executable_file(nvcc_path, "nvcc")
+    nvcc_output = _run_preflight_probe(
+        runner, (str(nvcc_path), "--version"), "nvcc version probe"
+    )
+    if _NVCC_11_8_OUTPUT.search(nvcc_output) is None:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"nvcc release 11.8 is required; got {nvcc_output or '<empty>'}",
+        )
+
+    gcc_path = _require_executable_file(
+        dependencies.gcc_path, "SparseDrive /usr/bin/gcc compiler"
+    )
+    gxx_path = _require_executable_file(
+        dependencies.gxx_path, "SparseDrive /usr/bin/g++ compiler"
+    )
+    version_argv = ("-dumpfullversion", "-dumpversion")
+    gcc_output = _run_preflight_probe(
+        runner, (str(gcc_path), *version_argv), "gcc version probe"
+    )
+    gxx_output = _run_preflight_probe(
+        runner, (str(gxx_path), *version_argv), "g++ version probe"
+    )
+    gcc_version = _parse_compiler_version(gcc_output, "gcc")
+    gxx_version = _parse_compiler_version(gxx_output, "g++")
+    if (
+        gcc_version != gxx_version
+        or not _SPARSE_COMPILER_MIN_MAJOR
+        <= gcc_version[0]
+        <= _SPARSE_COMPILER_MAX_MAJOR
+    ):
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            "SparseDrive requires compatible matching GCC/G++ versions "
+            f"{_SPARSE_COMPILER_MIN_MAJOR} through {_SPARSE_COMPILER_MAX_MAJOR}; "
+            f"got gcc {gcc_output} and g++ {gxx_output}",
+        )
+
+
+def preflight_environment(
+    project_root: Path,
+    model_id: str,
+    runner: Callable[..., Any] = subprocess.run,
+    *,
+    dependencies: Optional[EnvironmentPreflightDependencies] = None,
+) -> EnvironmentPreflight:
+    """setup mutation 전에 project, host, ROS와 model prerequisite를 검증한다."""
+    selected_dependencies = dependencies or EnvironmentPreflightDependencies()
+    if not isinstance(selected_dependencies, EnvironmentPreflightDependencies):
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            "dependencies must be EnvironmentPreflightDependencies",
+        )
+    root = _canonical_absolute_posix_path(
+        project_root, "project root", _HOST_PREFLIGHT_ACTION
+    )
+    _require_real_directory(root, _HOST_PREFLIGHT_ACTION, "project root")
+    package_root = root / "src" / "Validator_pkg" / "validator_inference"
+    profile_path = root / "src" / "Validator_pkg" / "config" / "profile.json"
+    manifest_path = package_root / "config" / "model_environments.json"
+    _require_real_directory(
+        package_root, _HOST_PREFLIGHT_ACTION, "validator_inference package root"
+    )
+    _require_preflight_regular_file(manifest_path, "environment manifest")
+    _require_preflight_regular_file(profile_path, "model profile")
+    if model_id not in SUPPORTED_MODEL_IDS:
+        _raise(_HOST_PREFLIGHT_ACTION, f"unsupported model_id: {model_id}")
+
+    try:
+        from validator_inference.profile_store import (
+            ProfileError as ProfileLoadError,
+            SelectedProfile as SelectedProfileType,
+        )
+    except ImportError as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, "cannot import model profile loader"
+        ) from exc
+
+    try:
+        manifest = selected_dependencies.load_manifest(manifest_path)
+        definition = selected_dependencies.select_definition(manifest, model_id)
+        selected_profile = selected_dependencies.load_profile(profile_path, model_id)
+        paths = environment_paths(root, model_id)
+    except EnvironmentSetupError:
+        raise
+    except EnvironmentConfigError as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, f"environment manifest is invalid: {exc}"
+        ) from exc
+    except ProfileLoadError as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION, f"model profile is invalid: {exc}"
+        ) from exc
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise EnvironmentSetupError(
+            _HOST_PREFLIGHT_ACTION,
+            f"cannot load model environment/profile for {model_id}: {exc}",
+        ) from exc
+    if not isinstance(manifest, EnvironmentManifest):
+        _raise(_HOST_PREFLIGHT_ACTION, "manifest loader returned an invalid value")
+    if not isinstance(definition, ModelEnvironmentDefinition):
+        _raise(_HOST_PREFLIGHT_ACTION, "environment selector returned an invalid value")
+    if not isinstance(selected_profile, SelectedProfileType):
+        _raise(_HOST_PREFLIGHT_ACTION, "profile loader returned an invalid value")
+    if definition.cuda_policy not in _SUPPORTED_CUDA_POLICIES:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"unsupported cuda_policy: {definition.cuda_policy}",
+        )
+    source = selected_profile.data.get("source")
+    profile_commit = source.get("commit") if isinstance(source, dict) else None
+    if profile_commit != definition.source_commit:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            f"profile source commit does not match environment definition for {model_id}",
+        )
+
+    _validate_host_platform(selected_dependencies)
+    uv_path = _validate_uv(manifest, selected_dependencies, runner)
+    _validate_ros_noetic(selected_dependencies)
+    gpu_available = _probe_gpu(selected_dependencies)
+    warnings: list[str] = []
+    if not gpu_available:
+        if definition.cuda_policy in {"required", "extension_required"}:
+            _raise(
+                _HOST_PREFLIGHT_ACTION,
+                f"CUDA GPU is required by {model_id} "
+                f"(cuda_policy={definition.cuda_policy})",
+            )
+        warnings.append(
+            "CUDA GPU is not available; continuing because "
+            f"{model_id} declares cuda_policy=recommended"
+        )
+    if definition.cuda_policy == "extension_required":
+        _validate_sparse_host(selected_dependencies, runner)
+
+    return EnvironmentPreflight(
+        root=root,
+        package_root=package_root,
+        manifest=manifest,
+        definition=definition,
+        selected_profile=selected_profile,
+        paths=paths,
+        uv_path=uv_path,
+        warnings=tuple(warnings),
+    )
 
 
 @dataclass
