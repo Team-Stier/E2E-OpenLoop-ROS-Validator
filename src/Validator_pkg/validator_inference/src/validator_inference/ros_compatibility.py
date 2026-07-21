@@ -78,10 +78,15 @@ _NATIVE_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES) + (
     ".dll",
 )
 _VERSIONED_PYTHON = re.compile(r"python([0-9]+)\.([0-9]+)\Z")
+_XMLRPC_CLEANUP_ALARM_SECONDS = 0.05
 
 
 class RosCompatibilityError(RuntimeError):
     """교차 interpreter ROS runtime이 격리 또는 통신 계약을 어길 때 발생한다."""
+
+
+class _XmlRpcDeadlineExpired(BaseException):
+    """blocking XML-RPC와 local transport cleanup을 SIGALRM으로 중단한다."""
 
 
 @dataclass(frozen=True)
@@ -322,20 +327,60 @@ def _xmlrpc_request(
     remaining = deadline - monotonic()
     if remaining <= 0:
         raise RosCompatibilityError("ROS master XML-RPC deadline expired")
-    proxy = proxy_factory(master_uri, remaining)
-    try:
-        method = getattr(proxy, method_name)
-        response = method(*arguments)
-    except (OSError, socket.timeout, xmlrpc.client.Error) as exc:
+    if threading.current_thread() is not threading.main_thread():
         raise RosCompatibilityError(
-            f"ROS master XML-RPC {method_name} failed: {exc}"
-        ) from exc
+            "ROS master XML-RPC hard deadline requires the main thread"
+        )
+    if not hasattr(signal, "SIGALRM") or not hasattr(signal, "ITIMER_REAL"):
+        raise RosCompatibilityError("ROS master XML-RPC hard deadline is unavailable")
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer != (0.0, 0.0):
+        raise RosCompatibilityError(
+            "ROS master XML-RPC cannot replace an active process alarm"
+        )
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    proxy: Optional[object] = None
+    response: object = None
+    request_error: Optional[BaseException] = None
+    deadline_expired = False
+
+    def expire(_signum: int, _frame: object) -> None:
+        """request 또는 close가 absolute deadline 뒤 계속되면 즉시 unwind한다."""
+        raise _XmlRpcDeadlineExpired()
+
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(
+        signal.ITIMER_REAL,
+        remaining,
+        _XMLRPC_CLEANUP_ALARM_SECONDS,
+    )
+    try:
+        try:
+            proxy = proxy_factory(master_uri, remaining)
+            method = getattr(proxy, method_name)
+            response = method(*arguments)
+        except _XmlRpcDeadlineExpired:
+            deadline_expired = True
+        except (OSError, socket.timeout, xmlrpc.client.Error) as exc:
+            request_error = exc
     finally:
-        _close_xmlrpc_proxy(proxy)
-    if monotonic() > deadline:
+        try:
+            if proxy is not None:
+                try:
+                    _close_xmlrpc_proxy(proxy)
+                except _XmlRpcDeadlineExpired:
+                    deadline_expired = True
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, previous_handler)
+    if deadline_expired or monotonic() >= deadline:
         raise RosCompatibilityError(
             f"ROS master XML-RPC {method_name} exceeded its deadline"
         )
+    if request_error is not None:
+        raise RosCompatibilityError(
+            f"ROS master XML-RPC {method_name} failed: {request_error}"
+        ) from request_error
     return response
 
 
@@ -937,8 +982,8 @@ def run_ros_compatibility_smoke(
                 target_python=policy.target_python,
                 target_pythonpath=(policy.ros_overlay, policy.catkin_python_path),
                 message_types=MESSAGE_TYPES,
-                system_received=tuple(system_payload["received"]),
-                target_received=tuple(target_payload["received"]),
+                system_received=MESSAGE_TYPES,
+                target_received=MESSAGE_TYPES,
                 use_sim_time=True,
                 system_clock_advanced=True,
                 target_clock_advanced=True,

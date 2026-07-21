@@ -323,6 +323,102 @@ def test_xmlrpc_request_closes_server_proxy_transport_without_remote_close():
     assert observed == ["local"]
 
 
+def test_xmlrpc_request_interrupts_slow_blocking_call_at_absolute_deadline():
+    """지속적으로 깨어나는 blocking call도 absolute deadline에서 중단한다."""
+    observed = []
+
+    class Proxy:
+        """deadline보다 오래 조금씩 진행되는 XML-RPC peer를 흉내 낸다."""
+
+        def getPid(self, *_arguments):
+            """socket slow-trickle처럼 짧은 blocking 구간을 반복한다."""
+            limit = time.monotonic() + 1.0
+            while time.monotonic() < limit:
+                time.sleep(0.01)
+            return [1, "late", 42]
+
+        def _ServerProxy__close(self):
+            """deadline 뒤에도 local transport cleanup이 호출됐음을 기록한다."""
+            observed.append("closed")
+
+    started = time.monotonic()
+    with pytest.raises(RosCompatibilityError, match="deadline"):
+        _xmlrpc_request(
+            "http://127.0.0.1:43210/",
+            "getPid",
+            ("/validator_ros_compatibility",),
+            started + 0.05,
+            proxy_factory=lambda _uri, _timeout: Proxy(),
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert observed == ["closed"]
+
+
+def test_xmlrpc_request_bounds_blocking_transport_cleanup_after_deadline():
+    """request deadline 뒤 transport close도 짧은 cleanup bound를 넘지 않는다."""
+    observed = []
+
+    class Proxy:
+        """request와 local close가 모두 영구 blocking할 수 있는 proxy다."""
+
+        def getPid(self, *_arguments):
+            """absolute request deadline까지 blocking한다."""
+            time.sleep(1.0)
+
+        def _ServerProxy__close(self):
+            """두 번째 alarm이 cleanup을 중단하는지 앞뒤 marker로 드러낸다."""
+            observed.append("close-started")
+            time.sleep(1.0)
+            observed.append("close-finished")
+
+    started = time.monotonic()
+    with pytest.raises(RosCompatibilityError, match="deadline"):
+        _xmlrpc_request(
+            "http://127.0.0.1:43210/",
+            "getPid",
+            ("/validator_ros_compatibility",),
+            started + 0.05,
+            proxy_factory=lambda _uri, _timeout: Proxy(),
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3
+    assert observed == ["close-started"]
+
+
+def test_xmlrpc_request_restores_process_alarm_when_transport_close_raises():
+    """local close 예외에서도 process-global SIGALRM 상태를 유출하지 않는다."""
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    class Proxy:
+        """정상 응답 뒤 local close만 실패하는 proxy다."""
+
+        def getPid(self, *_arguments):
+            """deadline 전에 정상 master 응답을 반환한다."""
+            return [1, "ready", 42]
+
+        def _ServerProxy__close(self):
+            """alarm restoration 경로를 통과시키는 cleanup 오류를 낸다."""
+            raise RuntimeError("forced close failure")
+
+    try:
+        with pytest.raises(RuntimeError, match="forced close failure"):
+            _xmlrpc_request(
+                "http://127.0.0.1:43210/",
+                "getPid",
+                ("/validator_ros_compatibility",),
+                time.monotonic() + 1.0,
+                proxy_factory=lambda _uri, _timeout: Proxy(),
+            )
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+        assert signal.getsignal(signal.SIGALRM) is previous_handler
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def test_master_readiness_requires_a_successful_xmlrpc_response():
     """listener가 열렸더라도 getPid XML-RPC 성공 응답 전에는 ready가 아니다."""
     responses = iter((OSError("accepted TCP only"), [0, "not ready", 0], [1, "ok", 7]))
@@ -595,6 +691,32 @@ def test_run_ros_compatibility_smoke_validates_reports_and_cleans_roscore():
     assert not any(process.group_alive for process in processes)
 
 
+def test_smoke_report_preserves_protocol_order_after_sorted_json_round_trip():
+    """sorted JSON object 순서와 무관하게 report type 순서는 protocol을 따른다."""
+    policy = _path_policy()
+    processes = [
+        _FakeProcess(1101),
+        _FakeProcess(1102, returncode=0),
+        _FakeProcess(1103, returncode=0),
+    ]
+    reports = {
+        name: json.loads(json.dumps(_peer_report(role, policy), sort_keys=True))
+        for name, role in (("system.json", "system"), ("target.json", "target"))
+    }
+    dependencies, _calls, _signals, _control_calls = _dependencies(
+        processes, reports
+    )
+
+    result = run_ros_compatibility_smoke(
+        policy,
+        system_python=Path("/usr/bin/python3"),
+        dependencies=dependencies,
+    )
+
+    assert result.system_received == MESSAGE_TYPES
+    assert result.target_received == MESSAGE_TYPES
+
+
 def test_run_ros_compatibility_smoke_cleans_started_groups_on_peer_start_failure():
     """target peer 시작이 실패해도 먼저 시작한 roscore와 system peer를 종료한다."""
     policy = _path_policy()
@@ -768,7 +890,7 @@ def test_peer_cli_reports_runtime_failure_without_traceback(tmp_path, capsys):
 
 def _build_catkin_install_prefix(tmp_path):
     """필요한 두 package만 가진 격리 Catkin workspace를 실제 install한다."""
-    workspace = tmp_path / "catkin install workspace"
+    workspace = tmp_path / "catkin_install_workspace"
     validator_root = workspace / "src/Validator_pkg"
     validator_root.mkdir(parents=True)
     ignore = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
@@ -787,15 +909,18 @@ def _build_catkin_install_prefix(tmp_path):
         validator_root / "config",
         ignore=ignore,
     )
-    install_prefix = (tmp_path / "isolated install prefix").resolve()
+    install_prefix = (tmp_path / "isolated_install_prefix").resolve()
+    environment = dict(os.environ)
+    environment["PWD"] = str(workspace)
     result = subprocess.run(
         [
             "catkin_make",
             "install",
             f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+            "-DPYTHON_EXECUTABLE=/usr/bin/python3",
         ],
         cwd=workspace,
-        env=dict(os.environ),
+        env=environment,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -803,6 +928,9 @@ def _build_catkin_install_prefix(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stdout
+    assert f"Base path: {workspace}" in result.stdout
+    assert f"Source space: {workspace / 'src'}" in result.stdout
+    assert f"Install space: {install_prefix}" in result.stdout
     return install_prefix
 
 
@@ -1037,6 +1165,9 @@ def test_real_install_prefix_and_roslaunch_signal_contract(tmp_path):
     relay = install_prefix / "lib/validator_inference/inference_engine_node.py"
     catkin_python = install_prefix / "lib/python3/dist-packages"
     assert wrapper.read_bytes().splitlines()[0] == b"#!/usr/bin/python3"
+    assert wrapper.read_bytes() == (
+        _VALIDATOR_PACKAGE_ROOT / "validator_inference/scripts/model_env_exec"
+    ).read_bytes()
     assert relay.is_file()
     assert (catkin_python / "validator_inference/__init__.py").is_file()
     assert (catkin_python / "validator_msgs/msg/__init__.py").is_file()
@@ -1159,8 +1290,7 @@ def test_real_cross_version_ros_compatibility_smoke(tmp_path, python_version):
             "-c",
             (
                 "import json,sysconfig; "
-                "print(json.dumps([sysconfig.get_path('stdlib'), "
-                "sysconfig.get_path('platstdlib')]))"
+                "print(json.dumps(sysconfig.get_path('stdlib')))"
             ),
         ],
         check=True,
@@ -1168,15 +1298,13 @@ def test_real_cross_version_ros_compatibility_smoke(tmp_path, python_version):
         text=True,
         timeout=30,
     )
-    stdlib_paths = tuple(
-        dict.fromkeys(Path(value) for value in json.loads(completed.stdout))
-    )
+    base_stdlib = Path(json.loads(completed.stdout))
     policy = RuntimePathPolicy(
         target_python=target_python,
         target_environment=target_environment,
         ros_overlay=ros_overlay,
         catkin_python_path=catkin_python_path,
-        target_stdlib_paths=stdlib_paths,
+        target_stdlib_paths=(base_stdlib,),
         project_source_paths=(source_path,),
     )
 
