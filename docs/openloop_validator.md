@@ -14,6 +14,8 @@ RViz가 필요 없으면 `./openloop interfuser`를 사용한다. 다른 bag은 
 
 ## 환경 관리
 
+지원 host는 Ubuntu 20.04 x86_64와 ROS Noetic이며, PATH에서 정확히 `uv 0.11.14`를 찾을 수 있어야 한다. 모델별 required CUDA/toolchain 조건은 setup preflight가 실제 파일과 version으로 검사한다.
+
 활성 환경의 source, runtime asset, ROS overlay, Python package lock을 다시 검사하려면 다음 명령을 실행한다.
 
 ```bash
@@ -47,9 +49,12 @@ CLI가 전달하는 인자를 직접 제어해야 할 때만 ROS setup을 source
 
 ```bash
 roslaunch Validator_pkg openloop_validator.launch \
+  project_root:=/home/stier/E2E-OpenLoop-ROS-Validator \
   model_id:=interfuser \
   model_env_root:=/home/stier/E2E-OpenLoop-ROS-Validator/.venvs \
   show_rviz:=true
 ```
 
 직접 launch는 환경을 생성하거나 검증하지 않는다. 먼저 `./openloop setup interfuser` 또는 `./openloop verify interfuser`를 실행한다.
+
+고급 직접 launch에서는 `profile_file:=/absolute/profile.json`과 `record_dir:=/absolute/records`를 추가해 profile과 기록 경로를 바꿀 수 있다.

@@ -36,8 +36,10 @@
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>rosbag</exec_depend>
   <exec_depend>rosgraph</exec_depend>
   <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>roslaunch</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>morai_msgs</exec_depend>

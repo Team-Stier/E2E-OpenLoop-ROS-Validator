@@ -390,6 +390,7 @@ def test_root_shim_is_executable_and_preserves_bootstrap_contract():
     assert 'source /opt/ros/noetic/setup.bash' in content
     assert 'if [[ -f "$PROJECT_ROOT/devel/setup.bash" ]]; then' in content
     assert 'source "$PROJECT_ROOT/devel/setup.bash"' in content
+    assert 'export OPENLOOP_PROJECT_ROOT="$PROJECT_ROOT"' in content
     assert (
         'export PYTHONPATH="$PROJECT_ROOT/src/Validator_pkg/validator_inference/src'
         '${PYTHONPATH:+:$PYTHONPATH}"'
@@ -400,6 +401,65 @@ def test_root_shim_is_executable_and_preserves_bootstrap_contract():
         '"$@"'
     ) in content
     subprocess.run(["bash", "-n", str(ROOT_SHIM)], check=True)
+
+
+def test_default_project_root_prefers_valid_explicit_environment(
+    cli: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """install-space CLI가 명시된 실제 source project를 선택하는지 검사한다."""
+    root = tmp_path / "project"
+    (root / "src/Validator_pkg/config").mkdir(parents=True)
+    (root / "src/Validator_pkg/config/profile.json").write_text("{}\n")
+    manifest = root / "src/Validator_pkg/validator_inference/config"
+    manifest.mkdir(parents=True)
+    (manifest / "model_environments.json").write_text("{}\n")
+    monkeypatch.setenv("OPENLOOP_PROJECT_ROOT", str(root))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "install/lib/openloop_cli.py"))
+
+    assert cli._default_project_root() == root.resolve()
+
+
+def test_default_project_root_finds_valid_caller_checkout_from_install_space(
+    cli: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """환경 변수가 없으면 install-space CLI가 caller checkout을 찾는지 검사한다."""
+    root = tmp_path / "project"
+    (root / "src/Validator_pkg/config").mkdir(parents=True)
+    (root / "src/Validator_pkg/config/profile.json").write_text("{}\n")
+    manifest = root / "src/Validator_pkg/validator_inference/config"
+    manifest.mkdir(parents=True)
+    (manifest / "model_environments.json").write_text("{}\n")
+    monkeypatch.delenv("OPENLOOP_PROJECT_ROOT", raising=False)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "install/lib/openloop_cli.py"))
+
+    assert cli._default_project_root() == root.resolve()
+
+
+def test_default_project_root_rejects_invalid_explicit_environment(
+    cli: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """명시 project root가 다른 directory를 가리키면 암묵 fallback하지 않는다."""
+    monkeypatch.setenv("OPENLOOP_PROJECT_ROOT", str(tmp_path / "not-a-project"))
+
+    with pytest.raises(cli.OpenLoopCliError, match="OPENLOOP_PROJECT_ROOT"):
+        cli._default_project_root()
+
+
+def test_main_reports_invalid_explicit_project_root_without_traceback(
+    cli: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    """install-space root 설정 오류가 표준 한 줄 CLI 진단으로 종료되는지 검사한다."""
+    monkeypatch.setenv("OPENLOOP_PROJECT_ROOT", str(tmp_path / "not-a-project"))
+
+    assert cli.main(["bag"]) == 1
+    assert capsys.readouterr().err == (
+        "openloop: OPENLOOP_PROJECT_ROOT must be a canonical source project root\n"
+    )
 
 
 def test_root_shim_clean_checkout_preserves_cli_argument_boundaries(tmp_path: Path):

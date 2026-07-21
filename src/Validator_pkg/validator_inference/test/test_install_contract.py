@@ -40,4 +40,4 @@ def test_runtime_package_declares_ros_smoke_dependencies():
         element.text for element in package_xml.findall("exec_depend")
     }
 
-    assert {"rosgraph", "rosgraph_msgs"} <= runtime_dependencies
+    assert {"rosbag", "rosgraph", "rosgraph_msgs", "roslaunch"} <= runtime_dependencies

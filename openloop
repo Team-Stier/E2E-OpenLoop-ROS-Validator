@@ -11,5 +11,6 @@ _source_ros_environment() {
 }
 _source_ros_environment
 unset -f _source_ros_environment
+export OPENLOOP_PROJECT_ROOT="$PROJECT_ROOT"
 export PYTHONPATH="$PROJECT_ROOT/src/Validator_pkg/validator_inference/src${PYTHONPATH:+:$PYTHONPATH}"
 exec /usr/bin/python3 "$PROJECT_ROOT/src/Validator_pkg/validator_inference/scripts/openloop_cli.py" "$@"

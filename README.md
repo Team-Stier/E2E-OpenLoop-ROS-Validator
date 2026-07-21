@@ -282,6 +282,8 @@ lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
 
 `setup`은 모델별 고정 Python/CUDA dependency를 `.venvs/<model>/builds/`에 만들고 검증이 끝난 build만 `current`로 선택한다. `run`과 모델 shorthand는 환경을 설치하거나 변경하지 않는다. 전체 hash 무결성 검사와 이전 build 정리는 각각 다음 명령을 사용한다.
 
+지원 host는 Ubuntu 20.04 x86_64, ROS Noetic, `uv 0.11.14`이다. 모델별 required CUDA/toolchain 조건은 setup 시작 단계에서 검사한다.
+
 ```bash
 ./openloop verify interfuser
 ./openloop prune interfuser
@@ -293,9 +295,10 @@ lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
 
 ```bash
 roslaunch Validator_pkg openloop_validator.launch \
+  project_root:=/home/stier/E2E-OpenLoop-ROS-Validator \
   model_id:=interfuser \
   model_env_root:=/home/stier/E2E-OpenLoop-ROS-Validator/.venvs \
   show_rviz:=true
 ```
 
-기본 결과 위치는 프로젝트의 `records/openloop/`이다. `/waypoints`는 `Lidar3D-4` frame이고 매 tick 결과는 `/inference_metric` 하나를 통해 CSV에 기록된다.
+기본 결과 위치는 프로젝트의 `records/openloop/`이다. 고급 직접 launch에서는 `profile_file:=/absolute/profile.json`, `record_dir:=/absolute/records`로 로컬 경로를 바꿀 수 있다. `/waypoints`는 `Lidar3D-4` frame이고 매 tick 결과는 `/inference_metric` 하나를 통해 CSV에 기록된다.

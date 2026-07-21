@@ -38,8 +38,39 @@ class OpenLoopCliError(RuntimeError):
 
 
 def _default_project_root() -> Path:
-    """source-tree scripts 위치에서 저장소 루트를 반환한다."""
-    return Path(__file__).resolve().parents[4]
+    """명시 환경, caller cwd 또는 source script에서 실제 저장소 루트를 찾는다."""
+    def is_project_root(candidate: Path) -> bool:
+        """CLI가 소유한 두 추적 설정 파일로 source project root를 식별한다."""
+        return (
+            candidate.is_dir()
+            and (candidate / _MANIFEST_RELATIVE_PATH).is_file()
+            and (candidate / _PROFILE_RELATIVE_PATH).is_file()
+        )
+
+    configured = os.environ.get("OPENLOOP_PROJECT_ROOT")
+    if configured is not None:
+        candidate = Path(configured)
+        if (
+            not configured
+            or not candidate.is_absolute()
+            or candidate.resolve() != candidate
+            or not is_project_root(candidate)
+        ):
+            raise OpenLoopCliError(
+                "OPENLOOP_PROJECT_ROOT must be a canonical source project root"
+            )
+        return candidate
+
+    caller = Path.cwd().resolve()
+    if is_project_root(caller):
+        return caller
+    script = Path(__file__).resolve()
+    for candidate in script.parents:
+        if is_project_root(candidate):
+            return candidate
+    raise OpenLoopCliError(
+        "cannot locate source project root; set OPENLOOP_PROJECT_ROOT"
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -169,12 +200,12 @@ def main(
     """CLI를 dispatch하고 장기 실행 명령은 현재 process를 교체한다."""
     arguments = sys.argv[1:] if argv is None else argv
     args = _parser().parse_args(_normalize_argv(arguments))
-    root = (
-        _default_project_root()
-        if project_root is None
-        else Path(project_root).resolve()
-    )
     try:
+        root = (
+            _default_project_root()
+            if project_root is None
+            else Path(project_root).resolve()
+        )
         if args.command == "setup":
             result = environment_setup.setup_environment(
                 root, args.model_id, recreate=args.recreate

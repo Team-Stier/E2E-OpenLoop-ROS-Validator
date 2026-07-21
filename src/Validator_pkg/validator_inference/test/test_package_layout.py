@@ -60,5 +60,11 @@ def test_operator_documentation_uses_canonical_three_command_workflow():
 
         assert "./openloop verify interfuser" in text
         assert "./openloop prune interfuser" in text
+        assert "project_root:=/" in text
         assert "model_env_root:=/" in text
         assert "third-party compatibility artifact" in text
+        assert "uv 0.11.14" in text
+        assert "Ubuntu 20.04" in text
+        assert "ROS Noetic" in text
+        assert "profile_file" in text
+        assert "record_dir" in text
