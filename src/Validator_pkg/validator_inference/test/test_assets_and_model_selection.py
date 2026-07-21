@@ -23,7 +23,7 @@ from validator_inference.models.interfuser import InterFuserModel
 from validator_inference.models.select import build_selected_model
 from validator_inference.models.sparsedrive_v2 import SparseDriveV2Model
 from validator_inference.models.tfv6 import TFv6Model
-from validator_inference.profile_store import SelectedProfile
+from validator_inference.profile_store import SelectedProfile, load_selected_profile
 
 
 MODEL_TYPES = {
@@ -32,6 +32,8 @@ MODEL_TYPES = {
     "diffusiondrive_v2": DiffusionDriveV2InferenceModel,
     "sparsedrive_v2": SparseDriveV2Model,
 }
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+PROFILE_PATH = PACKAGE_ROOT.parent / "config" / "profile.json"
 
 
 def _selected(model_id, data=None):
@@ -98,6 +100,19 @@ def test_factory_returns_exact_concrete_type_without_loading_assets(
 def test_factory_rejects_unknown_model_id(tmp_path):
     with pytest.raises(ValueError, match="unsupported model_id: unknown"):
         build_selected_model(_selected("unknown"), project_root=tmp_path)
+
+
+def test_interfuser_asset_order_keeps_checkpoint_at_runtime_index_zero():
+    profile = load_selected_profile(PROFILE_PATH, "interfuser").data
+
+    assert [asset["role"] for asset in profile["runtime_assets"]] == [
+        "checkpoint",
+        "image_backbone",
+    ]
+    assert profile["runtime_assets"][0]["path"] == (
+        "models/interfuser/official_carla/interfuser.pth.tar"
+    )
+    assert "43.163.208.95" not in json.dumps(profile, sort_keys=True)
 
 
 def test_missing_asset_names_resolved_path_and_expected_hash(tmp_path):

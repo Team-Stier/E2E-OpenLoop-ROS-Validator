@@ -50,6 +50,43 @@ def test_tfv6_profile_pins_official_noradar_checkpoint_contract(profile_path: Pa
     assert all(item["key"] != "radar" for item in tfv6["required_inputs"])
 
 
+def test_interfuser_profile_preserves_exact_asset_hashes_and_provenance(
+    profile_path: Path,
+):
+    interfuser = load_selected_profile(profile_path, "interfuser").data
+
+    assert interfuser["runtime_assets"] == [
+        {
+            "role": "checkpoint",
+            "path": "models/interfuser/official_carla/interfuser.pth.tar",
+            "expected_filename": "interfuser.pth.tar",
+            "sha256": (
+                "39548dcfa56cdc06b8ccc52d7f6187a7d70ef36b05b7027db4d64a57ac3e30b2"
+            ),
+            "provenance": {
+                "classification": "third_party_compatibility_artifact",
+                "repository": "https://github.com/MingfeiCheng/Drivora",
+                "commit": "25d56d2300f422d502c6549695b9e49efd5e5e00",
+                "google_drive_id": "1GKiASmGPbD4FwHkUoVfGRk_lMLrGb2f6",
+            },
+        },
+        {
+            "role": "image_backbone",
+            "path": (
+                "models/shared/torch-cache/hub/checkpoints/"
+                "resnet50d_ra2-464e36ba.pth"
+            ),
+            "source_url": (
+                "https://github.com/rwightman/pytorch-image-models/releases/"
+                "download/v0.1-weights/resnet50d_ra2-464e36ba.pth"
+            ),
+            "sha256": (
+                "464e36baa940a80971e717454e61e8f6fc1a1b284b7a3dbb6f6fd4c3da78533d"
+            ),
+        },
+    ]
+
+
 def test_sparse_profile_rejects_partial_inline_calibration(profile_path: Path):
     with pytest.raises(ProfileError, match="K_original_3x3"):
         load_selected_profile(profile_path, "sparsedrive_v2")
