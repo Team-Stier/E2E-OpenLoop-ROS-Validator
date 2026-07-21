@@ -20,16 +20,32 @@ def quaternion_slerp(
     """
     start = np.asarray(q0, dtype=np.float64)
     end = np.asarray(q1, dtype=np.float64)
-    start_norm = float(np.linalg.norm(start))
-    end_norm = float(np.linalg.norm(end))
-    if start_norm == 0.0 or end_norm == 0.0:
-        raise ValueError("quaternions must be nonzero")
+    if start.shape != (4,) or end.shape != (4,):
+        raise ValueError("quaternions must have shape (4,)")
+    if not np.all(np.isfinite(start)) or not np.all(np.isfinite(end)):
+        raise ValueError("quaternions must contain finite components")
+
+    fraction_array = np.asarray(fraction, dtype=np.float64)
+    if fraction_array.shape != () or not bool(np.isfinite(fraction_array)):
+        raise ValueError("fraction must be a finite scalar")
+    fraction_value = float(fraction_array)
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        start_norm = float(np.linalg.norm(start))
+        end_norm = float(np.linalg.norm(end))
+    if (
+        not np.isfinite(start_norm)
+        or not np.isfinite(end_norm)
+        or start_norm == 0.0
+        or end_norm == 0.0
+    ):
+        raise ValueError("quaternions must have a finite nonzero norm")
 
     start = start / start_norm
     end = end / end_norm
-    if fraction == 0.0:
+    if fraction_value == 0.0:
         return start
-    if fraction == 1.0:
+    if fraction_value == 1.0:
         return end
 
     dot = float(np.dot(start, end))
@@ -39,11 +55,11 @@ def quaternion_slerp(
     dot = float(np.clip(dot, -1.0, 1.0))
 
     if dot > 0.9995:
-        result = start + fraction * (end - start)
+        result = start + fraction_value * (end - start)
         return result / np.linalg.norm(result)
 
     angle = float(np.arccos(dot))
     inverse_sine = 1.0 / np.sin(angle)
-    start_weight = np.sin((1.0 - fraction) * angle) * inverse_sine
-    end_weight = np.sin(fraction * angle) * inverse_sine
+    start_weight = np.sin((1.0 - fraction_value) * angle) * inverse_sine
+    end_weight = np.sin(fraction_value * angle) * inverse_sine
     return start_weight * start + end_weight * end

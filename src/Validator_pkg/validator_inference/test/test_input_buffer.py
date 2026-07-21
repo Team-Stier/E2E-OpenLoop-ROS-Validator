@@ -1,12 +1,14 @@
 """유한 인과 추론 입력 저장소와 TF pose 이력을 검사한다."""
 
-import importlib
+import os
+import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
-from validator_inference import input_buffer
 from validator_inference.input_buffer import (
     InferenceFrame,
     InputBuffer,
@@ -190,14 +192,38 @@ def test_pose_without_bracketing_pair_is_missing():
     assert history.interpolate(time_from_sec(1.5)) is None
 
 
-def test_importing_input_buffer_does_not_load_tf(monkeypatch):
-    for name in tuple(sys.modules):
-        if name == "tf" or name.startswith("tf.") or name.startswith("tf2_py"):
-            monkeypatch.delitem(sys.modules, name)
+def test_clean_importing_input_buffer_rejects_tf_dependencies():
+    package_source = Path(__file__).parents[1] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(package_source)
+    script = dedent(
+        """
+        import importlib.abc
+        import sys
 
-    importlib.reload(input_buffer)
+        attempted = []
 
-    assert not any(
-        name == "tf" or name.startswith("tf.") or name.startswith("tf2_py")
-        for name in sys.modules
+        class RejectTfImports(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if (
+                    fullname == "tf"
+                    or fullname.startswith("tf.")
+                    or fullname.startswith("tf2_py")
+                ):
+                    attempted.append(fullname)
+                    raise ImportError("rejected TF dependency: " + fullname)
+                return None
+
+        sys.meta_path.insert(0, RejectTfImports())
+        import validator_inference.input_buffer
+        assert not attempted, attempted
+        """
     )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
