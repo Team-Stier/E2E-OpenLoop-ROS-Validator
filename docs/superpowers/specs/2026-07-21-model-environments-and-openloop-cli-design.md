@@ -210,8 +210,8 @@ arguments so lock regeneration is reviewable. PyTorch indexes are fixed to
 `https://download.pytorch.org/whl/cu121`, `cu124`, or `cu118` as shown in the
 model table; PyPI is the secondary runtime dependency index. SparseDrive also
 declares CUDA Toolkit 11.8, `CUDA_HOME`, the accepted `nvcc` 11.8 release, host
-compiler compatibility, its two extension source directories and build command,
-and import checks for both built extension modules.
+compiler compatibility, its single `navsim/agents/sparsedrive/ops` build
+directory and command, and import checks for both built extension modules.
 
 CUDA policy has executable semantics:
 

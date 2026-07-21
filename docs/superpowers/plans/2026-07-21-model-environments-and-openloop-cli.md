@@ -155,7 +155,7 @@ Construct argv arrays, never shell strings. Venv creation is `uv venv --no-proje
 
 - [ ] **Step 4: Add all four inputs and generated locks**
 
-Every `.in` includes exact torch/torchvision pins and target-Python builds of `PyYAML`, `rospkg`, `catkin_pkg`, `netifaces`, and `python-dateutil`. TFv6 also pins torchaudio 2.5.0+cu124, NumPy 1.26, timm 1.0.19, transformers 4.46.3, and torchmetrics 0.11; DiffusionDrive pins protobuf 4.25.3, diffusers, and einops; SparseDrive pins protobuf 3.20.* and its upstream direct dependencies. DiffusionDrive and SparseDrive replace the unhashable upstream Git reference with the immutable nuPlan archive at commit `ce3c323af01c0d7ec5672f7832ef53f9c679aab0`, allowing `uv pip compile --generate-hashes` to record its archive hash. Generate each lock with the manifest-recorded `uv 0.11.14`, Python patch, `--python-platform x86_64-unknown-linux-gnu`, official CUDA wheel index, PyPI secondary index, `--generate-hashes`, and fixed `--exclude-newer` timestamp. Check the generated lock contains hashes for every installable line.
+Every `.in` includes exact torch/torchvision pins and target-Python builds of `PyYAML`, `rospkg`, `catkin_pkg`, `netifaces`, and `python-dateutil`. TFv6 also pins torchaudio 2.5.0+cu124, NumPy 1.26, timm 1.0.19, transformers 4.46.3, and torchmetrics 0.11; DiffusionDrive pins protobuf 4.25.3, diffusers, and einops; SparseDrive pins protobuf 3.20.* and its upstream direct dependencies. DiffusionDrive and SparseDrive replace the unhashable upstream Git reference with `nuplan-devkit @ https://github.com/motional/nuplan-devkit/archive/ce3c323af01c0d7ec5672f7832ef53f9c679aab0.tar.gz`; `uv pip compile --generate-hashes` must record archive SHA256 `5ab521c1af439902fd8e3df2619da75a03ade5814b35cd37c4c920fd45455e62`. Generate each lock with the manifest-recorded `uv 0.11.14`, Python patch, `--python-platform x86_64-unknown-linux-gnu`, official CUDA wheel index, PyPI secondary index, `--generate-hashes`, and fixed `--exclude-newer` timestamp. Check the generated lock contains hashes for every installable line.
 
 - [ ] **Step 5: Pass manifest and lock tests**
 
@@ -248,7 +248,7 @@ Create candidates directly at their unique final paths so venv-generated scripts
 
 - [ ] **Step 4: Add host prerequisite phase tests**
 
-Inject command lookup/runner/GPU probes. Assert unsupported OS, wrong `uv`, missing ROS, missing CUDA for TFv6, missing `nvcc 11.8`/`CUDA_HOME`/compiler/extensions or null three-camera calibration for SparseDrive fail before any downloader or venv call. Assert InterFuser and DiffusionDrive return a recorded warning without CUDA, and exact `uv` argv from Task 2 is executed with `check=True`.
+Inject command lookup/runner/GPU probes. Assert unsupported OS, wrong `uv`, missing ROS, missing CUDA for TFv6, missing `nvcc 11.8`/`CUDA_HOME`/compiler/extensions or null three-camera calibration for SparseDrive fail before any downloader or venv call. SparseDrive uses cwd `models/sources/sparsedrive_v2/navsim/agents/sparsedrive/ops` and executes the candidate Python on `setup.py build_ext --inplace` with `CUDA_HOME=/usr/local/cuda-11.8`, `FORCE_CUDA=1`, `TORCH_CUDA_ARCH_LIST=8.6`, `CC=/usr/bin/gcc`, and `CXX=/usr/bin/g++`; verify imports `deformable_aggregation_ext` and `deformable_aggregation_with_depth_ext` under that package. Assert InterFuser and DiffusionDrive return a recorded warning without CUDA, and exact `uv` argv from Task 2 is executed with `check=True`.
 
 - [ ] **Step 5: Implement setup phases and deep verification**
 
