@@ -1,0 +1,20 @@
+frame_id: "base_link"
+
+# BEV 영상 크기
+width: 400
+height: 500
+
+# 차량 좌표계 기준 범위 [m]
+x_min: 0.0
+x_max: 50.0
+y_min: -20.0
+y_max: 20.0
+
+# 한 픽셀이 나타내는 실제 거리 [m/pixel]
+resolution: 0.1
+
+# 픽셀 축 정의
+# row=0: 차량으로부터 가장 먼 전방
+# col=0: 차량 좌측 끝
+row_zero_is_x_max: true
+col_zero_is_y_max: true
