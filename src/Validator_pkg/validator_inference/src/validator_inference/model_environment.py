@@ -48,6 +48,8 @@ _PATCH_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0
 _GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 _IMPORT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
 _TORCH_BACKEND = re.compile(r"cu[0-9]{3}\Z")
+_SETUP_ACTION_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+_SETUP_ACTIONS = {"build_sparsedrive_cuda_extensions"}
 
 
 class EnvironmentConfigError(ValueError):
@@ -192,10 +194,17 @@ def _require_string_tuple(
 
 def _validate_index(value: str, context: str) -> None:
     """package index가 credential 없는 고정 HTTPS URL인지 검사한다."""
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise EnvironmentConfigError(
+            f"{context} contains a malformed index URL"
+        ) from exc
     if (
         parsed.scheme != "https"
         or not parsed.hostname
+        or port not in (None, 443)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -298,6 +307,15 @@ def _parse_model_definition(
         f"models.{model_id}.setup_actions",
         allow_empty=True,
     )
+    if any(not _SETUP_ACTION_NAME.fullmatch(action) for action in setup_actions):
+        raise EnvironmentConfigError(
+            f"models.{model_id}.setup_actions contains an invalid identifier"
+        )
+    unsupported_actions = set(setup_actions) - _SETUP_ACTIONS
+    if unsupported_actions:
+        raise EnvironmentConfigError(
+            f"models.{model_id}.setup_actions contains an unsupported action"
+        )
 
     requirements_input = _resolve_requirement_path(
         package_root,

@@ -37,6 +37,16 @@ EXPECTED = {
         "cuda_policy": "recommended",
         "cuda_index": "https://download.pytorch.org/whl/cu121",
         "torch_backend": "cu121",
+        "required_imports": {
+            "torch",
+            "torchvision",
+            "numpy",
+            "cv2",
+            "timm",
+            "imgaug",
+            "skimage",
+        },
+        "setup_actions": set(),
     },
     "tfv6": {
         "python": "3.10.20",
@@ -45,6 +55,16 @@ EXPECTED = {
         "cuda_policy": "required",
         "cuda_index": "https://download.pytorch.org/whl/cu124",
         "torch_backend": "cu124",
+        "required_imports": {
+            "torch",
+            "torchvision",
+            "torchaudio",
+            "numpy",
+            "timm",
+            "transformers",
+            "torchmetrics",
+        },
+        "setup_actions": set(),
     },
     "diffusiondrive_v2": {
         "python": "3.9.25",
@@ -53,6 +73,14 @@ EXPECTED = {
         "cuda_policy": "recommended",
         "cuda_index": "https://download.pytorch.org/whl/cu118",
         "torch_backend": "cu118",
+        "required_imports": {
+            "torch",
+            "torchvision",
+            "diffusers",
+            "einops",
+            "nuplan",
+        },
+        "setup_actions": set(),
     },
     "sparsedrive_v2": {
         "python": "3.9.25",
@@ -61,6 +89,14 @@ EXPECTED = {
         "cuda_policy": "extension_required",
         "cuda_index": "https://download.pytorch.org/whl/cu118",
         "torch_backend": "cu118",
+        "required_imports": {
+            "torch",
+            "torchvision",
+            "nuplan",
+            "deformable_aggregation_ext",
+            "deformable_aggregation_with_depth_ext",
+        },
+        "setup_actions": {"build_sparsedrive_cuda_extensions"},
     },
 }
 COMMON_INPUTS = {
@@ -149,6 +185,8 @@ def test_manifest_defines_exact_supported_models(manifest: EnvironmentManifest):
         assert definition.python_version == expected["python"]
         assert definition.cuda_policy == expected["cuda_policy"]
         assert definition.torch_backend == expected["torch_backend"]
+        assert set(definition.required_imports) == expected["required_imports"]
+        assert set(definition.setup_actions) == expected["setup_actions"]
         assert definition.indexes == (
             expected["cuda_index"],
             "https://pypi.org/simple",
@@ -329,6 +367,53 @@ def test_manifest_rejects_unknown_or_mismatched_torch_backend(
 
 
 @pytest.mark.parametrize(
+    "bad_import",
+    ("torch vision", " torch", "torch ", "torch-module", "torch..nn"),
+)
+def test_manifest_rejects_invalid_required_import_syntax(
+    tmp_path: Path,
+    manifest_payload: dict[str, Any],
+    bad_import: str,
+):
+    """required import가 공백 없는 Python module identifier인지 검사한다."""
+    path = _mutated_manifest(
+        tmp_path,
+        manifest_payload,
+        lambda payload: payload["models"]["interfuser"].update(
+            required_imports=["torch", bad_import]
+        ),
+    )
+    with pytest.raises(EnvironmentConfigError, match="required_imports"):
+        load_environment_manifest(path)
+
+
+@pytest.mark.parametrize(
+    "bad_action",
+    (
+        "download_assets",
+        " build_sparsedrive_cuda_extensions",
+        "build_sparsedrive_cuda_extensions ",
+        "build sparsedrive cuda extensions",
+    ),
+)
+def test_manifest_rejects_invalid_or_unknown_setup_actions(
+    tmp_path: Path,
+    manifest_payload: dict[str, Any],
+    bad_action: str,
+):
+    """setup action이 identifier 문법과 executor allowlist를 모두 따르는지 검사한다."""
+    path = _mutated_manifest(
+        tmp_path,
+        manifest_payload,
+        lambda payload: payload["models"]["interfuser"].update(
+            setup_actions=[bad_action]
+        ),
+    )
+    with pytest.raises(EnvironmentConfigError, match="setup_actions"):
+        load_environment_manifest(path)
+
+
+@pytest.mark.parametrize(
     "field,bad_path",
     (
         ("requirements_input", "/tmp/interfuser.in"),
@@ -380,6 +465,14 @@ def test_manifest_rejects_requirement_symlink_escape(
         ["https://pypi.org/simple", "https://download.pytorch.org/whl/cu121"],
         ["https://user:password@example.com/simple", "https://pypi.org/simple"],
         ["not-a-url", "https://pypi.org/simple"],
+        [
+            "https://download.pytorch.org:bogus/whl/cu121",
+            "https://pypi.org/simple",
+        ],
+        [
+            "https://download.pytorch.org:8443/whl/cu121",
+            "https://pypi.org/simple",
+        ],
     ),
 )
 def test_manifest_rejects_malformed_or_reordered_indexes(
