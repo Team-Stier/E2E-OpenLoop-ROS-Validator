@@ -25,6 +25,7 @@ __pycache__/
 .codex/
 .agents/
 graphify-out/
+/.venvs/
 
 # Local Docker TDD environment
 Dockerfile
