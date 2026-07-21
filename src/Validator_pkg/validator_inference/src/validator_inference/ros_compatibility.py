@@ -907,6 +907,7 @@ def run_ros_compatibility_smoke(
             deadline = selected_dependencies.monotonic() + float(timeout_seconds)
             system_environment = dict(inherited)
             system_environment["ROS_MASTER_URI"] = master_uri
+            system_environment["PYTHONDONTWRITEBYTECODE"] = "1"
 
             roscore = _spawn_process(
                 selected_dependencies,
@@ -927,6 +928,7 @@ def run_ros_compatibility_smoke(
                 selected_dependencies,
                 [
                     str(system_executable),
+                    "-B",
                     "-m",
                     module_command,
                     "--role",
@@ -941,6 +943,7 @@ def run_ros_compatibility_smoke(
                 selected_dependencies,
                 [
                     str(policy.target_python),
+                    "-B",
                     "-m",
                     module_command,
                     "--role",

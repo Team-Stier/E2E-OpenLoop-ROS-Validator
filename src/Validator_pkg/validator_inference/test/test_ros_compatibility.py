@@ -680,7 +680,12 @@ def test_run_ros_compatibility_smoke_validates_reports_and_cleans_roscore():
     assert result.system_received == MESSAGE_TYPES
     assert result.target_received == MESSAGE_TYPES
     assert all(kwargs["start_new_session"] is True for _argv, kwargs in calls)
+    assert calls[1][0][1:3] == ["-B", "-m"]
+    assert calls[2][0][1:3] == ["-B", "-m"]
+    system_environment = calls[1][1]["env"]
+    assert system_environment["PYTHONDONTWRITEBYTECODE"] == "1"
     target_environment = calls[2][1]["env"]
+    assert target_environment["PYTHONDONTWRITEBYTECODE"] == "1"
     assert target_environment["PYTHONPATH"] == ":".join(
         (str(policy.ros_overlay), str(policy.catkin_python_path))
     )
