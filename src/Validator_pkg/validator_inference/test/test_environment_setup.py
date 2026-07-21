@@ -2323,7 +2323,7 @@ def test_prepare_copies_exact_user_cache_with_atomic_fsync_protocol(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """exact user cache를 sibling temp에서 fsync한 뒤 atomic replace와 parent fsync한다."""
+    """exact cache를 fsync한 뒤 no-clobber link, temp unlink와 parent fsync한다."""
     checkpoint_payload = b"checkpoint"
     backbone_payload = b"cached backbone" * 4096
     assets = _interfuser_runtime_assets(
@@ -2334,39 +2334,146 @@ def test_prepare_copies_exact_user_cache_with_atomic_fsync_protocol(
     user_cache = _write_asset(tmp_path, Path("user/cache/backbone.pth"), backbone_payload)
     events: list[tuple[Any, ...]] = []
     real_fsync = os.fsync
-    real_replace = os.replace
+    real_link = os.link
+    real_unlink = os.unlink
 
     def recording_fsync(descriptor: int) -> None:
         mode = os.fstat(descriptor).st_mode
         events.append(("fsync", "directory" if stat.S_ISDIR(mode) else "file"))
         real_fsync(descriptor)
 
-    def recording_replace(
+    def recording_link(
         source: str,
         destination: str,
         *,
         src_dir_fd: int | None = None,
         dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
     ) -> None:
-        events.append(("replace", source, destination, src_dir_fd == dst_dir_fd))
-        real_replace(
+        events.append(
+            (
+                "link",
+                source,
+                destination,
+                src_dir_fd == dst_dir_fd,
+                follow_symlinks,
+            )
+        )
+        real_link(
             source,
             destination,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
 
+    def recording_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        events.append(("unlink", path))
+        real_unlink(path, dir_fd=dir_fd)
+
     monkeypatch.setattr(environment_setup.os, "fsync", recording_fsync)
-    monkeypatch.setattr(environment_setup.os, "replace", recording_replace)
+    monkeypatch.setattr(environment_setup.os, "link", recording_link)
+    monkeypatch.setattr(environment_setup.os, "unlink", recording_unlink)
 
     prepare_local_runtime_assets(preflight, interfuser_user_cache=user_cache)
 
     destination = preflight.root / _INTERFUSER_BACKBONE_PATH
     assert destination.read_bytes() == backbone_payload
     assert events[0] == ("fsync", "file")
-    assert events[1][0] == "replace"
-    assert events[1][2:] == (destination.name, True)
-    assert events[2] == ("fsync", "directory")
+    assert events[1][0] == "link"
+    assert events[1][2:] == (destination.name, True, False)
+    assert events[2] == ("unlink", events[1][1])
+    assert events[3] == ("fsync", "directory")
+    assert not any(path.name.startswith(".asset-") for path in destination.parent.iterdir())
+
+
+@pytest.mark.parametrize("racer_kind", ("regular", "symlink"))
+def test_prepare_atomic_install_never_clobbers_destination_created_at_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    racer_kind: str,
+):
+    """publication 직전 생긴 regular file이나 symlink를 atomic no-clobber로 보존한다."""
+    checkpoint_payload = b"checkpoint"
+    backbone_payload = b"cached backbone" * 4096
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), _bytes_sha256(backbone_payload)
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    _write_asset(preflight.root, _INTERFUSER_CHECKPOINT_PATH, checkpoint_payload)
+    user_cache = _write_asset(tmp_path, Path("user/cache/backbone.pth"), backbone_payload)
+    destination = preflight.root / _INTERFUSER_BACKBONE_PATH
+    symlink_target = tmp_path / "race-target.pth"
+    symlink_target.write_bytes(b"outside")
+    raced: dict[str, int] = {}
+    real_link = os.link
+    real_replace = os.replace
+
+    def create_racer(name: str, parent_descriptor: int) -> None:
+        if racer_kind == "regular":
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                os.write(descriptor, b"racer content")
+            finally:
+                os.close(descriptor)
+        else:
+            os.symlink(str(symlink_target), name, dir_fd=parent_descriptor)
+        raced["inode"] = os.stat(
+            name, dir_fd=parent_descriptor, follow_symlinks=False
+        ).st_ino
+
+    def racing_link(
+        source: str,
+        destination_name: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        assert src_dir_fd is not None and dst_dir_fd is not None
+        create_racer(destination_name, dst_dir_fd)
+        real_link(
+            source,
+            destination_name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    def racing_replace(
+        source: str,
+        destination_name: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        assert src_dir_fd is not None and dst_dir_fd is not None
+        create_racer(destination_name, dst_dir_fd)
+        real_replace(
+            source,
+            destination_name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(environment_setup.os, "link", racing_link)
+    monkeypatch.setattr(environment_setup.os, "replace", racing_replace)
+
+    with pytest.raises(EnvironmentSetupError, match="already exists|overwrite") as caught:
+        prepare_local_runtime_assets(preflight, interfuser_user_cache=user_cache)
+
+    assert caught.value.action == "assets"
+    assert destination.lstat().st_ino == raced["inode"]
+    if racer_kind == "regular":
+        assert destination.read_bytes() == b"racer content"
+    else:
+        assert destination.is_symlink()
+        assert Path(os.readlink(destination)) == symlink_target
     assert not any(path.name.startswith(".asset-") for path in destination.parent.iterdir())
 
 

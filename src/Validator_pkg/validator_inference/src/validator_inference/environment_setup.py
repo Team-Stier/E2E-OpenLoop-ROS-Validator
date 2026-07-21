@@ -1148,7 +1148,7 @@ def _copy_interfuser_user_cache(
     declaration: _RuntimeAssetDeclaration,
     user_cache: Path,
 ) -> bool:
-    """user cache가 있으면 same-fd hash와 atomic sibling install로 project에 복사한다."""
+    """user cache가 있으면 same-fd hash와 atomic no-clobber install로 복사한다."""
     source = _canonical_absolute_posix_path(
         user_cache, "InterFuser user cache", _ASSETS_ACTION
     )
@@ -1210,25 +1210,20 @@ def _copy_interfuser_user_cache(
                         os.close(temporary_descriptor)
                         temporary_descriptor = None
                         try:
-                            os.stat(
+                            os.link(
+                                temporary_name,
                                 declaration.absolute_path.name,
-                                dir_fd=parent_descriptor,
+                                src_dir_fd=parent_descriptor,
+                                dst_dir_fd=parent_descriptor,
                                 follow_symlinks=False,
                             )
-                        except FileNotFoundError:
-                            pass
-                        else:
-                            _raise(
+                        except FileExistsError as exc:
+                            raise EnvironmentSetupError(
                                 _ASSETS_ACTION,
-                                "runtime asset destination appeared during copy; "
-                                "refusing to overwrite",
-                            )
-                        os.replace(
-                            temporary_name,
-                            declaration.absolute_path.name,
-                            src_dir_fd=parent_descriptor,
-                            dst_dir_fd=parent_descriptor,
-                        )
+                                "runtime asset destination already exists; refusing "
+                                f"to overwrite: {declaration.absolute_path}",
+                            ) from exc
+                        os.unlink(temporary_name, dir_fd=parent_descriptor)
                         temporary_name = None
                         os.fsync(parent_descriptor)
                     except EnvironmentSetupError:
