@@ -271,6 +271,39 @@ def test_xmlrpc_request_uses_only_the_remaining_monotonic_deadline():
     }
 
 
+def test_xmlrpc_request_closes_server_proxy_transport_without_remote_close():
+    """Python 3.8 ServerProxy의 동적 ``close`` 원격 method를 호출하지 않는다."""
+    observed = []
+
+    class Proxy:
+        """ServerProxy의 private local close와 동적 remote method 동작을 흉내 낸다."""
+
+        def getPid(self, *_arguments):
+            """정상 master 응답을 반환한다."""
+            return [1, "ready", 42]
+
+        def _ServerProxy__close(self):
+            """실제 ServerProxy context manager가 쓰는 local transport close다."""
+            observed.append("local")
+
+        def __getattr__(self, name):
+            """존재하지 않는 이름이 원격 method가 되는 동작을 재현한다."""
+            if name == "close":
+                return lambda: observed.append("remote")
+            raise AttributeError(name)
+
+    _xmlrpc_request(
+        "http://127.0.0.1:43210/",
+        "getPid",
+        ("/validator_ros_compatibility",),
+        15.0,
+        monotonic=iter((10.0, 11.0)).__next__,
+        proxy_factory=lambda _uri, _timeout: Proxy(),
+    )
+
+    assert observed == ["local"]
+
+
 def test_master_readiness_requires_a_successful_xmlrpc_response():
     """listener가 열렸더라도 getPid XML-RPC 성공 응답 전에는 ready가 아니다."""
     responses = iter((OSError("accepted TCP only"), [0, "not ready", 0], [1, "ok", 7]))

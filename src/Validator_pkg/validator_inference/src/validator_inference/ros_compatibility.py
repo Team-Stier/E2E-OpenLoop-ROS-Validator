@@ -298,6 +298,17 @@ def _xmlrpc_proxy(master_uri: str, timeout_seconds: float) -> Any:
     )
 
 
+def _close_xmlrpc_proxy(proxy: object) -> None:
+    """ServerProxy transport를 원격 ``close`` method 호출 없이 local에서 닫는다."""
+    private_close = getattr(proxy, "_ServerProxy__close", None)
+    if callable(private_close):
+        private_close()
+        return
+    close_descriptor = getattr(type(proxy), "close", None)
+    if callable(close_descriptor):
+        close_descriptor(proxy)
+
+
 def _xmlrpc_request(
     master_uri: str,
     method_name: str,
@@ -320,9 +331,7 @@ def _xmlrpc_request(
             f"ROS master XML-RPC {method_name} failed: {exc}"
         ) from exc
     finally:
-        close = getattr(proxy, "close", None)
-        if callable(close):
-            close()
+        _close_xmlrpc_proxy(proxy)
     if monotonic() > deadline:
         raise RosCompatibilityError(
             f"ROS master XML-RPC {method_name} exceeded its deadline"
