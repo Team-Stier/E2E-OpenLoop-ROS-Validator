@@ -2714,6 +2714,11 @@ class _SetupRunner:
         self.source_commit = ""
         self.fail_phase: str | None = None
         self.candidate_cuda_available = True
+        self.post_sparse_git_status_output = ""
+        self.write_sparse_extensions = True
+        self.phase_hooks: dict[
+            str, Callable[[tuple[str, ...], dict[str, Any]], None]
+        ] = {}
 
     @staticmethod
     def _phase(command: tuple[str, ...]) -> str:
@@ -2785,7 +2790,11 @@ class _SetupRunner:
         elif phase == "source_head":
             stdout = self.source_commit + "\n"
         elif phase == "source_status":
-            stdout = self.git_status_output
+            stdout = (
+                self.post_sparse_git_status_output
+                if "sparse_build" in self.events
+                else self.git_status_output
+            )
         elif phase == "uv_venv":
             candidate = Path(command[-1])
             python = candidate / "bin" / "python"
@@ -2797,10 +2806,38 @@ class _SetupRunner:
             stdout = "1\n" if self.candidate_cuda_available else "0\n"
         elif phase == "freeze":
             stdout = self.freeze_output
+        elif phase == "sparse_build":
+            ops = Path(kwargs["cwd"])
+            build_output = ops / "build" / "temp.linux-x86_64-cpython-39"
+            build_output.mkdir(parents=True)
+            (build_output / "generated.o").write_bytes(b"object")
+            if self.write_sparse_extensions:
+                for module in (
+                    "deformable_aggregation_ext",
+                    "deformable_aggregation_with_depth_ext",
+                ):
+                    (ops / f"{module}.cpython-39-x86_64-linux-gnu.so").write_bytes(
+                        ("extension:" + module).encode("ascii")
+                    )
+            stdout = ""
+        elif phase == "sparse_imports":
+            ops = Path(command[-1])
+            stdout = json.dumps(
+                [
+                    str(ops / f"{module}.cpython-39-x86_64-linux-gnu.so")
+                    for module in (
+                        "deformable_aggregation_ext",
+                        "deformable_aggregation_with_depth_ext",
+                    )
+                ]
+            )
         elif phase == "unexpected":
             raise AssertionError(f"unexpected setup command: {command!r}")
         else:
             stdout = ""
+        hook = self.phase_hooks.get(phase)
+        if hook is not None:
+            hook(command, dict(kwargs))
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
 
@@ -2954,6 +2991,41 @@ def _setup_call(runner: _SetupRunner, phase: str):
     return matches[0]
 
 
+def _selected_runtime_asset_path(
+    root: Path,
+    dependencies: EnvironmentSetupDependencies,
+    model_id: str,
+    index: int = 0,
+) -> Path:
+    """setup fixture profile에서 한 runtime asset의 절대 경로를 반환한다."""
+    profile_path = root / "src" / "Validator_pkg" / "config" / "profile.json"
+    selected = dependencies.preflight_dependencies.load_profile(profile_path, model_id)
+    return root / selected.data["runtime_assets"][index]["path"]
+
+
+def _mutate_file_preserving_size_and_mtime(path: Path) -> None:
+    """fast fingerprint를 우회하는 same-size/mtime 변조를 만든다."""
+    before = path.lstat()
+    payload = path.read_bytes()
+    assert payload
+    path.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+
+_DIFFUSION_GENERATED_PATH = Path(
+    "models/sources/diffusiondrive_v2/navsim/agents/diffusiondrivev2/"
+    "diffusiondrivev2_model_sel_inference.py"
+)
+_SPARSE_EXTENSION_PATHS = tuple(
+    Path("models/sources/sparsedrive_v2/navsim/agents/sparsedrive/ops")
+    / f"{module}.cpython-39-x86_64-linux-gnu.so"
+    for module in (
+        "deformable_aggregation_ext",
+        "deformable_aggregation_with_depth_ext",
+    )
+)
+
+
 def test_setup_public_result_and_success_phase_contract_are_exact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -2990,8 +3062,13 @@ def test_setup_public_result_and_success_phase_contract_are_exact(
     assert result.warnings == ()
     assert environment_paths(root, "tfv6").current.resolve() == result.environment_dir
     assert lifecycle_events == ["state", "activate"]
-    assert events[:2] == [("asset_fetch", "tfv6"), ("asset_verify", "tfv6")]
-    assert events[-1][0] == "ros_smoke"
+    assert [event[0] for event in events] == [
+        "asset_fetch",
+        "asset_verify",
+        "ros_smoke",
+        "asset_verify",
+        "asset_verify",
+    ]
     assert [phase for _, _, phase in runner.calls] == [
         "host_uv",
         "catkin_build",
@@ -3005,6 +3082,10 @@ def test_setup_public_result_and_success_phase_contract_are_exact(
         "cuda_runtime",
         "model_load",
         "freeze",
+        "source_head",
+        "source_status",
+        "source_head",
+        "source_status",
     ]
     assert all(call[1]["check"] is True for call in runner.calls)
     assert all(call[1]["shell"] is False for call in runner.calls)
@@ -3378,3 +3459,621 @@ def test_setup_allows_only_exact_verified_diffusion_derivative_dirty_entry(
     )
 
     assert result.changed is True
+
+
+def test_setup_diffusion_state_fingerprints_derivative_and_reuse_rejects_tamper(
+    tmp_path: Path,
+):
+    """재생성된 derivative SHA를 state에 고정하고 self-attested 변조를 거부한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    derivative_status = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.git_status_output = derivative_status
+
+    first = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+
+    derivative = root / _DIFFUSION_GENERATED_PATH
+    assert first.state.assets[-1] == AssetFingerprint(
+        path=_DIFFUSION_GENERATED_PATH,
+        sha256=sha256_file(derivative),
+        size=derivative.lstat().st_size,
+        mtime_ns=derivative.lstat().st_mtime_ns,
+    )
+    _mutate_file_preserving_size_and_mtime(derivative)
+    reuse_runner = _SetupRunner(
+        root, "diffusiondrive_v2", first.state.python_version
+    )
+    reuse_runner.source_commit = first.state.source_commit
+    reuse_runner.git_status_output = derivative_status
+
+    with pytest.raises(EnvironmentSetupError, match="generated|fingerprint|SHA") as caught:
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            runner=reuse_runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "reuse_verification"
+    assert environment_paths(root, "diffusiondrive_v2").current.resolve() == (
+        first.environment_dir
+    )
+
+
+def test_setup_sparse_state_fingerprints_exact_built_extensions(tmp_path: Path):
+    """Sparse import가 선택한 두 in-place extension만 state asset으로 기록한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    runner.post_sparse_git_status_output = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+
+    result = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+
+    generated = result.state.assets[-2:]
+    assert tuple(item.path for item in generated) == _SPARSE_EXTENSION_PATHS
+    assert tuple(item.sha256 for item in generated) == tuple(
+        sha256_file(root / path) for path in _SPARSE_EXTENSION_PATHS
+    )
+    assert not (
+        root
+        / "models"
+        / "sources"
+        / "sparsedrive_v2"
+        / "navsim"
+        / "agents"
+        / "sparsedrive"
+        / "ops"
+        / "build"
+    ).exists()
+    sparse_import_call = _setup_call(runner, "sparse_imports")
+    assert sparse_import_call[1]["capture_output"] is True
+    assert sparse_import_call[1]["text"] is True
+
+
+def test_setup_sparse_reuse_rejects_saved_extension_sha_mismatch(tmp_path: Path):
+    """Sparse reuse는 같은 size/mtime의 compiled extension 변조도 SHA로 거부한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    _mutate_file_preserving_size_and_mtime(root / _SPARSE_EXTENSION_PATHS[0])
+    reuse_runner = _SetupRunner(root, "sparsedrive_v2", first.state.python_version)
+    reuse_runner.source_commit = first.state.source_commit
+    reuse_runner.git_status_output = extension_status
+
+    with pytest.raises(EnvironmentSetupError, match="fingerprint|SHA") as caught:
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=reuse_runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "reuse_verification"
+    assert environment_paths(root, "sparsedrive_v2").current.resolve() == (
+        first.environment_dir
+    )
+
+
+def test_setup_sparse_recreate_allows_exact_existing_extensions(tmp_path: Path):
+    """성공 setup이 남긴 exact 두 extension은 recreate source 검증을 통과한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    recreate_runner = _SetupRunner(
+        root, "sparsedrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = extension_status
+    recreate_runner.post_sparse_git_status_output = extension_status
+
+    recreated = setup_environment(
+        root,
+        "sparsedrive_v2",
+        recreate=True,
+        runner=recreate_runner,
+        dependencies=dependencies,
+    )
+
+    assert recreated.changed is True
+    assert recreated.environment_dir.name == "build-002"
+    assert environment_paths(root, "sparsedrive_v2").current.resolve() == (
+        recreated.environment_dir
+    )
+
+
+def test_setup_sparse_rejects_unattested_preexisting_exact_extensions(
+    tmp_path: Path,
+):
+    """active state가 없는 exact-name .so는 candidate 생성 전에 거부한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    for index, path in enumerate(_SPARSE_EXTENSION_PATHS):
+        absolute = root / path
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        absolute.write_bytes(f"untrusted:{index}".encode("ascii"))
+    runner.git_status_output = extension_status
+    runner.post_sparse_git_status_output = extension_status
+
+    with pytest.raises(EnvironmentSetupError, match="active state|authenticated"):
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert not any(phase == "uv_venv" for _, _, phase in runner.calls)
+    assert not environment_paths(root, "sparsedrive_v2").current.exists()
+
+
+def test_setup_sparse_recreate_rejects_extension_not_matching_active_state(
+    tmp_path: Path,
+):
+    """recreate도 active state 저장 SHA와 다른 preexisting .so를 신뢰하지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    _mutate_file_preserving_size_and_mtime(root / _SPARSE_EXTENSION_PATHS[0])
+    recreate_runner = _SetupRunner(
+        root, "sparsedrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = extension_status
+    recreate_runner.post_sparse_git_status_output = extension_status
+
+    with pytest.raises(EnvironmentSetupError, match="SHA|authenticated"):
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=dependencies,
+        )
+
+    assert not any(phase == "uv_venv" for _, _, phase in recreate_runner.calls)
+    assert environment_paths(root, "sparsedrive_v2").current.resolve() == (
+        first.environment_dir
+    )
+
+
+def test_setup_sparse_stale_state_requires_extension_rebuild(tmp_path: Path):
+    """stale lock state의 authenticated .so를 no-op build로 재인증하지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    stale_state = dataclasses.replace(first.state, lock_sha256="0" * 64)
+    environment_setup.write_environment_state(
+        first.environment_dir / ENVIRONMENT_STATE_FILENAME, stale_state
+    )
+    recreate_runner = _SetupRunner(
+        root, "sparsedrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = extension_status
+    recreate_runner.post_sparse_git_status_output = extension_status
+    recreate_runner.write_sparse_extensions = False
+
+    with pytest.raises(EnvironmentSetupError, match="rebuild|unchanged") as caught:
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "sparse_extensions"
+    assert environment_paths(root, "sparsedrive_v2").current.resolve() == (
+        first.environment_dir
+    )
+
+
+def test_setup_sparse_stale_state_accepts_rebuilt_extensions(tmp_path: Path):
+    """stale state라도 build가 두 .so identity를 교체하면 새 state로 복구한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    stale_state = dataclasses.replace(first.state, lock_sha256="0" * 64)
+    environment_setup.write_environment_state(
+        first.environment_dir / ENVIRONMENT_STATE_FILENAME, stale_state
+    )
+    recreate_runner = _SetupRunner(
+        root, "sparsedrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = extension_status
+    recreate_runner.post_sparse_git_status_output = extension_status
+
+    def replace_extensions(
+        _command: tuple[str, ...], _kwargs: dict[str, Any]
+    ) -> None:
+        for path in _SPARSE_EXTENSION_PATHS:
+            absolute = root / path
+            replacement = absolute.with_name(absolute.name + ".rebuilt")
+            replacement.write_bytes(absolute.read_bytes() + b":rebuilt")
+            os.replace(replacement, absolute)
+
+    recreate_runner.phase_hooks["sparse_build"] = replace_extensions
+
+    recreated = setup_environment(
+        root,
+        "sparsedrive_v2",
+        recreate=True,
+        runner=recreate_runner,
+        dependencies=dependencies,
+    )
+
+    assert recreated.changed is True
+    assert recreated.state.lock_sha256 == first.state.lock_sha256
+    assert environment_paths(root, "sparsedrive_v2").current.resolve() == (
+        recreated.environment_dir
+    )
+
+
+def test_setup_revalidates_runtime_asset_immediately_before_state_and_activation(
+    tmp_path: Path,
+):
+    """긴 candidate build 중 runtime asset 변조는 state/current를 남기지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    paths = environment_paths(root, "tfv6")
+    old = create_candidate(paths, "old-build")
+    paths.current.symlink_to(Path("builds/old-build"))
+    runtime_asset = _selected_runtime_asset_path(root, dependencies, "tfv6")
+    runner.phase_hooks["model_load"] = lambda _command, _kwargs: (
+        _mutate_file_preserving_size_and_mtime(runtime_asset)
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="changed during setup") as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert caught.value.action == "setup_revalidation"
+    assert paths.current.resolve() == old
+    assert not (paths.builds / "build-001" / ENVIRONMENT_STATE_FILENAME).exists()
+
+
+def test_setup_revalidates_again_after_state_write_before_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """state write 중 asset이 바뀌면 completion state를 지우고 old current를 보존한다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    paths = environment_paths(root, "tfv6")
+    old = create_candidate(paths, "old-build")
+    paths.current.symlink_to(Path("builds/old-build"))
+    runtime_asset = _selected_runtime_asset_path(root, dependencies, "tfv6")
+    real_write = environment_setup.write_environment_state
+
+    def write_then_mutate(path: Path, state: EnvironmentState) -> None:
+        real_write(path, state)
+        _mutate_file_preserving_size_and_mtime(runtime_asset)
+
+    monkeypatch.setattr(environment_setup, "write_environment_state", write_then_mutate)
+
+    with pytest.raises(EnvironmentSetupError, match="changed during setup") as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert caught.value.action == "setup_revalidation"
+    assert paths.current.resolve() == old
+    assert not (paths.builds / "build-001" / ENVIRONMENT_STATE_FILENAME).exists()
+
+
+def test_setup_revalidates_source_immediately_before_state_and_activation(
+    tmp_path: Path,
+):
+    """model load 중 source checkout 변경도 검증 완료 state로 승격하지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    paths = environment_paths(root, "tfv6")
+    old = create_candidate(paths, "old-build")
+    paths.current.symlink_to(Path("builds/old-build"))
+    runner.phase_hooks["model_load"] = lambda _command, _kwargs: setattr(
+        runner, "git_status_output", " M tracked.py\n"
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="dirty") as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert caught.value.action == "source_verification"
+    assert paths.current.resolve() == old
+    assert not (paths.builds / "build-001" / ENVIRONMENT_STATE_FILENAME).exists()
+
+
+def test_setup_revalidates_generated_derivative_before_activation(tmp_path: Path):
+    """model load 중 derivative 변조는 verifier의 self hash와 무관하게 실패한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    runner.git_status_output = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    derivative = root / _DIFFUSION_GENERATED_PATH
+    runner.phase_hooks["model_load"] = lambda _command, _kwargs: (
+        _mutate_file_preserving_size_and_mtime(derivative)
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="changed during setup") as caught:
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "setup_revalidation"
+    paths = environment_paths(root, "diffusiondrive_v2")
+    assert not paths.current.exists()
+    assert not (paths.builds / "build-001" / ENVIRONMENT_STATE_FILENAME).exists()
+
+
+def test_setup_sparse_rejects_build_dirty_output_outside_exact_extensions(
+    tmp_path: Path,
+):
+    """Sparse build 후 exact extension 외 source 출력은 activation 전에 차단한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    runner.post_sparse_git_status_output = "".join(
+        [
+            *(
+                f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+                for path in _SPARSE_EXTENSION_PATHS
+            ),
+            "?? navsim/agents/sparsedrive/ops/unexpected_build_output.py\n",
+        ]
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="dirty") as caught:
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "source_verification"
+    paths = environment_paths(root, "sparsedrive_v2")
+    assert not paths.current.exists()
+    assert not (paths.builds / "build-001" / ENVIRONMENT_STATE_FILENAME).exists()
+
+
+def test_setup_sparse_preserves_and_rejects_preexisting_build_tree(tmp_path: Path):
+    """setup은 사용자가 남긴 ops/build를 삭제하거나 재사용하지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    build = (
+        root
+        / "models"
+        / "sources"
+        / "sparsedrive_v2"
+        / "navsim"
+        / "agents"
+        / "sparsedrive"
+        / "ops"
+        / "build"
+    )
+    build.mkdir(parents=True)
+    user_file = build / "user-diagnostic.txt"
+    user_file.write_text("keep\n", encoding="utf-8")
+
+    with pytest.raises(EnvironmentSetupError, match="pre-existing.*build") as caught:
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "sparse_extensions"
+    assert user_file.read_text(encoding="utf-8") == "keep\n"
+    assert not any(phase == "sparse_build" for _, _, phase in runner.calls)
+
+
+def test_setup_sparse_cleanup_preserves_replaced_build_directory(tmp_path: Path):
+    """build 중 root inode가 교체되면 replacement를 삭제하지 않고 실패한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    build = (
+        root
+        / "models"
+        / "sources"
+        / "sparsedrive_v2"
+        / "navsim"
+        / "agents"
+        / "sparsedrive"
+        / "ops"
+        / "build"
+    )
+    marker = build / "concurrent-owner.txt"
+
+    def replace_build_tree(_command: tuple[str, ...], _kwargs: dict[str, Any]) -> None:
+        shutil.rmtree(build)
+        build.mkdir()
+        marker.write_text("preserve\n", encoding="utf-8")
+
+    runner.phase_hooks["sparse_build"] = replace_build_tree
+
+    with pytest.raises(EnvironmentSetupError, match="changed|replaced") as caught:
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "sparse_extensions"
+    assert marker.read_text(encoding="utf-8") == "preserve\n"
+    assert not environment_paths(root, "sparsedrive_v2").current.exists()
+
+
+def test_setup_sparse_cleanup_does_not_follow_replacement_after_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """ownership check 뒤 교체된 nonempty build root는 dirfd cleanup이 삭제하지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    build = (
+        root
+        / "models"
+        / "sources"
+        / "sparsedrive_v2"
+        / "navsim"
+        / "agents"
+        / "sparsedrive"
+        / "ops"
+        / "build"
+    )
+    moved = build.with_name("owned-build-moved")
+    marker = build / "concurrent-owner.txt"
+
+    def replace_before_fd_cleanup(_descriptor: int) -> None:
+        build.rename(moved)
+        build.mkdir()
+        marker.write_text("preserve\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        environment_setup,
+        "_clear_sparse_build_tree_fd",
+        replace_before_fd_cleanup,
+        raising=False,
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="changed|replaced") as caught:
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "sparse_extensions"
+    assert marker.read_text(encoding="utf-8") == "preserve\n"
+    assert moved.is_dir()
+    assert not environment_paths(root, "sparsedrive_v2").current.exists()
+
+
+def test_setup_reuse_revalidates_assets_after_runtime_checks(tmp_path: Path):
+    """reuse deep check 뒤 발생한 same-metadata 변조도 반환 직전에 탐지한다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    first = setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+    runtime_asset = root / first.state.assets[0].path
+    reuse_runner = _SetupRunner(root, "tfv6", first.state.python_version)
+    reuse_runner.source_commit = first.state.source_commit
+    reuse_runner.phase_hooks["model_load"] = lambda _command, _kwargs: (
+        _mutate_file_preserving_size_and_mtime(runtime_asset)
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="changed during verification") as caught:
+        setup_environment(
+            root,
+            "tfv6",
+            runner=reuse_runner,
+            dependencies=dependencies,
+        )
+
+    assert caught.value.action == "reuse_verification"
+    assert environment_paths(root, "tfv6").current.resolve() == first.environment_dir

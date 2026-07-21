@@ -139,6 +139,11 @@ _SETUP_PREFLIGHT_IDS = (
 _DIFFUSION_DERIVATIVE = Path(
     "navsim/agents/diffusiondrivev2/diffusiondrivev2_model_sel_inference.py"
 )
+_SPARSE_OPS = Path("navsim/agents/sparsedrive/ops")
+_SPARSE_EXTENSION_MODULES = (
+    "deformable_aggregation_ext",
+    "deformable_aggregation_with_depth_ext",
+)
 
 
 def _read_host_os_release() -> Mapping[str, str]:
@@ -2781,13 +2786,11 @@ def _call_asset_verifier(
     return metadata
 
 
-def _validate_source_checkout(
+def _source_checkout_from_metadata(
     preflight: EnvironmentPreflight,
     metadata: Mapping[str, Any],
-    dependencies: EnvironmentSetupDependencies,
-    runner: Callable[..., Any],
-) -> None:
-    """source HEAD와 tracked/untracked dirty entries를 pinned contract와 대조한다."""
+) -> Path:
+    """asset verifier metadata의 checkout을 실제 project source directory로 제한한다."""
     source = metadata.get("source")
     if not isinstance(source, Mapping):
         _raise("source_verification", "asset verifier returned no source metadata")
@@ -2800,6 +2803,22 @@ def _validate_source_checkout(
         checkout.relative_to(preflight.root / "models" / "sources")
     except ValueError:
         _raise("source_verification", "source checkout escapes models/sources")
+    return checkout
+
+
+def _validate_source_checkout(
+    preflight: EnvironmentPreflight,
+    metadata: Mapping[str, Any],
+    dependencies: EnvironmentSetupDependencies,
+    runner: Callable[..., Any],
+    *,
+    allowed_generated_paths: Sequence[Path] = (),
+) -> Path:
+    """source HEAD와 tracked/untracked dirty entries를 pinned contract와 대조한다."""
+    source = metadata.get("source")
+    if not isinstance(source, Mapping):
+        _raise("source_verification", "asset verifier returned no source metadata")
+    checkout = _source_checkout_from_metadata(preflight, metadata)
     git = _lookup_preflight_executable(
         dependencies.preflight_dependencies, "git", "git"
     )
@@ -2840,30 +2859,349 @@ def _validate_source_checkout(
     status = _setup_stdout(
         status_result, "source_verification", "git status"
     )
+    allowed_paths: set[str] = set()
+    for generated in allowed_generated_paths:
+        value = Path(generated)
+        if (
+            value.is_absolute()
+            or not value.parts
+            or any(part in {"", ".", ".."} for part in value.parts)
+        ):
+            _raise("source_verification", "generated source path is invalid")
+        allowed_paths.add(value.as_posix())
     dirty_lines = tuple(line for line in status.splitlines() if line)
-    if not dirty_lines:
-        return
-    derivative = source.get("local_derivative")
-    allowed = False
-    if (
-        preflight.definition.model_id == "diffusiondrive_v2"
-        and len(dirty_lines) == 1
-        and len(dirty_lines[0]) > 3
-        and dirty_lines[0][3:] == _DIFFUSION_DERIVATIVE.as_posix()
-        and isinstance(derivative, Mapping)
-        and derivative.get("path") == _DIFFUSION_DERIVATIVE.as_posix()
-        and isinstance(derivative.get("sha256"), str)
-    ):
-        derivative_path = checkout / _DIFFUSION_DERIVATIVE
-        try:
-            allowed = sha256_file(derivative_path) == derivative["sha256"]
-        except OSError:
-            allowed = False
-    if not allowed:
+    invalid_lines = tuple(
+        line
+        for line in dirty_lines
+        if len(line) <= 3
+        or line[:3] != "?? "
+        or line[3:] not in allowed_paths
+    )
+    if invalid_lines:
         _raise(
             "source_verification",
-            "source checkout is dirty: " + ", ".join(dirty_lines),
+            "source checkout is dirty: " + ", ".join(invalid_lines),
         )
+    return checkout
+
+
+def _generated_artifact_declaration(
+    preflight: EnvironmentPreflight,
+    relative_path: Path,
+    role: str,
+) -> _RuntimeAssetDeclaration:
+    """검증 대상으로 정한 repository-local generated file 선언을 만든다."""
+    relative = Path(relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        _raise(_ASSETS_ACTION, f"generated artifact path is invalid: {relative}")
+    absolute = _canonical_absolute_posix_path(
+        preflight.root.joinpath(*relative.parts),
+        f"generated artifact {role}",
+        _ASSETS_ACTION,
+    )
+    return _RuntimeAssetDeclaration(
+        role=role,
+        relative_path=relative,
+        absolute_path=absolute,
+        expected_sha256=None,
+        payload={},
+    )
+
+
+def _diffusion_generated_path(
+    preflight: EnvironmentPreflight, checkout: Path
+) -> Path:
+    """Diffusion derivative의 project-relative 고정 경로를 반환한다."""
+    try:
+        checkout_relative = checkout.relative_to(preflight.root)
+    except ValueError:
+        _raise(_ASSETS_ACTION, "Diffusion source checkout escapes project root")
+    return checkout_relative / _DIFFUSION_DERIVATIVE
+
+
+def _is_sparse_extension_filename(module: str, filename: str) -> bool:
+    """한 exact Sparse module의 CPython extension filename인지 확인한다."""
+    return (
+        filename == f"{module}.so"
+        or (
+            filename.startswith(f"{module}.")
+            and filename.endswith(".so")
+            and len(filename) > len(module) + len(".so") + 1
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _SparseGeneratedBaseline:
+    """인증된 기존 Sparse extension identity와 rebuild 필요 여부를 보관한다."""
+
+    paths: tuple[Path, ...]
+    identities: tuple[tuple[int, int, int], ...]
+    require_rebuild: bool
+
+
+def _existing_sparse_generated_paths(
+    preflight: EnvironmentPreflight, checkout: Path
+) -> tuple[Path, ...]:
+    """이전 성공 build가 남긴 exact Sparse extension regular files만 찾는다."""
+    ops = checkout / _SPARSE_OPS
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    with _open_absolute_nofollow(
+        ops, flags, "source_verification", "SparseDrive ops"
+    ) as descriptor:
+        try:
+            names = tuple(sorted(os.listdir(descriptor)))
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "source_verification", "cannot inspect SparseDrive generated extensions"
+            ) from exc
+        selected: list[Path] = []
+        for module in _SPARSE_EXTENSION_MODULES:
+            matches = tuple(
+                name for name in names if _is_sparse_extension_filename(module, name)
+            )
+            if len(matches) > 1:
+                _raise(
+                    "source_verification",
+                    f"multiple generated SparseDrive extensions found for {module}",
+                )
+            if not matches:
+                continue
+            name = matches[0]
+            try:
+                metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    "source_verification",
+                    f"cannot inspect generated SparseDrive extension: {name}",
+                ) from exc
+            if not stat.S_ISREG(metadata.st_mode):
+                _raise(
+                    "source_verification",
+                    f"generated SparseDrive extension is not a regular file: {name}",
+                )
+            try:
+                selected.append((ops / name).relative_to(preflight.root))
+            except ValueError:
+                _raise(
+                    "source_verification",
+                    "generated SparseDrive extension escapes project root",
+                )
+    return tuple(selected)
+
+
+def _sparse_generated_identities(
+    preflight: EnvironmentPreflight,
+    paths: Sequence[Path],
+    action: str,
+) -> tuple[tuple[int, int, int], ...]:
+    """exact Sparse extension의 device/inode/mtime identity를 안전하게 읽는다."""
+    identities: list[tuple[int, int, int]] = []
+    for relative in paths:
+        absolute = preflight.root.joinpath(*Path(relative).parts)
+        with _open_regular_file(
+            absolute, action, f"generated SparseDrive extension {relative}"
+        ) as (_, metadata):
+            identities.append(
+                (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns)
+            )
+    return tuple(identities)
+
+
+def _authenticate_existing_sparse_generated_paths(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    paths: Sequence[Path],
+    active_state: Optional[EnvironmentState],
+    manifest_sha256: str,
+) -> _SparseGeneratedBaseline:
+    """기존 Sparse .so pair를 active state SHA로 인증하고 rebuild 정책을 정한다."""
+    selected = tuple(Path(path) for path in paths)
+    if not selected:
+        return _SparseGeneratedBaseline((), (), False)
+    selected = _validate_sparse_generated_paths(
+        preflight, checkout, selected, "source_verification"
+    )
+    if active_state is None:
+        _raise(
+            "source_verification",
+            "pre-existing SparseDrive extensions require an authenticated active state",
+        )
+    if active_state.model_id != preflight.definition.model_id:
+        _raise(
+            "source_verification",
+            "active state cannot authenticate SparseDrive extensions for this model",
+        )
+    if len(active_state.assets) < len(_SPARSE_EXTENSION_MODULES):
+        _raise(
+            "source_verification",
+            "active state is missing authenticated SparseDrive extensions",
+        )
+    saved = tuple(active_state.assets[-len(_SPARSE_EXTENSION_MODULES) :])
+    saved_paths = _validate_sparse_generated_paths(
+        preflight,
+        checkout,
+        tuple(item.path for item in saved),
+        "source_verification",
+    )
+    if selected != saved_paths:
+        _raise(
+            "source_verification",
+            "pre-existing SparseDrive extensions do not match the active state",
+        )
+    observed = _fingerprint_generated_artifacts(
+        preflight, checkout, sparse_paths=selected
+    )
+    if observed != saved:
+        _raise(
+            "source_verification",
+            "pre-existing SparseDrive extension SHA does not match the active state",
+        )
+    current_contract = (
+        active_state.schema == ENVIRONMENT_STATE_SCHEMA
+        and active_state.model_id == preflight.definition.model_id
+        and active_state.python_version == preflight.definition.python_version
+        and active_state.python_platform == EXPECTED_PYTHON_PLATFORM
+        and active_state.uv_version == EXPECTED_UV_VERSION
+        and active_state.manifest_sha256 == manifest_sha256
+        and active_state.lock_sha256
+        == preflight.definition.requirements_lock_sha256
+        and active_state.source_commit == preflight.definition.source_commit
+        and active_state.preflight_ids == _SETUP_PREFLIGHT_IDS
+    )
+    return _SparseGeneratedBaseline(
+        selected,
+        _sparse_generated_identities(
+            preflight, selected, "source_verification"
+        ),
+        not current_contract,
+    )
+
+
+def _validate_sparse_generated_paths(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    paths: Sequence[Path],
+    action: str,
+) -> tuple[Path, ...]:
+    """Sparse state/import origin을 ops root의 exact 두 ABI extension으로 제한한다."""
+    selected = tuple(Path(path) for path in paths)
+    try:
+        ops_relative = (checkout / _SPARSE_OPS).relative_to(preflight.root)
+    except ValueError:
+        _raise(action, "SparseDrive ops directory escapes project root")
+    if len(selected) != len(_SPARSE_EXTENSION_MODULES):
+        _raise(action, "SparseDrive requires exactly two generated extensions")
+    for module, relative in zip(_SPARSE_EXTENSION_MODULES, selected):
+        if (
+            relative.is_absolute()
+            or relative.parent != ops_relative
+            or not _is_sparse_extension_filename(module, relative.name)
+        ):
+            _raise(action, f"invalid generated SparseDrive extension: {relative}")
+    if len(set(selected)) != len(selected):
+        _raise(action, "generated SparseDrive extension paths must be unique")
+    return selected
+
+
+def _source_relative_generated_paths(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    project_relative_paths: Sequence[Path],
+    action: str,
+) -> tuple[Path, ...]:
+    """generated project paths를 검증된 checkout 기준 경로로 바꾼다."""
+    values: list[Path] = []
+    for relative in project_relative_paths:
+        try:
+            values.append((preflight.root / relative).relative_to(checkout))
+        except ValueError:
+            _raise(action, f"generated artifact is outside source checkout: {relative}")
+    return tuple(values)
+
+
+def _fingerprint_generated_artifacts(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    *,
+    sparse_paths: Sequence[Path] = (),
+) -> tuple[AssetFingerprint, ...]:
+    """선택 model의 executable generated source/native artifacts를 deep hash한다."""
+    model_id = preflight.definition.model_id
+    if model_id == "diffusiondrive_v2":
+        if sparse_paths:
+            _raise(_ASSETS_ACTION, "DiffusionDrive cannot declare Sparse extensions")
+        declarations = (
+            _generated_artifact_declaration(
+                preflight,
+                _diffusion_generated_path(preflight, checkout),
+                "diffusiondrive_derivative",
+            ),
+        )
+    elif model_id == "sparsedrive_v2":
+        selected = _validate_sparse_generated_paths(
+            preflight, checkout, sparse_paths, _ASSETS_ACTION
+        )
+        declarations = tuple(
+            _generated_artifact_declaration(
+                preflight, relative, f"sparse_extension:{module}"
+            )
+            for module, relative in zip(_SPARSE_EXTENSION_MODULES, selected)
+        )
+    else:
+        if sparse_paths:
+            _raise(_ASSETS_ACTION, "model does not declare generated extensions")
+        declarations = ()
+    return tuple(_fingerprint_runtime_asset(value) for value in declarations)
+
+
+def _state_generated_paths(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    state: EnvironmentState,
+    runtime_count: int,
+) -> tuple[Path, ...]:
+    """state tail이 model별 exact generated artifact set인지 검증해 반환한다."""
+    tail = tuple(item.path for item in state.assets[runtime_count:])
+    model_id = preflight.definition.model_id
+    if model_id == "diffusiondrive_v2":
+        expected = (_diffusion_generated_path(preflight, checkout),)
+        if tail != expected:
+            _raise(
+                "reuse_verification",
+                "state is missing the trusted DiffusionDrive derivative fingerprint",
+            )
+        return tail
+    if model_id == "sparsedrive_v2":
+        return _validate_sparse_generated_paths(
+            preflight, checkout, tail, "reuse_verification"
+        )
+    if tail:
+        _raise("reuse_verification", "state contains unexpected generated artifacts")
+    return ()
+
+
+def _fingerprint_environment_inputs(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    generated_paths: Sequence[Path] = (),
+) -> tuple[AssetFingerprint, ...]:
+    """runtime assets와 model별 executable generated artifacts를 한 snapshot으로 묶는다."""
+    runtime = fingerprint_runtime_assets(preflight)
+    generated = _fingerprint_generated_artifacts(
+        preflight,
+        checkout,
+        sparse_paths=(
+            generated_paths
+            if preflight.definition.model_id == "sparsedrive_v2"
+            else ()
+        ),
+    )
+    return runtime + generated
 
 
 def _candidate_install_environment(candidate: Path) -> dict[str, str]:
@@ -2930,32 +3268,237 @@ def _validate_candidate_python_version(
         )
 
 
+def _reserve_sparse_build_tree(build_directory: Path) -> int:
+    """부재한 ops/build를 선점하고 inode 재사용을 막는 directory fd를 반환한다."""
+    try:
+        build_directory.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise EnvironmentSetupError(
+            "sparse_extensions",
+            f"pre-existing SparseDrive build tree must be preserved: {build_directory}",
+        ) from exc
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            "sparse_extensions", "cannot reserve SparseDrive build tree"
+        ) from exc
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            str(build_directory),
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        metadata = os.fstat(descriptor)
+        path_metadata = build_directory.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            _raise(
+                "sparse_extensions",
+                "reserved SparseDrive build path is not a real directory",
+            )
+        if (
+            path_metadata.st_dev != metadata.st_dev
+            or path_metadata.st_ino != metadata.st_ino
+        ):
+            _raise("sparse_extensions", "SparseDrive build tree changed during reserve")
+        _fsync_directory(
+            build_directory.parent, "sparse_extensions", "SparseDrive ops"
+        )
+    except BaseException:
+        remove_owned_entry = False
+        if descriptor is not None:
+            try:
+                expected = os.fstat(descriptor)
+                actual = build_directory.lstat()
+                remove_owned_entry = (
+                    stat.S_ISDIR(actual.st_mode)
+                    and not stat.S_ISLNK(actual.st_mode)
+                    and actual.st_dev == expected.st_dev
+                    and actual.st_ino == expected.st_ino
+                )
+            except OSError:
+                pass
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if remove_owned_entry:
+            try:
+                build_directory.rmdir()
+            except OSError:
+                pass
+        raise
+    if descriptor is None:
+        _raise("sparse_extensions", "SparseDrive build reservation lost its descriptor")
+    return descriptor
+
+
+def _sparse_build_entry_metadata(
+    parent_descriptor: int, name: str
+) -> os.stat_result:
+    """열린 ops dir 기준 build entry를 symlink를 따르지 않고 검사한다."""
+    try:
+        return os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        _raise(
+            "sparse_extensions",
+            "generated SparseDrive build tree changed or was removed",
+        )
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            "sparse_extensions", "cannot inspect generated SparseDrive build tree"
+        ) from exc
+
+
+def _require_sparse_build_identity(
+    metadata: os.stat_result, expected: os.stat_result
+) -> None:
+    """build name이 선점 당시 열린 directory와 같은 inode인지 확인한다."""
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_dev != expected.st_dev
+        or metadata.st_ino != expected.st_ino
+    ):
+        _raise(
+            "sparse_extensions",
+            "generated SparseDrive build tree changed or was replaced; preserving it",
+        )
+
+
+def _clear_sparse_build_tree_fd(descriptor: int) -> None:
+    """열린 build dir 아래 entry를 dir_fd 상대 연산으로만 재귀 삭제한다."""
+    try:
+        names = tuple(sorted(os.listdir(descriptor)))
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            "sparse_extensions", "cannot inspect generated SparseDrive build contents"
+        ) from exc
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for name in names:
+        try:
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions",
+                "generated SparseDrive build contents changed during cleanup",
+            ) from exc
+        if stat.S_ISDIR(metadata.st_mode):
+            child_descriptor: Optional[int] = None
+            try:
+                child_descriptor = os.open(
+                    name, directory_flags, dir_fd=descriptor
+                )
+                opened = os.fstat(child_descriptor)
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                ):
+                    _raise(
+                        "sparse_extensions",
+                        "generated SparseDrive build contents changed during cleanup",
+                    )
+                _clear_sparse_build_tree_fd(child_descriptor)
+                current = os.stat(
+                    name, dir_fd=descriptor, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or current.st_dev != opened.st_dev
+                    or current.st_ino != opened.st_ino
+                ):
+                    _raise(
+                        "sparse_extensions",
+                        "generated SparseDrive build contents changed during cleanup",
+                    )
+                os.rmdir(name, dir_fd=descriptor)
+            except EnvironmentSetupError:
+                raise
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    "sparse_extensions",
+                    "cannot remove generated SparseDrive build contents",
+                ) from exc
+            finally:
+                if child_descriptor is not None:
+                    try:
+                        os.close(child_descriptor)
+                    except OSError:
+                        pass
+            continue
+        try:
+            os.unlink(name, dir_fd=descriptor)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions",
+                "cannot remove generated SparseDrive build contents",
+            ) from exc
+
+
+def _remove_created_sparse_build_tree(
+    build_directory: Path, descriptor: int
+) -> None:
+    """이번 Sparse build가 만든 intermediate tree만 symlink-safe하게 제거한다."""
+    try:
+        expected = os.fstat(descriptor)
+        parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        with _open_absolute_nofollow(
+            build_directory.parent,
+            parent_flags,
+            "sparse_extensions",
+            "SparseDrive ops",
+        ) as parent_descriptor:
+            metadata = _sparse_build_entry_metadata(
+                parent_descriptor, build_directory.name
+            )
+            _require_sparse_build_identity(metadata, expected)
+            _clear_sparse_build_tree_fd(descriptor)
+            metadata = _sparse_build_entry_metadata(
+                parent_descriptor, build_directory.name
+            )
+            _require_sparse_build_identity(metadata, expected)
+            try:
+                os.rmdir(build_directory.name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    "sparse_extensions",
+                    "cannot remove generated SparseDrive build tree",
+                ) from exc
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 def _run_sparse_setup_action(
     preflight: EnvironmentPreflight,
     candidate_python: Path,
     dependencies: EnvironmentSetupDependencies,
     runner: Callable[..., Any],
-) -> None:
+    *,
+    baseline: Optional[_SparseGeneratedBaseline] = None,
+) -> tuple[AssetFingerprint, ...]:
     """SparseDrive의 유일한 declared CUDA extension action을 exact 환경에서 실행한다."""
     actions = preflight.definition.setup_actions
     if not actions:
-        return
+        return ()
     if (
         preflight.definition.model_id != "sparsedrive_v2"
         or actions != ("build_sparsedrive_cuda_extensions",)
     ):
         _raise("sparse_extensions", "unsupported setup action contract")
-    ops = (
-        preflight.root
-        / "models"
-        / "sources"
-        / "sparsedrive_v2"
-        / "navsim"
-        / "agents"
-        / "sparsedrive"
-        / "ops"
-    )
+    checkout = preflight.root / "models" / "sources" / "sparsedrive_v2"
+    ops = checkout / _SPARSE_OPS
     _require_real_directory(ops, "sparse_extensions", "SparseDrive ops")
+    build_directory = ops / "build"
     build_environment = _candidate_install_environment(candidate_python.parent.parent)
     build_environment.update(
         {
@@ -2966,30 +3509,90 @@ def _run_sparse_setup_action(
             "CXX": str(dependencies.preflight_dependencies.gxx_path),
         }
     )
-    _run_setup_command(
-        runner,
-        (str(candidate_python), "setup.py", "build_ext", "--inplace"),
-        "sparse_extensions",
-        cwd=ops,
-        env=build_environment,
-        timeout=_MODEL_LOAD_TIMEOUT_SECONDS,
-    )
+    build_descriptor = _reserve_sparse_build_tree(build_directory)
+    try:
+        _run_setup_command(
+            runner,
+            (str(candidate_python), "setup.py", "build_ext", "--inplace"),
+            "sparse_extensions",
+            cwd=ops,
+            env=build_environment,
+            timeout=_MODEL_LOAD_TIMEOUT_SECONDS,
+        )
+    finally:
+        _remove_created_sparse_build_tree(build_directory, build_descriptor)
     import_code = (
-        "import importlib, pathlib, sys; root = pathlib.Path(sys.argv[1]).resolve(); "
+        "import importlib, json, pathlib, sys; "
+        "root = pathlib.Path(sys.argv[1]).resolve(); "
         "sys.path.insert(0, str(root)); "
-        "names = ('deformable_aggregation_ext', "
-        "'deformable_aggregation_with_depth_ext'); "
+        f"names = {_SPARSE_EXTENSION_MODULES!r}; "
         "origins = [pathlib.Path(importlib.import_module(name).__file__).resolve() "
         "for name in names]; "
-        "assert all(root == origin.parent or root in origin.parents for origin in origins)"
+        "assert all(root == origin.parent for origin in origins); "
+        "print(json.dumps([str(origin) for origin in origins]))"
     )
-    _run_setup_command(
+    result = _run_setup_command(
         runner,
         (str(candidate_python), "-c", import_code, str(ops)),
         "sparse_extensions",
         cwd=preflight.root,
         env=build_environment,
+        capture_output=True,
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
+    )
+    try:
+        values = json.loads(
+            _setup_stdout(result, "sparse_extensions", "SparseDrive extension imports")
+        )
+    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
+        raise EnvironmentSetupError(
+            "sparse_extensions", "SparseDrive extension imports returned invalid JSON"
+        ) from exc
+    if not isinstance(values, list) or any(
+        not isinstance(value, str) for value in values
+    ):
+        _raise(
+            "sparse_extensions",
+            "SparseDrive extension imports must return a JSON path array",
+        )
+    project_paths: list[Path] = []
+    for value in values:
+        origin = _canonical_absolute_posix_path(
+            value, "SparseDrive extension origin", "sparse_extensions"
+        )
+        try:
+            project_paths.append(origin.relative_to(preflight.root))
+        except ValueError:
+            _raise(
+                "sparse_extensions",
+                f"SparseDrive extension origin escapes project root: {origin}",
+            )
+    selected_paths = _validate_sparse_generated_paths(
+        preflight, checkout, project_paths, "sparse_extensions"
+    )
+    if baseline is not None and baseline.require_rebuild:
+        current_identities = _sparse_generated_identities(
+            preflight, selected_paths, "sparse_extensions"
+        )
+        unchanged = tuple(
+            module
+            for module, old_path, old_identity, new_path, new_identity in zip(
+                _SPARSE_EXTENSION_MODULES,
+                baseline.paths,
+                baseline.identities,
+                selected_paths,
+                current_identities,
+            )
+            if old_path == new_path and old_identity == new_identity
+        )
+        if unchanged:
+            _raise(
+                "sparse_extensions",
+                "stale active state requires rebuilt SparseDrive extensions; "
+                "unchanged modules: " + ", ".join(unchanged),
+            )
+    return _fingerprint_generated_artifacts(
+        preflight, checkout, sparse_paths=selected_paths
     )
 
 
@@ -3180,8 +3783,27 @@ def _deep_verify_environment(
             "environment state preflight identifiers do not match the current contract",
         )
     metadata = _call_asset_verifier(preflight, dependencies)
-    _validate_source_checkout(preflight, metadata, dependencies, runner)
-    fingerprints = fingerprint_runtime_assets(preflight)
+    checkout = _source_checkout_from_metadata(preflight, metadata)
+    runtime_count = len(_runtime_asset_declarations(preflight))
+    generated_paths = _state_generated_paths(
+        preflight, checkout, state, runtime_count
+    )
+    allowed_source_paths = _source_relative_generated_paths(
+        preflight,
+        checkout,
+        generated_paths,
+        "reuse_verification",
+    )
+    _validate_source_checkout(
+        preflight,
+        metadata,
+        dependencies,
+        runner,
+        allowed_generated_paths=allowed_source_paths,
+    )
+    fingerprints = _fingerprint_environment_inputs(
+        preflight, checkout, generated_paths
+    )
     if fingerprints != state.assets:
         _raise("reuse_verification", "runtime asset fingerprint or SHA changed")
     overlay_sha256 = verify_ros_overlay(
@@ -3208,6 +3830,25 @@ def _deep_verify_environment(
     )
     if freeze_sha256 != state.installed_packages_sha256:
         _raise("reuse_verification", "installed package freeze SHA changed")
+    final_metadata = _call_asset_verifier(preflight, dependencies)
+    final_checkout = _source_checkout_from_metadata(preflight, final_metadata)
+    if final_checkout != checkout:
+        _raise("reuse_verification", "source checkout changed during verification")
+    _validate_source_checkout(
+        preflight,
+        final_metadata,
+        dependencies,
+        runner,
+        allowed_generated_paths=allowed_source_paths,
+    )
+    final_fingerprints = _fingerprint_environment_inputs(
+        preflight, checkout, generated_paths
+    )
+    if final_fingerprints != state.assets:
+        _raise(
+            "reuse_verification",
+            "runtime or generated artifact changed during verification",
+        )
     return runtime_warning
 
 
@@ -3219,6 +3860,43 @@ def _merge_setup_warnings(
     if runtime_warning is not None and not any("CUDA" in warning for warning in warnings):
         warnings.append(runtime_warning)
     return tuple(warnings)
+
+
+def _revalidate_setup_inputs(
+    preflight: EnvironmentPreflight,
+    dependencies: EnvironmentSetupDependencies,
+    runner: Callable[..., Any],
+    checkout: Path,
+    generated_paths: Sequence[Path],
+    expected_fingerprints: tuple[AssetFingerprint, ...],
+) -> tuple[AssetFingerprint, ...]:
+    """source/runtime/generated snapshot이 setup baseline과 같은지 다시 확인한다."""
+    metadata = _call_asset_verifier(preflight, dependencies)
+    observed_checkout = _source_checkout_from_metadata(preflight, metadata)
+    if observed_checkout != checkout:
+        _raise("setup_revalidation", "source checkout changed during setup")
+    allowed_source_paths = _source_relative_generated_paths(
+        preflight,
+        checkout,
+        generated_paths,
+        "setup_revalidation",
+    )
+    _validate_source_checkout(
+        preflight,
+        metadata,
+        dependencies,
+        runner,
+        allowed_generated_paths=allowed_source_paths,
+    )
+    fingerprints = _fingerprint_environment_inputs(
+        preflight, checkout, generated_paths
+    )
+    if fingerprints != expected_fingerprints:
+        _raise(
+            "setup_revalidation",
+            "runtime or generated artifact changed during setup",
+        )
+    return fingerprints
 
 
 def _create_environment_state(
@@ -3272,10 +3950,10 @@ def setup_environment(
             preflight, selected_dependencies, runner
         )
         manifest_sha256 = sha256_file(preflight.manifest.manifest_path)
+        active = inspect_active_environment(
+            preflight.paths, preflight.definition, manifest_sha256
+        )
         if not recreate:
-            active = inspect_active_environment(
-                preflight.paths, preflight.definition, manifest_sha256
-            )
             if active.valid:
                 if active.environment_dir is None or active.state is None:
                     _raise("reuse_verification", "active inspection lost environment state")
@@ -3299,10 +3977,44 @@ def setup_environment(
         prepare_local_runtime_assets(preflight)
         _call_asset_fetcher(preflight, selected_dependencies)
         asset_metadata = _call_asset_verifier(preflight, selected_dependencies)
-        _validate_source_checkout(
-            preflight, asset_metadata, selected_dependencies, runner
+        checkout = _source_checkout_from_metadata(preflight, asset_metadata)
+        sparse_baseline: Optional[_SparseGeneratedBaseline] = None
+        if preflight.definition.model_id == "diffusiondrive_v2":
+            initial_generated_paths = (
+                _diffusion_generated_path(preflight, checkout),
+            )
+        elif preflight.definition.model_id == "sparsedrive_v2":
+            initial_generated_paths = _existing_sparse_generated_paths(
+                preflight, checkout
+            )
+            sparse_baseline = _authenticate_existing_sparse_generated_paths(
+                preflight,
+                checkout,
+                initial_generated_paths,
+                active.state,
+                manifest_sha256,
+            )
+        else:
+            initial_generated_paths = ()
+        initial_allowed_source_paths = _source_relative_generated_paths(
+            preflight,
+            checkout,
+            initial_generated_paths,
+            "source_verification",
         )
-        asset_fingerprints = fingerprint_runtime_assets(preflight)
+        _validate_source_checkout(
+            preflight,
+            asset_metadata,
+            selected_dependencies,
+            runner,
+            allowed_generated_paths=initial_allowed_source_paths,
+        )
+        runtime_fingerprints = fingerprint_runtime_assets(preflight)
+        initial_generated_fingerprints = (
+            _fingerprint_generated_artifacts(preflight, checkout)
+            if preflight.definition.model_id == "diffusiondrive_v2"
+            else ()
+        )
         try:
             build_id = selected_dependencies.build_id()
         except (RuntimeError, ValueError, TypeError) as exc:
@@ -3324,8 +4036,12 @@ def setup_environment(
             candidate / "bin" / "python", "candidate Python"
         )
         _validate_candidate_python_version(preflight, candidate_python, runner)
-        _run_sparse_setup_action(
-            preflight, candidate_python, selected_dependencies, runner
+        sparse_generated_fingerprints = _run_sparse_setup_action(
+            preflight,
+            candidate_python,
+            selected_dependencies,
+            runner,
+            baseline=sparse_baseline,
         )
         overlay = candidate / ".ros-overlay"
         build_ros_overlay(
@@ -3351,6 +4067,25 @@ def setup_environment(
         installed_packages_sha256 = _installed_packages_sha256(
             preflight, candidate, child_environment, runner
         )
+        expected_fingerprints = (
+            runtime_fingerprints
+            + initial_generated_fingerprints
+            + sparse_generated_fingerprints
+        )
+        generated_paths = tuple(
+            fingerprint.path
+            for fingerprint in (
+                initial_generated_fingerprints + sparse_generated_fingerprints
+            )
+        )
+        final_fingerprints = _revalidate_setup_inputs(
+            preflight,
+            selected_dependencies,
+            runner,
+            checkout,
+            generated_paths,
+            expected_fingerprints,
+        )
         try:
             completed_at = selected_dependencies.utc_now()
         except (RuntimeError, ValueError, TypeError) as exc:
@@ -3359,7 +4094,7 @@ def setup_environment(
             preflight,
             overlay_sha256,
             installed_packages_sha256,
-            asset_fingerprints,
+            final_fingerprints,
             completed_at,
         )
         state_path = candidate / ENVIRONMENT_STATE_FILENAME
@@ -3370,6 +4105,26 @@ def setup_environment(
             raise EnvironmentSetupError("state_write", str(exc)) from exc
         if observed_state != state:
             _raise("state_write", "environment state readback mismatch")
+        try:
+            _revalidate_setup_inputs(
+                preflight,
+                selected_dependencies,
+                runner,
+                checkout,
+                generated_paths,
+                expected_fingerprints,
+            )
+        except BaseException:
+            try:
+                state_path.unlink()
+                _fsync_directory(candidate, "state_write", "candidate directory")
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    "state_write", "cannot remove failed candidate state"
+                ) from exc
+            raise
         activate_candidate(preflight.paths, candidate)
         return EnvironmentOperationResult(
             environment_dir=candidate,
