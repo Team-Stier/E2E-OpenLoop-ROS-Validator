@@ -32,13 +32,17 @@ sub:
 E2E-OpenLoop-ROS-Validator/
 ├── src/
 │   ├── MORAI-ROS_morai_msgs
-│   └── Validator_pkg
+│   └── Validator_pkg/                 # Catkin package group (package.xml 없음)
+│       ├── config/profile.json         # 세 layer가 공유하는 model contract
+│       ├── validator_inference/        # ROS package: validator_inference
+│       ├── validator_msgs/             # ROS package: validator_msgs
+│       └── validator_pipeline/         # ROS package: Validator_pkg
 ├── rosbag/
 ├── models/               # 다운로드한 checkpoint와 auxiliary asset; Git 미추적
 └── records/
     └── openloop/  # 평가별 inference_YYYYMMDDTHHMMSS+0900_{model_id}.csv
 ```
-코드 파일은 Validator_pkg 밑에 둘 것.
+`src/Validator_pkg` 자체는 package manifest를 두지 않는 그룹 디렉터리다. Catkin은 안의 세 sibling package를 각각 발견하며, preprocessing/visualization launch의 ROS package 이름은 기존 호환을 위해 `Validator_pkg`를 유지한다.
 `rosbag/`에 [2026-07-16-17-13-14.bag](https://drive.google.com/drive/folders/1IBFk-q1ZYYRfLVi6TD8P2BgOuWAzudab?usp=share_link)저장.
 
 ## 2. Architecture
@@ -69,7 +73,8 @@ flowchart TD
     B1-->E
     B2-->E
     G["/lidar3D/BEV\n=================\nsensor_msgs/Image (mono8 visual)"]
-    GM["모델별 lidar input\n=================\n/lidar/tfv6/processed\n/lidar/interfuser/processed\n/lidar/diffusiondrive_v2/processed"]
+    GM["모델별 lidar input\n=================\n/lidar/interfuser/processed\n/lidar/diffusiondrive_v2/processed"]
+    GD["선택적 TFv6 진단 출력\n=================\n/lidar/tfv6/processed\n5-sweep; inference input 아님"]
     H0["/image/front/processed\n=================\nsensor_msgs/Image"]
     H1["/image/left/processed\n=================\nsensor_msgs/Image"]
     H2["/image/right/processed\n=================\nsensor_msgs/Image"]
@@ -82,6 +87,7 @@ flowchart TD
     
     D-->G
     D-->GM
+    D-->GD
     T-->D
     E-->H0
     E-->H1
@@ -99,7 +105,8 @@ flowchart TD
 
     GM-->J
     HM-->J
-    A-->J
+    A-->|TFv6 raw 10-sweep|J
+    T-->|TFv6 pose interpolation|J
     DF-->J
     TP-->J
 
@@ -180,25 +187,27 @@ rosrun Validator_pkg image_adaptor.py _model_profiles:=all
 
 #### 2.1.2 LiDAR topic contract
 
-`lidar_bev_processor`는 rosbag의 `/lidar3D`를 입력으로 받고, TFv6의 여러 프레임을 차량 움직임에 맞춰 정렬할 때만 `/tf`도 사용한다.
+`lidar_bev_processor`는 rosbag의 `/lidar3D`를 입력으로 받아 시각화 BEV와 InterFuser/DiffusionDrive V2 추론 입력을 만든다. 선택적 TFv6 진단 출력을 만들 때는 `/tf`도 사용한다. TFv6의 실제 추론 LiDAR 경로는 이 노드와 독립적으로 inference layer가 책임진다.
 
 | Input topic | Type | Purpose |
 | --- | --- | --- |
 | `/lidar3D` | `sensor_msgs/PointCloud2` | 현재 LiDAR point cloud |
-| `/tf` | `tf2_msgs/TFMessage` | TFv6 5-sweep motion compensation (`map` → `base_link`) |
+| `/tf` | `tf2_msgs/TFMessage` | 선택적 5-sweep 진단 출력 정렬; TFv6 inference의 raw 10-sweep pose interpolation |
 
 시각화용 `/lidar3D/BEV`는 선택한 모델과 무관하게 항상 발행한다. 카메라 BEV와 동일하게 전방 25 m, 좌우 총 30 m를 0.05 m/pixel로 표현하며, 크기는 600 x 500이고 encoding은 `mono8`이다. 이 토픽은 visualizer용이며 모델 추론 입력으로 사용하지 않는다.
 
-모델 추론용 LiDAR는 모델별 tensor 모양과 값 범위가 달라 별도의 namespace로 발행한다.
+전처리 LiDAR 출력은 아래와 같다. InterFuser와 DiffusionDrive V2 출력은 모델 입력이고, TFv6 출력은 전처리 동작을 비교하기 위한 선택적 진단용이다.
 
-| Model profile | Model input topic | Size (W x H) | Encoding / value | Processing |
+| Model profile | Preprocessing output | Size (W x H) | Encoding / value | Consumer / processing |
 | --- | --- | --- | --- | --- |
-| TFv6 | `/lidar/tfv6/processed` | 384 x 320 | `32FC1`, density `[0, 1]` | 5-sweep motion compensation, ground removal |
+| TFv6 | `/lidar/tfv6/processed` | 384 x 320 | `32FC1`, density `[0, 1]` | 선택적 진단용 5-sweep motion compensation/ground removal; inference는 구독하지 않음 |
 | InterFuser | `/lidar/interfuser/processed` | 224 x 224 | `32FC3`; below/above `[0, 1]`, total `[0, 2]` | height-separated histogram |
 | DiffusionDrive v2 | `/lidar/diffusiondrive_v2/processed` | 256 x 256 | `32FC1`, above-ground density `[0, 1]` | ground-relative histogram |
 | SparseDrive v2 | 발행하지 않음 | - | - | camera-only profile |
 
-좌표 변환에는 `config/0716demo.json`의 LiDAR 장착 위치 `(x=2.0, y=0.0, z=1.5)`를 사용한다. TFv6 profile에서는 `/tf`의 `map` → `base_link` 변환으로 과거 sweep을 현재 차량 좌표계에 정렬한다.
+InterFuser histogram은 고정 source와 동일하게 `xbins=np.linspace(-28,29,225)`, `ybins=np.linspace(-28,0,225)`를 사용해 각 축에 225개 edge/224개 bin을 만든다. x 끝값 29는 의도된 계약이며 28로 바꾸지 않는다.
+
+좌표 변환에는 `validator_pipeline/config/0716demo.json`과 공유 profile의 LiDAR 장착 위치 `(x=2.0, y=0.0, z=1.5)`를 사용한다. TFv6 inference는 `/lidar3D`의 시간순 raw `PointCloud2` 10개를 직접 FIFO에 보관한다. 각 sweep stamp에서 `/tf`의 `map` → `base_link` pose를 translation 선형 보간과 quaternion SLERP로 구한 뒤 최신 causal anchor로 정렬하고, 고정된 LEAD builder의 ego mask·ground removal·rasterization 순서를 적용한다. 따라서 `/lidar/tfv6/processed` 5-sweep 영상은 TFv6 model input이 아니다.
 
 카메라와 LiDAR의 `~model_profiles`는 launch 인자 하나로 함께 선택한다. 기본값 `raw`는 legacy 카메라 토픽과 시각화용 LiDAR BEV만 발행하고, `all`은 지원하는 모든 모델별 전처리 토픽을 활성화한다.
 
@@ -259,19 +268,22 @@ rosrun Validator_pkg bev_overlay_viewer.py
 ### 2.3 visualization layer
 `visualizer`노드로 구성됨.
 lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
+두 BEV는 `base_link` 기준 600 x 500, x=[0,25] m, y=[-15,15] m, 0.05 m/pixel 계약을 공유한다. Inference가 발행하는 `/waypoints`는 `Lidar3D-4` frame이므로 visualizer가 profile의 `T_base_from_lidar`(평행이동 `[2,0,1.5]`, identity quaternion)를 적용해 `base_link` BEV에 표시한다.
 
 ## 3. Open-loop 실행
 
-아래 예시는 `interfuser`를 선택한다. 다른 모델은 세 명령의 model ID를 동일하게 바꾼다. SparseDrive V2는 실행 전에 `src/Validator_pkg/config/profile.json`의 세 camera calibration을 모두 채워야 한다.
+아래 예시는 `interfuser`를 선택해 preprocessing, inference, visualization을 하나의 launch로 시작한다. 다른 모델은 두 명령의 model ID를 동일하게 바꾼다. SparseDrive V2는 실행 전에 `src/Validator_pkg/config/profile.json`의 front/left/right inline calibration(`K_original_3x3`, distortion metadata, `T_lidar_from_camera_4x4`)을 모두 채워야 하며, 하나라도 비어 있으면 worker 생성 전에 시작을 차단한다.
 
 ```bash
 catkin_make
 source devel/setup.bash
 rosrun validator_inference fetch_model_assets.py --model-id interfuser
-roslaunch validator_inference openloop_inference.launch model_id:=interfuser
+roslaunch Validator_pkg openloop_validator.launch model_id:=interfuser show_rviz:=true
 ```
 
-launch는 `/use_sim_time=true`를 설정하고 OptFeeder, InferenceEngine, Recorder 세 노드만 시작한다. PreprocessLayer를 실행한 뒤 다른 terminal에서 bag clock과 함께 재생한다.
+`openloop_validator.launch`는 `/use_sim_time=true`를 설정하고 선택한 model ID를 preprocessing의 `model_profiles`와 inference의 `model_id`에 동일하게 전달한 뒤 visualizer/RViz까지 시작한다. 다른 terminal에서 bag clock과 함께 재생한다. Inference layer만 독립적으로 점검할 때에만 `roslaunch validator_inference openloop_inference.launch model_id:=...`를 사용한다.
+
+이 저장소의 기본 Docker 이미지는 ROS Noetic의 Catkin/메시지/launch 및 전처리·시각화 계약을 검증하는 환경이다. 실제 네 모델 forward에는 `fetch_model_assets.py`로 받는 checkpoint/source 외에도 각 고정 source가 요구하는 PyTorch·Python·CUDA 런타임이 별도로 필요하며, 특히 TFv6는 LEAD 호환 Python/CUDA 환경에서 실행해야 한다.
 
 ```bash
 source devel/setup.bash

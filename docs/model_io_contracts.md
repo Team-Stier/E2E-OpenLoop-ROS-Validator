@@ -7,8 +7,11 @@
 
 This document describes the tensor/data contract between the external PreprocessLayer, the inference-layer OptFeederNode/InputBuffer, and each concrete PyTorch model object. It does not define a generic adapter.
 
+The Catkin source layout is a package group at `src/Validator_pkg/`: `validator_inference`, `validator_msgs`, and `validator_pipeline` are sibling packages. The last directory keeps the ROS package name `Validator_pkg`, so the integrated entry point is `roslaunch Validator_pkg openloop_validator.launch`.
+
 - B: batch size; open-loop runtime uses B=1.
-- All ROS output paths use frame Lidar3D-4.
+- All ROS model output paths (`/waypoints`) use frame Lidar3D-4.
+- Visualization uses a base_link BEV (600×500, x=[0,25] m, y=[-15,15] m, 0.05 m/pixel) and applies the recorded T_base_from_lidar to Lidar3D-4 waypoints before drawing them.
 - InputBuffer chooses only messages at or before DrivingFeature.header.stamp. Stale messages are valid and their age is recorded.
 - Static model binary assets are local files under models/ and are verified before model load.
 - The current bag has no radar and no camera intrinsic/distortion data.
@@ -46,6 +49,8 @@ The anchor shape is (20, 8, 2), dtype float64 in the source file, and the model 
 
 The LiDAR raster uses x=[-32,64] m, y=[-40,40] m, 4 pixels/m, occupancy clip=5. InputBuffer pairs each of the ten chronological PointCloud2 messages with the interpolated map-to-base pose transform into the newest causal anchor; a missing pose is `not_ready`. For every sweep, the TFv6 source boundary first applies the profile's full `T_base_from_lidar`, then ports the pinned LEAD `base_agent.py:140-237` order exactly: ego-footprint mask, `lead.common.ransac.remove_ground(..., parallel=True)`, and source BEV/height bounds. Only the surviving base/ego points are aligned into the newest anchor. ROS y-left is converted once to CARLA y-right immediately before the pinned 0.1 m quantization, LEAD `rasterize_lidar`, and LEAD 16-bit PNG `compress_float_image`/`decompress_float_image` round-trip.
 
+The inference-layer subscriptions for this path are raw `/lidar3D` and `/tf`; `/lidar/tfv6/processed` is an optional five-sweep preprocessing diagnostic and is never a TFv6 model input. Pose lookup uses linear translation interpolation and quaternion SLERP between bracketing `/tf` messages for each of the ten raw sweep stamps.
+
 Fallback route points remain published in `Lidar3D-4`. Before TFv6 forward they are transformed by the recorded `T_base_from_lidar` (`base_link` parent, `Lidar3D-4` child, translation `[2,0,1.5]`, quaternion `[0,0,0,1]`) and only then converted to CARLA y-right coordinates.
 
 ### 3.2 Official no-radar contract
@@ -72,7 +77,7 @@ Native prediction is eight ego-relative waypoint points at 0.25 s intervals. Fir
 | status | B×7: CARLA command[6] and forward speed | OptFeederNode |
 | target point | B×2 CARLA ego-local route point | OptFeederNode |
 
-Image tensors use the official resize/crop and ImageNet normalization. The LiDAR histogram uses original CARLA-space bounds x=[-28,28], y=[-28,0], 8 pixels/m, clip=5. The `Lidar3D-4` target point is transformed by the same recorded `T_base_from_lidar` before the CARLA y sign change. InterFuser requires no temporal FIFO and outputs ten ego-relative waypoints.
+Image tensors use the official resize/crop and ImageNet normalization. The pinned LiDAR builder uses the exact edge arrays `xbins=np.linspace(-28,29,225)` and `ybins=np.linspace(-28,0,225)`: 225 edge values and therefore 224×224 bins. It then clips each height channel at 5. The asymmetric x endpoint is intentional and must not be normalized to 28. The `Lidar3D-4` target point is transformed by the same recorded `T_base_from_lidar` before the CARLA y sign change. InterFuser requires no temporal FIFO and outputs ten ego-relative waypoints.
 
 ### 4.2 Current-bag compatibility
 
@@ -133,7 +138,7 @@ T_camera_from_lidar = inverse(T_lidar_from_camera)
 lidar2img = A_resize_crop × K_original × T_camera_from_lidar[:3, :]
 ~~~
 
-Before forwarding, OptFeederNode validates that all three cameras are complete and hashes the canonical inline calibration object into calibration_profile_sha256. Missing values make SparseDrive not_ready; they do not block the other three models.
+Before forwarding, OptFeederNode validates that all three cameras are complete and hashes the canonical inline calibration object into calibration_profile_sha256. Selecting SparseDrive with missing values raises a profile error before worker construction; the incomplete SparseDrive profile does not block the other three models.
 
 ### 6.3 Output
 
@@ -158,10 +163,10 @@ After the model assets are downloaded and the implementation passes its smoke te
 catkin_make
 source devel/setup.bash
 rosrun validator_inference fetch_model_assets.py --model-id interfuser
-roslaunch validator_inference openloop_inference.launch model_id:=interfuser
+roslaunch Validator_pkg openloop_validator.launch model_id:=interfuser show_rviz:=true
 ```
 
-PreprocessLayer를 함께 실행하고, 별도 terminal에서 ROS simulated time을 공급한다.
+`openloop_validator.launch`는 선택한 model ID를 PreprocessLayer, inference layer, visualization layer에 동일하게 전달한다. 별도 terminal에서 ROS simulated time을 공급한다. Inference layer만 독립 점검할 때는 `roslaunch validator_inference openloop_inference.launch model_id:=interfuser`를 사용한다.
 
 ```bash
 source devel/setup.bash

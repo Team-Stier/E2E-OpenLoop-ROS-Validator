@@ -69,11 +69,15 @@
   <exec_depend>message_filters</exec_depend>
   <exec_depend>morai_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-rospkg</exec_depend>
   <exec_depend>rospy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>tf2_msgs</exec_depend>
   <exec_depend>rviz</exec_depend>
+  <exec_depend>validator_inference</exec_depend>
 
 
   <!-- The export tag contains other, unspecified, tags -->

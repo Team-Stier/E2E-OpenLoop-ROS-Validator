@@ -1,0 +1,54 @@
+<launch>
+    <arg name="show_rviz" default="false"/>
+    <arg name="draw_waypoints" default="true"/>
+    <arg name="profile_file" default=""/>
+    <arg name="forward_range" default="25.0"/>
+    <arg name="lateral_range" default="30.0"/>
+    <arg name="resolution" default="0.05"/>
+
+    <!--
+      Camera BEV, LiDAR BEV, visualizer가 공유하는
+      공통 geometry 설정을 전역 namespace에 로드한다.
+    -->
+    <rosparam
+        command="load"
+        file="$(find Validator_pkg)/config/bev_geometry.yaml"
+        ns="/bev_geometry"/>
+
+    <!-- Keep visualization geometry identical to preprocessing overrides. -->
+    <param name="/bev_geometry/x_min" value="0.0" type="double"/>
+    <param name="/bev_geometry/x_max" value="$(arg forward_range)" type="double"/>
+    <param name="/bev_geometry/y_min" value="$(eval -float(arg('lateral_range')) / 2.0)" type="double"/>
+    <param name="/bev_geometry/y_max" value="$(eval float(arg('lateral_range')) / 2.0)" type="double"/>
+    <param name="/bev_geometry/resolution" value="$(arg resolution)" type="double"/>
+    <param name="/bev_geometry/height" value="$(eval int(round(float(arg('forward_range')) / float(arg('resolution')))))" type="int"/>
+    <param name="/bev_geometry/width" value="$(eval int(round(float(arg('lateral_range')) / float(arg('resolution')))))" type="int"/>
+
+    <node
+        pkg="Validator_pkg"
+        type="bev_visualizer.py"
+        name="bev_visualizer"
+        output="screen"
+        required="true">
+
+        <rosparam
+            command="load"
+            file="$(find Validator_pkg)/config/bev_visualizer.yaml"/>
+
+        <param
+            name="draw_waypoints"
+            value="$(arg draw_waypoints)"/>
+        <param
+            if="$(eval arg('profile_file') != '')"
+            name="profile_file"
+            value="$(arg profile_file)"/>
+    </node>
+
+    <node
+        if="$(arg show_rviz)"
+        pkg="rviz"
+        type="rviz"
+        name="e2e_validator_rviz"
+        args="-d $(find Validator_pkg)/rviz/e2e_validator.rviz"
+        output="screen"/>
+</launch>

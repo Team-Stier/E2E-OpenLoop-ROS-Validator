@@ -15,6 +15,7 @@
     type="image_adaptor.py"
     name="image_adaptor"
     output="screen"
+    required="true"
   >
     <param name="model_profiles" value="$(arg model_profiles)" />
   </node>
@@ -24,6 +25,7 @@
     type="lidar_bev_processor.py"
     name="lidar_bev_processor"
     output="screen"
+    required="true"
   >
     <param name="config_path" value="$(arg config_path)" />
     <param name="model_profiles" value="$(arg model_profiles)" />
@@ -38,6 +40,7 @@
     type="camera_bev_stitcher.py"
     name="camera_bev_stitcher"
     output="screen"
+    required="true"
   >
     <param name="config_path" value="$(arg config_path)" />
     <param name="show_gui" value="$(arg show_gui)" />

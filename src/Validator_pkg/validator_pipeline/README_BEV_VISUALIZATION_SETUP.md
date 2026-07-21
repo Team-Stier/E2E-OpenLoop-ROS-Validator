@@ -1,6 +1,6 @@
 # BEV Visualization Setup
 
-이 문서는 `E2E-OpenLoop-ROS-Validator` 프로젝트에서 Camera BEV, LiDAR BEV, TFv6 waypoint를 하나의 화면으로 합성하고 RViz에서 확인하기 위해 추가된 파일 구조, ROS 의존성, 빌드 및 실행 방법을 설명한다.
+이 문서는 `E2E-OpenLoop-ROS-Validator` 프로젝트에서 Camera BEV, LiDAR BEV, inference waypoint를 하나의 화면으로 합성하고 RViz에서 확인하기 위해 추가된 파일 구조, ROS 의존성, 빌드 및 실행 방법을 설명한다.
 
 ---
 현재 파일의 위치에 맞게 수정해두긴 했다. 혹시나 이상이 있으면 김지한에게 알려주세요
@@ -14,7 +14,7 @@
 |---|---|---|
 | Camera BEV | `/image/BEV` | `sensor_msgs/Image`, `bgr8` |
 | LiDAR BEV | `/lidar3D/BEV` | `sensor_msgs/Image`, `mono8` |
-| TFv6 waypoint | `/waypoints` | `nav_msgs/Path` |
+| Model waypoint | `/waypoints` | `nav_msgs/Path`, `Lidar3D-4` |
 
 Visualizer 노드는 위 입력을 구독해 다음 결과를 발행한다.
 
@@ -38,29 +38,34 @@ Visualizer 노드는 위 입력을 구독해 다음 결과를 발행한다.
 └────────────────┴────────────────┴────────────────┘
 ```
 
-이 화면은 TFv6가 인식한 객체 결과가 아니라, TFv6 입력 이전 단계에서 Camera와 LiDAR의 BEV 정합 상태를 검증하기 위한 디버깅 화면이다.
+이 화면은 모델의 객체 인식 결과가 아니라, Camera/LiDAR BEV 정합과 inference waypoint 위치를 검증하기 위한 디버깅 화면이다.
 
 ---
 
 ## 2. 추가 파일 구조
 
-관련 파일은 모두 `Validator_pkg` 내부에 둔다.
+`src/Validator_pkg` 자체는 manifest가 없는 Catkin package group이다. `validator_inference`, `validator_msgs`, `validator_pipeline` 세 package가 sibling으로 있고, preprocessing/visualization 구현은 `validator_pipeline`에 둔다. 이 디렉터리의 `package.xml` 이름은 launch 호환을 위해 `Validator_pkg`다.
 
 ```text
 E2E-OpenLoop-ROS-Validator/
 └── src/
     └── Validator_pkg/
-        ├── scripts/
-        │   └── bev_visualizer.py
-        ├── config/
-        │   ├── bev_geometry.yaml
-        │   └── bev_visualizer.yaml
-        ├── launch/
-        │   └── bev_visualization.launch
-        ├── rviz/
-        │   └── e2e_validator.rviz
-        ├── CMakeLists.txt
-        └── package.xml
+        ├── config/profile.json
+        ├── validator_inference/
+        ├── validator_msgs/
+        └── validator_pipeline/        # ROS package: Validator_pkg
+            ├── scripts/
+            │   └── bev_visualizer.py
+            ├── config/
+            │   ├── bev_geometry.yaml
+            │   └── bev_visualizer.yaml
+            ├── launch/
+            │   ├── bev_visualization.launch
+            │   └── openloop_validator.launch
+            ├── rviz/
+            │   └── e2e_validator.rviz
+            ├── CMakeLists.txt
+            └── package.xml
 ```
 
 각 파일의 역할은 다음과 같다.
@@ -71,6 +76,7 @@ E2E-OpenLoop-ROS-Validator/
 | `config/bev_geometry.yaml` | 공통 BEV 좌표계, 범위, 해상도 및 이미지 크기 정의 |
 | `config/bev_visualizer.yaml` | 구독·발행 토픽, 합성 비율, 동기화 허용시간 등 정의 |
 | `launch/bev_visualization.launch` | Visualizer와 RViz 실행 |
+| `launch/openloop_validator.launch` | Preprocessing, inference, visualization 통합 실행 |
 | `rviz/e2e_validator.rviz` | RViz Display 구성 저장 |
 | `CMakeLists.txt` | Python 노드 및 설정 폴더 설치, ROS 패키지 의존성 선언 |
 | `package.xml` | 빌드·실행 시 필요한 ROS 패키지 의존성 선언 |
@@ -86,9 +92,9 @@ frame_id        : base_link
 x축             : 차량 전방
 y축             : 차량 좌측
 단위            : m
-metric bounds   : 동일한 x_min, x_max, y_min, y_max
-resolution      : 동일한 m/pixel
-image size      : 동일한 width, height
+metric bounds   : x=[0,25] m, y=[-15,15] m
+resolution      : 0.05 m/pixel
+image size      : width=600, height=500
 image 위쪽      : 차량 전방
 image 왼쪽      : 차량 좌측
 timestamp       : 원본 센서 timestamp 유지
@@ -102,7 +108,7 @@ lidar_bev_processor
 bev_visualizer
 ```
 
-Visualizer는 서로 다른 좌표계를 다시 맞추는 노드가 아니다.
+Visualizer는 서로 다른 Camera/LiDAR BEV 기하를 resize로 맞추는 노드가 아니다. 단, inference의 `/waypoints`는 계약상 `Lidar3D-4` frame으로 발행되므로, `bev_geometry.yaml`에 기록된 `T_base_from_lidar`(평행이동 `[2,0,1.5]`, quaternion `[0,0,0,1]`)를 적용해 waypoint만 `base_link` BEV로 변환한다.
 
 ```text
 Preprocessing layer:
@@ -124,7 +130,7 @@ BEV Visualizer는 다음 ROS 패키지를 사용한다.
 |---|---|
 | `rospy` | Python ROS 노드 |
 | `sensor_msgs` | Camera·LiDAR BEV Image |
-| `nav_msgs` | TFv6 waypoint `Path` |
+| `nav_msgs` | Model waypoint `Path` |
 | `cv_bridge` | ROS Image와 OpenCV 영상 변환 |
 | `message_filters` | Camera BEV와 LiDAR BEV 시간 동기화 |
 | `rviz` | 합성 결과 시각화 |
@@ -229,14 +235,14 @@ Python 노드는 실행 권한이 필요하다.
 
 ```bash
 chmod +x \
-~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/scripts/bev_visualizer.py
+~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_pipeline/scripts/bev_visualizer.py
 ```
 
 실행 권한을 확인한다.
 
 ```bash
 ls -l \
-~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/scripts/bev_visualizer.py
+~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_pipeline/scripts/bev_visualizer.py
 ```
 
 파일 권한에 `x`가 포함되어 있어야 한다.
@@ -252,14 +258,14 @@ ls -l \
 패키지가 다음 경로에 있다고 가정한다.
 
 ```text
-~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg
+~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_pipeline
 ```
 
 먼저 Python 문법을 검사한다.
 
 ```bash
 python3 -m py_compile \
-~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/scripts/bev_visualizer.py
+~/catkin_ws/src/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_pipeline/scripts/bev_visualizer.py
 ```
 
 워크스페이스를 빌드한다.
@@ -338,7 +344,7 @@ Add
 
 ### 8.3 3D 데이터 추가
 
-다음 Display를 추가하면 원본 LiDAR와 TFv6 waypoint를 3D View에서 함께 볼 수 있다.
+다음 Display를 추가하면 원본 LiDAR와 model waypoint를 3D View에서 함께 볼 수 있다.
 
 | RViz Display | Topic |
 |---|---|
@@ -354,11 +360,25 @@ RViz의 `Fixed Frame`은 다음으로 설정한다.
 base_link
 ```
 
-`/waypoints`가 `map` 또는 다른 frame으로 발행된다면 Visualizer에서 직접 그리기 전에 `base_link`로 변환해야 한다.
+Inference layer의 `/waypoints`는 `Lidar3D-4` frame으로 발행된다. BEV Visualizer는 공유 설정의 정적 `T_base_from_lidar`를 적용해 `base_link`로 변환한 뒤 합성한다. RViz 3D Path Display도 동일한 frame tree를 볼 수 있어야 한다.
 
 ---
 
 ## 9. 실행 순서
+
+### 통합 실행(권장)
+
+Preprocessing, inference, visualization의 model 선택을 하나로 묶으려면 다음 launch를 사용한다.
+
+```bash
+roslaunch Validator_pkg openloop_validator.launch \
+  model_id:=tfv6 \
+  show_rviz:=true
+```
+
+SparseDrive V2를 선택하는 경우 `src/Validator_pkg/config/profile.json`의 front/left/right inline calibration(`K_original_3x3`, distortion metadata, `T_lidar_from_camera_4x4`)을 모두 채워야 한다. Bag에 `CameraInfo`가 없으므로 비어 있는 값을 임의로 만들지 않는다.
+
+아래 절은 각 component를 따로 점검할 때의 실행 순서다.
 
 ### 터미널 1: ROS Master
 
@@ -391,7 +411,7 @@ roslaunch Validator_pkg camera_bev_pipeline.launch \
 
 ### 터미널 3: Visualizer와 RViz
 
-TFv6 추론 노드가 실행 중이고 `/waypoints`가 발행되는 경우:
+Inference 노드가 실행 중이고 `/waypoints`가 발행되는 경우:
 
 ```bash
 roslaunch Validator_pkg bev_visualization.launch \
@@ -399,7 +419,7 @@ roslaunch Validator_pkg bev_visualization.launch \
   draw_waypoints:=true
 ```
 
-아직 TFv6 추론 노드를 연결하지 않은 경우:
+아직 inference 노드를 연결하지 않은 경우:
 
 ```bash
 roslaunch Validator_pkg bev_visualization.launch \
@@ -461,12 +481,12 @@ rostopic echo -n 1 /lidar3D/BEV/height
 ```text
 /image/BEV
 encoding: bgr8
-width: 400
+width: 600
 height: 500
 
 /lidar3D/BEV
 encoding: mono8
-width: 400
+width: 600
 height: 500
 ```
 
@@ -543,7 +563,7 @@ rostopic hz /waypoints
 rostopic echo -n 1 /waypoints/header
 ```
 
-`/waypoints.header.frame_id`가 `base_link`가 아니라면 `tf2` 좌표 변환이 필요하다.
+정상 inference 출력의 `/waypoints.header.frame_id`는 `Lidar3D-4`다. visualizer는 inference와 동일한 `profile.json`의 `common_inference_policy.static_transforms.T_base_from_lidar`를 읽는다. parent/child가 각각 `base_link`/`Lidar3D-4`인지, translation이 `[2.0, 0.0, 1.5]`, quaternion이 `[0.0, 0.0, 0.0, 1.0]`인지 확인한다. 다른 frame이 들어오면 묵시한 채 그리지 말고 해당 frame에 맞는 명시적 변환을 profile에 기록해야 한다.
 
 ---
 
@@ -594,14 +614,15 @@ bev_visualizer
 RViz Image Display
 ```
 
-TFv6 inference engine이 실행 중이면 다음 경로가 추가된다.
+Inference engine이 실행 중이면 다음 경로가 추가된다.
 
 ```text
-TFv6 inference engine
-└─ /waypoints
-        │
-        ▼
-bev_visualizer
+inference engine
+└─ /waypoints (Lidar3D-4)
+        |
+        | T_base_from_lidar
+        v
+bev_visualizer (base_link BEV)
 └─ Camera + LiDAR + Waypoint 합성
 ```
 
@@ -612,14 +633,15 @@ bev_visualizer
 정상적으로 구성된 경우 다음 조건이 모두 만족되어야 한다.
 
 ```text
-[ ] /image/BEV가 bgr8, 400 x 500으로 발행됨
-[ ] /lidar3D/BEV가 mono8, 400 x 500으로 발행됨
+[ ] /image/BEV가 bgr8, 600 x 500으로 발행됨
+[ ] /lidar3D/BEV가 mono8, 600 x 500으로 발행됨
+[ ] 두 BEV가 x=[0,25] m, y=[-15,15] m, 0.05 m/pixel을 공유함
 [ ] 두 토픽의 header timestamp가 동기화 허용범위 이내임
 [ ] 두 토픽의 frame 기준이 base_link로 일관됨
 [ ] /visualization/bev_overlay가 지속적으로 발행됨
 [ ] RViz Image Display에서 Camera와 LiDAR가 중첩됨
-[ ] /waypoints가 존재할 때 합성 화면에 경로가 표시됨
+[ ] Lidar3D-4 /waypoints가 base_link로 변환되어 합성 화면에 경로가 표시됨
 [ ] 정지·직진·회전 구간에서 정합 상태가 유지됨
 ```
 
-이 검증이 완료된 이후에 TFv6의 객체 검출, BEV semantic, waypoint 출력 검증 계층을 추가한다.
+이 검증은 모델 추론 정확도와 별개로, 센서 BEV 정합·시간 동기·waypoint frame 변환이 통합 계약을 따르는지 확인한다.

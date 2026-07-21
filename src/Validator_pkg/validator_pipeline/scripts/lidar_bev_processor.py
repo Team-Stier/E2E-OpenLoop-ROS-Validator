@@ -795,6 +795,7 @@ def main():
         rospy.spin()
     except (OSError, TypeError, ValueError, rospkg.ResourceNotFound) as error:
         rospy.logfatal("lidar_bev_processor initialization failed: %s", error)
+        raise
 
 
 if __name__ == "__main__":

@@ -1,21 +1,22 @@
 <launch>
   <arg name="model_id" default="interfuser"/>
-  <arg name="profile_file" default="$(find validator_inference)/../config/profile.json"/>
+  <!-- Empty means: let each node resolve the source/install profile location. -->
+  <arg name="profile_file" default=""/>
   <arg name="record_dir" default="$(find validator_inference)/../../../records/openloop"/>
 
   <param name="/use_sim_time" value="true"/>
 
-  <node pkg="validator_inference" type="opt_feeder_node.py" name="opt_feeder" output="screen">
+  <node pkg="validator_inference" type="opt_feeder_node.py" name="opt_feeder" output="screen" required="true">
     <param name="model_id" value="$(arg model_id)"/>
-    <param name="profile_file" value="$(arg profile_file)"/>
+    <param if="$(eval arg('profile_file') != '')" name="profile_file" value="$(arg profile_file)"/>
   </node>
 
-  <node pkg="validator_inference" type="inference_engine_node.py" name="inference_engine" output="screen">
+  <node pkg="validator_inference" type="inference_engine_node.py" name="inference_engine" output="screen" required="true">
     <param name="model_id" value="$(arg model_id)"/>
-    <param name="profile_file" value="$(arg profile_file)"/>
+    <param if="$(eval arg('profile_file') != '')" name="profile_file" value="$(arg profile_file)"/>
   </node>
 
-  <node pkg="validator_inference" type="recorder_node.py" name="recorder" output="screen">
+  <node pkg="validator_inference" type="recorder_node.py" name="recorder" output="screen" required="true">
     <param name="model_id" value="$(arg model_id)"/>
     <param name="record_dir" value="$(arg record_dir)"/>
   </node>

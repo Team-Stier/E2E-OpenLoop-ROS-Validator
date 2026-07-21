@@ -145,7 +145,7 @@ class CameraBEVStitcher:
         self.resolution = float(rospy.get_param("~resolution", 0.05))
         self.feather_pixels = float(rospy.get_param("~feather_pixels", 30.0))
         self.blend_exponent = float(rospy.get_param("~blend_exponent", 64.0))
-        self.frame_id = rospy.get_param("~frame_id", "base_link_bev")
+        self.frame_id = rospy.get_param("~frame_id", "base_link")
         self.show_gui = bool(rospy.get_param("~show_gui", True))
         self.publish_debug_bevs = bool(
             rospy.get_param("~publish_debug_bevs", True)
@@ -505,6 +505,7 @@ def main():
         rospy.spin()
     except (OSError, KeyError, TypeError, ValueError) as error:
         rospy.logfatal("Camera BEV stitcher initialization failed: %s", error)
+        raise
 
 
 if __name__ == "__main__":

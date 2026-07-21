@@ -55,7 +55,7 @@ class BEVOverlayViewer:
         )
         self.output_frame_id = rospy.get_param(
             "~frame_id",
-            "base_link_bev_overlay",
+            "base_link",
         )
         self.sync_slop = float(rospy.get_param("~sync_slop", 0.20))
         self.sync_queue_size = int(rospy.get_param("~sync_queue_size", 30))

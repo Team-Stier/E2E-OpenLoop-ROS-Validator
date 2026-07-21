@@ -38,10 +38,7 @@ def test_launch_uses_sim_time_arguments_and_exactly_three_runtime_nodes():
 
     assert '<param name="/use_sim_time" value="true"/>' in launch
     assert '<arg name="model_id"' in launch
-    assert (
-        '<arg name="profile_file" '
-        'default="$(find validator_inference)/../config/profile.json"/>' in launch
-    )
+    assert '<arg name="profile_file" default=""/>' in launch
     assert (
         '<arg name="record_dir" '
         'default="$(find validator_inference)/../../../records/openloop"/>'
@@ -51,7 +48,10 @@ def test_launch_uses_sim_time_arguments_and_exactly_three_runtime_nodes():
     assert launch.count('type="opt_feeder_node.py"') == 1
     assert launch.count('type="inference_engine_node.py"') == 1
     assert launch.count('type="recorder_node.py"') == 1
-    assert launch.count('<param name="profile_file" value="$(arg profile_file)"/>') == 2
+    assert launch.count(
+        '<param if="$(eval arg(\'profile_file\') != \'\')" '
+        'name="profile_file" value="$(arg profile_file)"/>'
+    ) == 2
     assert '<param name="record_dir" value="$(arg record_dir)"/>' in launch
     assert "/inference_time" not in launch
 

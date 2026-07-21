@@ -28,14 +28,11 @@ The default ``raw`` keeps only the legacy outputs. Supported profiles:
     /image/sparsedrive_v2/left            32FC3, 512x256
     /image/sparsedrive_v2/front           32FC3, 512x256
     /image/sparsedrive_v2/right           32FC3, 512x256
-    /image/sparsedrive_v2/cam_intrinsic   Float64MultiArray, 3x4x4
-    /image/sparsedrive_v2/lidar2cam       Float64MultiArray, 3x4x4
-    /image/sparsedrive_v2/cam2lidar       Float64MultiArray, 3x4x4
-    /image/sparsedrive_v2/projection_mat  Float64MultiArray, 3x4x4
-    /image/sparsedrive_v2/img_aug_matrix  Float64MultiArray, 3x4x4
-    /image/sparsedrive_v2/image_wh        Float64MultiArray, 3x2
     Values use ImageNet normalization in RGB order.
-    Geometry array order: left, front, right.
+
+Set ``~publish_sparsedrive_metadata:=true`` only for preprocessing diagnostics.
+Those FOV-derived arrays are not inference inputs; SparseDrive projection
+conditions come from validated profile-inline calibration in DrivingFeature.
 
 ROS Image stores float model inputs as HWC. Inference code must transpose them
 to CHW and add the batch/view dimensions expected by the PyTorch model.
@@ -524,58 +521,30 @@ def prepare_interfuser(images):
     }
 
 
-def crop_by_fraction(image, top, bottom, left, right):
-    """Crop using fractions so the NAVSIM crop transfers across resolutions."""
-    height, width = image.shape[:2]
-    y0 = int(round(height * top))
-    y1 = height - int(round(height * bottom))
-    x0 = int(round(width * left))
-    x1 = width - int(round(width * right))
-    if x1 <= x0 or y1 <= y0:
-        raise ValueError("Fractional crop produced an empty image")
-    return image[y0:y1, x0:x1]
-
-
 def prepare_diffusiondrive_v2(images):
     """Build DiffusionDriveV2's 1024x256 left/front/right camera strip."""
-    # Official NAVSIM preprocessing uses 1920x1080 images, removes 28 pixels
-    # vertically from every view and 416 pixels horizontally from side views.
-    vertical_fraction = 28.0 / 1080.0
-    side_fraction = 416.0 / 1920.0
-
-    left = crop_by_fraction(
-        bgr_to_rgb(images["left"]),
-        vertical_fraction,
-        vertical_fraction,
-        side_fraction,
-        side_fraction,
+    # The pinned NAVSIM builder crops 1920x1080 views, stitches the complete
+    # 4096x1024 strip, then applies one default cv2.INTER_LINEAR resize. MORAI
+    # cameras have different source sizes, so first map each deterministically
+    # into that source canvas and preserve the pinned operation order.
+    canonical = {
+        name: cv2.resize(
+            bgr_to_rgb(images[name]),
+            (1920, 1080),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        for name in CAMERA_NAMES
+    }
+    left = canonical["left"][28:-28, 416:-416]
+    front = canonical["front"][28:-28]
+    right = canonical["right"][28:-28, 416:-416]
+    stitched = np.concatenate([left, front, right], axis=1)
+    resized = cv2.resize(
+        stitched,
+        (1024, 256),
+        interpolation=cv2.INTER_LINEAR,
     )
-    front = crop_by_fraction(
-        bgr_to_rgb(images["front"]),
-        vertical_fraction,
-        vertical_fraction,
-        0.0,
-        0.0,
-    )
-    right = crop_by_fraction(
-        bgr_to_rgb(images["right"]),
-        vertical_fraction,
-        vertical_fraction,
-        side_fraction,
-        side_fraction,
-    )
-
-    # In the official 4096-pixel strip the side/front/side widths occupy
-    # 1088/1920/1088 pixels, which become 272/480/272 at width 1024.
-    strip = np.concatenate(
-        [
-            resize_image(left, (272, 256)),
-            resize_image(front, (480, 256)),
-            resize_image(right, (272, 256)),
-        ],
-        axis=1,
-    )
-    return unit_normalize(strip)
+    return unit_normalize(resized)
 
 
 def prepare_sparsedrive_v2(images):
@@ -622,6 +591,9 @@ class ImageAdaptor:
         self.sparsedrive_calibration = None
         self.sparsedrive_metadata_publishers = {}
         self.sparsedrive_metadata_shape_key = None
+        self.publish_sparsedrive_metadata_enabled = bool(
+            rospy.get_param("~publish_sparsedrive_metadata", False)
+        )
 
         self.legacy_publishers = {
             camera_name: rospy.Publisher(
@@ -633,7 +605,10 @@ class ImageAdaptor:
         }
         self.profile_publishers = self.create_profile_publishers()
 
-        if "sparsedrive_v2" in self.model_profiles:
+        if (
+            "sparsedrive_v2" in self.model_profiles
+            and self.publish_sparsedrive_metadata_enabled
+        ):
             package_path = rospkg.RosPack().get_path("Validator_pkg")
             default_config_path = os.path.join(
                 package_path,
@@ -908,7 +883,8 @@ class ImageAdaptor:
                 )
 
             if "sparsedrive_v2" in self.model_profiles:
-                self.publish_sparsedrive_metadata(images)
+                if self.publish_sparsedrive_metadata_enabled:
+                    self.publish_sparsedrive_metadata(images)
                 prepared = prepare_sparsedrive_v2(images)
                 for name, image in prepared.items():
                     self.publish_image(
@@ -924,6 +900,7 @@ class ImageAdaptor:
                 "Model image preprocessing failed: %s",
                 error,
             )
+            return
 
         rospy.loginfo_throttle(
             2.0,
@@ -939,6 +916,7 @@ def main():
         rospy.spin()
     except (TypeError, ValueError) as error:
         rospy.logfatal("image_adaptor initialization failed: %s", error)
+        raise
 
 
 if __name__ == "__main__":

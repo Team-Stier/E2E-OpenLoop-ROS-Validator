@@ -2,7 +2,7 @@
 
 """
 Camera BEV와 LiDAR BEV를 시간 동기화하여 하나의 디버깅 영상으로 합성한다.
-선택적으로 TFv6가 출력한 waypoint를 동일 BEV 영상에 표시한다.
+선택된 네 모델의 Lidar3D-4 waypoint를 base_link BEV에 변환해 표시한다.
 
 pub:
     /visualization/bev_overlay
@@ -22,19 +22,91 @@ sub:
 
     /waypoints
         nav_msgs/Path
-        base_link 기준 TFv6 예측 경로
+        Lidar3D-4 기준 모델 예측 경로
 """
 
-from typing import Optional, Tuple
+from collections import deque
+import json
+from pathlib import Path as FilePath
+import threading
+from typing import Deque, Optional, Tuple
 
 import cv2
 import message_filters
 import numpy as np
+import rospkg
 import rospy
 
 from cv_bridge import CvBridge, CvBridgeError
 from nav_msgs.msg import Path
 from sensor_msgs.msg import Image
+
+
+def _stamp_to_nsec(stamp) -> int:
+    """ROS1/ROS2 호환 stamp를 정수 nanosecond로 변환한다."""
+    to_nsec = getattr(stamp, "to_nsec", None)
+    if callable(to_nsec):
+        return int(to_nsec())
+    if hasattr(stamp, "secs") and hasattr(stamp, "nsecs"):
+        return int(stamp.secs) * 1_000_000_000 + int(stamp.nsecs)
+    if hasattr(stamp, "sec") and hasattr(stamp, "nanosec"):
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+    raise TypeError("stamp must expose ROS second/nanosecond fields")
+
+
+def _quaternion_rotation_matrix(quaternion) -> np.ndarray:
+    """xyzw quaternion을 검증해 3x3 회전 행렬로 변환한다."""
+    values = np.asarray(quaternion, dtype=np.float64)
+    if values.shape != (4,):
+        raise ValueError("waypoint transform quaternion must contain four values")
+    x, y, z, w = values
+    norm = float(np.dot(values, values))
+    if norm <= np.finfo(float).eps:
+        raise ValueError("waypoint transform quaternion must be nonzero")
+    scale = 2.0 / norm
+    return np.asarray(
+        [
+            [1.0 - scale * (y * y + z * z), scale * (x * y - z * w), scale * (x * z + y * w)],
+            [scale * (x * y + z * w), 1.0 - scale * (x * x + z * z), scale * (y * z - x * w)],
+            [scale * (x * z - y * w), scale * (y * z + x * w), 1.0 - scale * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def transform_point_xyz(point, translation, rotation) -> np.ndarray:
+    """child-frame point를 parent-frame 좌표로 rigid transform한다."""
+    point_array = np.asarray(point, dtype=np.float64)
+    translation_array = np.asarray(translation, dtype=np.float64)
+    if point_array.shape != (3,) or translation_array.shape != (3,):
+        raise ValueError("waypoint point and translation must contain three values")
+    return rotation @ point_array + translation_array
+
+
+def _default_profile_file() -> str:
+    """Locate the inference-owned profile in source or install space."""
+    package_dir = FilePath(rospkg.RosPack().get_path("validator_inference"))
+    candidates = (
+        package_dir.parent / "config" / "profile.json",
+        package_dir / "config" / "profile.json",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return str(candidates[0])
+
+
+def _load_waypoint_transform(profile_file: str):
+    """Read the common inference-to-BEV transform from the profile contract."""
+    payload = json.loads(FilePath(profile_file).read_text(encoding="utf-8"))
+    try:
+        return payload["common_inference_policy"]["static_transforms"][
+            "T_base_from_lidar"
+        ]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "profile is missing common T_base_from_lidar"
+        ) from error
 
 
 class BevVisualizer:
@@ -67,6 +139,23 @@ class BevVisualizer:
         self.resolution = float(
             rospy.get_param("/bev_geometry/resolution")
         )
+        profile_file = str(rospy.get_param("~profile_file", "")).strip()
+        if not profile_file:
+            profile_file = _default_profile_file()
+        waypoint_transform = _load_waypoint_transform(profile_file)
+        self.waypoint_parent_frame = str(
+            waypoint_transform["parent_frame_id"]
+        ).lstrip("/")
+        self.waypoint_frame_id = str(
+            waypoint_transform["child_frame_id"]
+        ).lstrip("/")
+        self.waypoint_translation = np.asarray(
+            waypoint_transform["translation_m"],
+            dtype=np.float64,
+        )
+        self.waypoint_rotation = _quaternion_rotation_matrix(
+            waypoint_transform["quaternion_xyzw"]
+        )
 
         # Visualizer parameters
         self.camera_topic = rospy.get_param(
@@ -94,6 +183,9 @@ class BevVisualizer:
         self.lidar_threshold = int(
             rospy.get_param("~lidar_threshold", 1)
         )
+        self.lidar_grid_value = int(
+            rospy.get_param("~lidar_grid_value", 60)
+        )
         self.lidar_alpha = float(
             rospy.get_param("~lidar_alpha", 0.7)
         )
@@ -116,6 +208,12 @@ class BevVisualizer:
         self.draw_waypoints_enabled = bool(
             rospy.get_param("~draw_waypoints", True)
         )
+        waypoint_history_size = int(
+            rospy.get_param("~waypoint_history_size", 50)
+        )
+        self.waypoint_max_age = float(
+            rospy.get_param("~waypoint_max_age", 0.5)
+        )
         self.waypoint_radius = int(
             rospy.get_param("~waypoint_radius", 3)
         )
@@ -123,7 +221,12 @@ class BevVisualizer:
             rospy.get_param("~waypoint_line_thickness", 2)
         )
 
-        self.latest_path: Optional[Path] = None
+        if waypoint_history_size <= 0:
+            raise ValueError("~waypoint_history_size must be positive")
+        if self.waypoint_max_age < 0.0:
+            raise ValueError("~waypoint_max_age must be non-negative")
+        self.path_history: Deque[Path] = deque(maxlen=waypoint_history_size)
+        self.path_lock = threading.Lock()
 
         self.overlay_pub = rospy.Publisher(
             self.overlay_topic,
@@ -195,8 +298,40 @@ class BevVisualizer:
                 f"configured={self.width}, calculated={expected_width}"
             )
 
+        if self.waypoint_parent_frame != self.frame_id.lstrip("/"):
+            raise ValueError(
+                "waypoint transform parent must match BEV frame: "
+                f"parent={self.waypoint_parent_frame}, bev={self.frame_id}"
+            )
+        if self.waypoint_translation.shape != (3,):
+            raise ValueError("waypoint transform translation must contain three values")
+
     def waypoints_callback(self, msg: Path) -> None:
-        self.latest_path = msg
+        with self.path_lock:
+            self.path_history.append(msg)
+
+    def path_at(self, reference_stamp) -> Optional[Path]:
+        """BEV 시각 이하의 가장 최신 causal path를 age 제한 안에서 고른다."""
+        reference_ns = _stamp_to_nsec(reference_stamp)
+        with self.path_lock:
+            history = tuple(self.path_history)
+        candidates = [
+            path
+            for path in history
+            if _stamp_to_nsec(path.header.stamp) <= reference_ns
+        ]
+        if not candidates:
+            return None
+        selected = max(
+            candidates,
+            key=lambda path: _stamp_to_nsec(path.header.stamp),
+        )
+        age_seconds = (
+            reference_ns - _stamp_to_nsec(selected.header.stamp)
+        ) / 1_000_000_000.0
+        if age_seconds > self.waypoint_max_age:
+            return None
+        return selected
 
     def metric_to_pixel(
         self,
@@ -277,6 +412,8 @@ class BevVisualizer:
         LiDAR mono8 영상으로부터 BGR 색상 영상과 유효 mask를 만든다.
         """
         lidar_mask = lidar_bev >= self.lidar_threshold
+        if 0 <= self.lidar_grid_value <= 255:
+            lidar_mask &= lidar_bev != self.lidar_grid_value
 
         lidar_color_image = np.zeros(
             (self.height, self.width, 3),
@@ -316,33 +453,44 @@ class BevVisualizer:
     def draw_waypoints(
         self,
         image: np.ndarray,
+        reference_stamp,
     ) -> np.ndarray:
         if not self.draw_waypoints_enabled:
             return image
 
-        if self.latest_path is None:
+        path = self.path_at(reference_stamp)
+        if path is None:
             return image
 
-        path_frame = self.latest_path.header.frame_id
+        path_frame = str(path.header.frame_id).lstrip("/")
+        bev_frame = self.frame_id.lstrip("/")
 
-        if path_frame not in ("", self.frame_id):
+        if path_frame not in ("", bev_frame, self.waypoint_frame_id):
             rospy.logwarn_throttle(
                 2.0,
-                "Waypoint frame이 %s입니다. 현재 visualizer는 %s만 지원합니다. "
-                "추론 노드에서 waypoint를 base_link 기준으로 발행하거나 "
-                "tf2 변환을 추가하십시오.",
+                "Waypoint frame %s은 BEV frame %s 또는 계약 frame %s이 아닙니다.",
                 path_frame,
-                self.frame_id,
+                bev_frame,
+                self.waypoint_frame_id,
             )
             return image
 
         pixels = []
 
-        for pose_stamped in self.latest_path.poses:
-            x = pose_stamped.pose.position.x
-            y = pose_stamped.pose.position.y
+        for pose_stamped in path.poses:
+            position = pose_stamped.pose.position
+            point = np.asarray(
+                [float(position.x), float(position.y), float(position.z)],
+                dtype=np.float64,
+            )
+            if path_frame == self.waypoint_frame_id:
+                point = transform_point_xyz(
+                    point,
+                    self.waypoint_translation,
+                    self.waypoint_rotation,
+                )
 
-            row, col = self.metric_to_pixel(x, y)
+            row, col = self.metric_to_pixel(float(point[0]), float(point[1]))
 
             if (
                 0 <= row < self.height
@@ -410,6 +558,19 @@ class BevVisualizer:
         camera_msg: Image,
         lidar_msg: Image,
     ) -> None:
+        expected_frame = self.frame_id.lstrip("/")
+        for label, message in (("camera", camera_msg), ("lidar", lidar_msg)):
+            observed_frame = str(message.header.frame_id).lstrip("/")
+            if observed_frame and observed_frame != expected_frame:
+                rospy.logerr_throttle(
+                    1.0,
+                    "%s BEV frame mismatch: received=%s configured=%s",
+                    label,
+                    observed_frame,
+                    expected_frame,
+                )
+                return
+
         try:
             camera_bev = self.bridge.imgmsg_to_cv2(
                 camera_msg,
@@ -445,7 +606,11 @@ class BevVisualizer:
             lidar_mask,
         )
 
-        overlay = self.draw_waypoints(overlay)
+        reference_stamp = min(
+            (camera_msg.header.stamp, lidar_msg.header.stamp),
+            key=_stamp_to_nsec,
+        )
+        overlay = self.draw_waypoints(overlay, reference_stamp)
 
         camera_panel = self.add_label(
             camera_bev,
@@ -497,7 +662,13 @@ def main() -> None:
         BevVisualizer()
         rospy.spin()
 
-    except (KeyError, ValueError, rospy.ROSException) as error:
+    except (
+        KeyError,
+        OSError,
+        ValueError,
+        rospkg.ResourceNotFound,
+        rospy.ROSException,
+    ) as error:
         rospy.logfatal("BEV visualizer initialization failed: %s", error)
         raise
 
