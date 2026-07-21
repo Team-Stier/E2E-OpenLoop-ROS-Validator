@@ -254,6 +254,54 @@ def test_build_ros_overlay_requires_package_init_module(tmp_path: Path):
         build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
 
 
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "import rosgraph.missing_module\n",
+        "from std_msgs.msg.missing_module import Missing\n",
+        "from .missing_relative import Missing\n",
+    ),
+)
+def test_build_ros_overlay_rejects_missing_selected_package_imports(
+    tmp_path: Path, statement: str
+):
+    """선택 package 내부 absolute·relative import의 누락 module closure를 거부한다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rospy" / "client.py").write_text(statement, encoding="utf-8")
+
+    with pytest.raises(EnvironmentSetupError, match="import closure"):
+        build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+
+def test_build_ros_overlay_accepts_external_optional_and_exported_symbol_imports(
+    tmp_path: Path,
+):
+    """allowlist 밖 optional import와 from-dot exported symbol은 module로 오판하지 않는다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rospy" / "client.py").write_text(
+        "import rosnode\n"
+        "import rosservice\n"
+        "import em\n"
+        "from . import exported_symbol\n"
+        "from . import client\n"
+        "from rosgraph import exported_symbol\n",
+        encoding="utf-8",
+    )
+
+    manifest = build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+    assert any(record.destination_path == Path("rospy/client.py") for record in manifest.files)
+
+
+def test_build_ros_overlay_rejects_python_syntax_errors(tmp_path: Path):
+    """복사 대상 Python source가 AST parse되지 않으면 candidate를 만들지 않는다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rospy" / "client.py").write_text("def broken(:\n", encoding="utf-8")
+
+    with pytest.raises(EnvironmentSetupError, match="syntax"):
+        build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+
 @pytest.mark.parametrize("suffix", (".so", ".cpython-38-x86_64-linux-gnu.so", ".pyd", ".dylib", ".dll"))
 def test_build_ros_overlay_rejects_native_extensions(tmp_path: Path, suffix: str):
     """허용 package 안의 Python ABI 또는 native library를 overlay에 넣지 않는다."""
@@ -489,6 +537,38 @@ def test_verify_ros_overlay_rejects_duplicate_json_keys(tmp_path: Path):
         '{"schema":1,"schema":1,"packages":[],"files":[]}\n', encoding="utf-8"
     )
     with pytest.raises(EnvironmentSetupError, match="duplicate"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
+def test_verify_ros_overlay_rejects_fifo_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """manifest FIFO를 read_bytes로 열어 block하기 전에 lstat 형식으로 거부한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    manifest.manifest_path.unlink()
+    os.mkfifo(str(manifest.manifest_path))
+    real_read_bytes = Path.read_bytes
+
+    def reject_fifo_read(path: Path) -> bytes:
+        """FIFO read 시도를 즉시 노출하고 일반 파일은 기존 구현으로 읽는다."""
+        if path == manifest.manifest_path:
+            raise AssertionError("FIFO read attempted")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_fifo_read)
+
+    with pytest.raises(EnvironmentSetupError, match="regular"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
+def test_verify_ros_overlay_normalizes_recursive_json(tmp_path: Path):
+    """decoder recursion 한계를 넘는 manifest를 domain 오류로 정규화한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    manifest.manifest_path.write_text(
+        "[" * 2000 + "0" + "]" * 2000 + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="JSON"):
         verify_ros_overlay(destination, manifest.manifest_path)
 
 

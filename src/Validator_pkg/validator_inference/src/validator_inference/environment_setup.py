@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -266,6 +267,109 @@ def _require_package_init(package_root: Path, package: str, action: str) -> None
         _raise(action, f"ROS package __init__.py must be a regular file: {package}")
 
 
+def _module_is_copied(module: Sequence[str], copied: set[Path]) -> bool:
+    """dotted module이 복사 예정 .py 또는 package/__init__.py로 존재하는지 판별한다."""
+    if not module:
+        return False
+    module_path = Path(*module)
+    return module_path.with_suffix(".py") in copied or (
+        module_path / "__init__.py"
+    ) in copied
+
+
+def _relative_import_module(
+    source: Path, node: ast.ImportFrom, action: str
+) -> tuple[str, ...]:
+    """한 relative ImportFrom의 기준 package와 명시 module을 절대 parts로 바꾼다."""
+    package = list(source.parent.parts)
+    if node.level > len(package):
+        _raise(
+            action,
+            f"import closure escapes top-level package in {source.as_posix()}",
+        )
+    parent_count = node.level - 1
+    if parent_count:
+        package = package[:-parent_count]
+    if node.module:
+        package.extend(node.module.split("."))
+    return tuple(package)
+
+
+def _require_imported_module(
+    module: Sequence[str], copied: set[Path], source: Path, action: str
+) -> None:
+    """참조한 선택 package module이 copied set에 없으면 closure 오류를 낸다."""
+    if not _module_is_copied(module, copied):
+        _raise(
+            action,
+            "import closure is missing module "
+            + ".".join(module)
+            + f" referenced by {source.as_posix()}",
+        )
+
+
+def _validate_import_node(
+    node: ast.AST,
+    source: Path,
+    packages: tuple[str, ...],
+    copied: set[Path],
+    action: str,
+) -> None:
+    """한 AST import node가 선택 package copied closure 안에서 해석되는지 검사한다."""
+    selected = set(packages)
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            module = tuple(alias.name.split("."))
+            if module[0] in selected:
+                _require_imported_module(module, copied, source, action)
+        return
+    if not isinstance(node, ast.ImportFrom):
+        return
+    if node.level:
+        module = _relative_import_module(source, node, action)
+        _require_imported_module(module, copied, source, action)
+        if node.module is None:
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                candidate = (*module, *alias.name.split("."))
+                # ``from . import x``의 x는 submodule일 수도 exported symbol일 수도
+                # 있다. 실제 copied module이 있을 때만 module로 분류한다.
+                if _module_is_copied(candidate, copied):
+                    _require_imported_module(candidate, copied, source, action)
+        return
+    if not node.module:
+        return
+    module = tuple(node.module.split("."))
+    if module[0] in selected:
+        _require_imported_module(module, copied, source, action)
+
+
+def _validate_import_closure(
+    discovered: Sequence[tuple[Path, Path]],
+    packages: tuple[str, ...],
+    action: str,
+) -> None:
+    """모든 복사 예정 Python source의 선택 package와 relative import closure를 검사한다."""
+    copied = {relative for _source, relative in discovered}
+    for source_path, relative in discovered:
+        try:
+            tree = ast.parse(source_path.read_bytes(), filename=str(source_path))
+        except SyntaxError as exc:
+            raise EnvironmentSetupError(
+                action, f"Python syntax error in ROS source: {relative.as_posix()}"
+            ) from exc
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                action, f"cannot read ROS Python source: {source_path}"
+            ) from exc
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                _validate_import_node(
+                    node, relative, packages, copied, action
+                )
+
+
 def _overlay_payload(
     packages: tuple[str, ...], files: tuple[RosOverlayFile, ...]
 ) -> dict[str, Any]:
@@ -351,6 +455,7 @@ def build_ros_overlay(
             _raise(action, f"declared ROS package has no Python source: {package}")
         discovered.extend(package_files)
     discovered.sort(key=lambda item: item[1].as_posix())
+    _validate_import_closure(discovered, selected_packages, action)
 
     try:
         target.mkdir(parents=True, exist_ok=False)
@@ -453,20 +558,23 @@ def _read_overlay_manifest(path: Path, action: str) -> RosOverlayManifest:
     _reject_existing_symlink_chain(path, action, "manifest")
     try:
         metadata = path.lstat()
-        encoded = path.read_bytes()
     except FileNotFoundError as exc:
         raise EnvironmentSetupError(action, f"manifest is missing: {path}") from exc
     except OSError as exc:
-        raise EnvironmentSetupError(action, f"cannot read manifest: {path}") from exc
+        raise EnvironmentSetupError(action, f"cannot inspect manifest: {path}") from exc
     if not stat.S_ISREG(metadata.st_mode):
         _raise(action, f"manifest is not a regular file: {path}")
+    try:
+        encoded = path.read_bytes()
+    except OSError as exc:
+        raise EnvironmentSetupError(action, f"cannot read manifest: {path}") from exc
     try:
         payload = json.loads(
             encoded.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
         )
     except EnvironmentSetupError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise EnvironmentSetupError(action, "manifest is not valid UTF-8 JSON") from exc
     if not isinstance(payload, dict):
         _raise(action, "manifest must be a JSON object")
