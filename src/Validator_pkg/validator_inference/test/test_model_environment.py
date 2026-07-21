@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
+import validator_inference.model_environment as model_environment
 from validator_inference.model_environment import (
     ActiveEnvironmentCheck,
     AssetFingerprint,
@@ -20,12 +22,16 @@ from validator_inference.model_environment import (
     EnvironmentState,
     EnvironmentStateError,
     ModelEnvironmentDefinition,
+    build_model_process_environment,
     build_uv_sync_argv,
     build_uv_venv_argv,
     environment_paths,
+    inspect_active_environment,
     load_environment_manifest,
+    read_environment_state,
     select_model_environment,
     sha256_file,
+    write_environment_state,
 )
 
 
@@ -250,6 +256,617 @@ def _assert_compile_command_contract(
     assert positional == [input_path], "compile command must have one exact input path"
     assert parsed_values == expected_values
     assert parsed_valueless == valueless_flags
+
+
+def _valid_environment_state(
+    project_root: Path,
+    environment_dir: Path,
+    definition: ModelEnvironmentDefinition,
+    manifest_sha256: str = "a" * 64,
+) -> EnvironmentState:
+    """검사 가능한 build와 asset을 만들고 그 fingerprint state를 반환한다."""
+    python = environment_dir / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python.chmod(0o700)
+    overlay_manifest = environment_dir / ".ros-overlay-manifest.json"
+    overlay_manifest.write_text('{"packages": []}\n', encoding="utf-8")
+    asset = project_root / "models" / definition.model_id / "weights.bin"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(b"runtime asset")
+    metadata = asset.stat()
+    return EnvironmentState(
+        schema=1,
+        model_id=definition.model_id,
+        python_version=definition.python_version,
+        python_platform="x86_64-manylinux_2_31",
+        uv_version="0.11.14",
+        manifest_sha256=manifest_sha256,
+        lock_sha256=definition.requirements_lock_sha256,
+        ros_overlay_sha256=sha256_file(overlay_manifest),
+        source_commit=definition.source_commit,
+        installed_packages_sha256="b" * 64,
+        python_executable=Path("bin/python"),
+        assets=(
+            AssetFingerprint(
+                path=Path("models") / definition.model_id / "weights.bin",
+                sha256=sha256_file(asset),
+                size=metadata.st_size,
+                mtime_ns=metadata.st_mtime_ns,
+            ),
+        ),
+        completed_at="2026-07-21T12:34:56Z",
+        preflight_ids=("python_imports", "runtime_assets"),
+    )
+
+
+def _active_environment_fixture(
+    tmp_path: Path, definition: ModelEnvironmentDefinition
+) -> tuple[EnvironmentPaths, Path, EnvironmentState]:
+    """current symlink가 선택한 정상 build와 state를 구성한다."""
+    paths = environment_paths(tmp_path, definition.model_id)
+    environment_dir = paths.builds / "build-001"
+    environment_dir.mkdir(parents=True)
+    state = _valid_environment_state(tmp_path, environment_dir, definition)
+    write_environment_state(environment_dir / ".validator-environment.json", state)
+    paths.current.symlink_to(Path("builds") / environment_dir.name)
+    return paths, environment_dir, state
+
+
+def _state_payload(state: EnvironmentState) -> dict[str, Any]:
+    """state writer의 JSON을 변형 가능한 payload로 읽는다."""
+    return {
+        "schema": state.schema,
+        "model_id": state.model_id,
+        "python_version": state.python_version,
+        "python_platform": state.python_platform,
+        "uv_version": state.uv_version,
+        "manifest_sha256": state.manifest_sha256,
+        "lock_sha256": state.lock_sha256,
+        "ros_overlay_sha256": state.ros_overlay_sha256,
+        "source_commit": state.source_commit,
+        "installed_packages_sha256": state.installed_packages_sha256,
+        "python_executable": state.python_executable.as_posix(),
+        "assets": [
+            {
+                "path": asset.path.as_posix(),
+                "sha256": asset.sha256,
+                "size": asset.size,
+                "mtime_ns": asset.mtime_ns,
+            }
+            for asset in state.assets
+        ],
+        "completed_at": state.completed_at,
+        "preflight_ids": list(state.preflight_ids),
+    }
+
+
+def test_environment_state_roundtrip_is_deterministic_and_uses_posix_paths(
+    tmp_path: Path, manifest: EnvironmentManifest
+):
+    """state JSON이 안정된 정렬·들여쓰기·개행과 POSIX 경로로 왕복되는지 검사한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    state = _valid_environment_state(
+        tmp_path, environment_dir, manifest.models["interfuser"]
+    )
+    state_path = environment_dir / ".validator-environment.json"
+
+    write_environment_state(state_path, state)
+    first = state_path.read_bytes()
+    write_environment_state(state_path, read_environment_state(environment_dir))
+
+    assert read_environment_state(environment_dir) == state
+    assert state_path.read_bytes() == first
+    assert first == (json.dumps(_state_payload(state), indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    assert os.stat(state_path).st_mode & 0o777 == 0o600
+
+
+def test_environment_state_write_replaces_atomically(
+    tmp_path: Path, manifest: EnvironmentManifest, monkeypatch: pytest.MonkeyPatch
+):
+    """state writer가 같은 directory의 임시 파일을 os.replace로 선택하는지 검사한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    state = _valid_environment_state(
+        tmp_path, environment_dir, manifest.models["interfuser"]
+    )
+    state_path = environment_dir / ".validator-environment.json"
+    state_path.write_text("old\n", encoding="utf-8")
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = os.replace
+
+    def recording_replace(source: Any, target: Any) -> None:
+        """atomic 교체 인자를 기록한 뒤 실제 교체를 수행한다."""
+        replacements.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    monkeypatch.setattr(model_environment.os, "replace", recording_replace)
+    write_environment_state(state_path, state)
+
+    assert len(replacements) == 1
+    temporary, target = replacements[0]
+    assert temporary.parent == state_path.parent
+    assert target == state_path
+    assert not temporary.exists()
+    assert read_environment_state(environment_dir) == state
+
+
+def test_environment_state_write_cleans_temporary_file_after_replace_failure(
+    tmp_path: Path, manifest: EnvironmentManifest, monkeypatch: pytest.MonkeyPatch
+):
+    """atomic replace 실패 시 기존 state와 directory 내용을 보존하는지 검사한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    state = _valid_environment_state(
+        tmp_path, environment_dir, manifest.models["interfuser"]
+    )
+    state_path = environment_dir / ".validator-environment.json"
+    state_path.write_text("old state\n", encoding="utf-8")
+    before = set(environment_dir.iterdir())
+
+    def fail_replace(source: Any, target: Any) -> None:
+        """교체 단계의 운영체제 오류를 재현한다."""
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(model_environment.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        write_environment_state(state_path, state)
+
+    assert state_path.read_text(encoding="utf-8") == "old state\n"
+    assert set(environment_dir.iterdir()) == before
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    (
+        (lambda payload: payload.pop("schema"), "missing keys"),
+        (lambda payload: payload.update(extra=True), "unknown keys"),
+        (lambda payload: payload.update(schema=True), "schema"),
+        (lambda payload: payload.update(schema=2), "schema"),
+        (lambda payload: payload.update(model_id="unknown"), "model_id"),
+        (lambda payload: payload.update(python_version="3.8"), "python_version"),
+        (lambda payload: payload.update(python_platform="linux"), "python_platform"),
+        (lambda payload: payload.update(uv_version="0.11.15"), "uv_version"),
+        (lambda payload: payload.update(manifest_sha256="A" * 64), "manifest_sha256"),
+        (lambda payload: payload.update(lock_sha256="0" * 63), "lock_sha256"),
+        (lambda payload: payload.update(ros_overlay_sha256=12), "ros_overlay_sha256"),
+        (lambda payload: payload.update(source_commit="g" * 40), "source_commit"),
+        (
+            lambda payload: payload.update(installed_packages_sha256="x"),
+            "installed_packages_sha256",
+        ),
+        (lambda payload: payload.update(python_executable="/bin/python"), "python_executable"),
+        (
+            lambda payload: payload.update(python_executable="bin/../../python"),
+            "python_executable",
+        ),
+        (lambda payload: payload.update(completed_at="2026-02-30T00:00:00Z"), "completed_at"),
+        (lambda payload: payload.update(preflight_ids=["ok", "ok"]), "preflight_ids"),
+        (lambda payload: payload.update(preflight_ids=["bad id"]), "preflight_ids"),
+        (lambda payload: payload.update(assets={}), "assets"),
+        (
+            lambda payload: payload["assets"][0].update(path="../weights.bin"),
+            "assets.path",
+        ),
+        (
+            lambda payload: payload["assets"].append(dict(payload["assets"][0])),
+            "duplicate asset path",
+        ),
+        (lambda payload: payload["assets"][0].update(sha256="z" * 64), "assets.sha256"),
+        (lambda payload: payload["assets"][0].update(size=True), "assets.size"),
+        (lambda payload: payload["assets"][0].update(mtime_ns=-1), "assets.mtime_ns"),
+        (lambda payload: payload["assets"][0].update(extra=True), "unknown keys"),
+    ),
+)
+def test_environment_state_rejects_malformed_payloads(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    mutate: Callable[[dict[str, Any]], None],
+    match: str,
+):
+    """state의 schema, 형식, ID, digest와 상대 경로를 엄격히 검증한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    state = _valid_environment_state(
+        tmp_path, environment_dir, manifest.models["interfuser"]
+    )
+    payload = _state_payload(state)
+    mutate(payload)
+    (environment_dir / ".validator-environment.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    with pytest.raises(EnvironmentStateError, match=match):
+        read_environment_state(environment_dir)
+
+
+def test_environment_state_rejects_duplicate_json_keys(tmp_path: Path):
+    """JSON decoder 단계에서 중복 state key도 손상으로 거부하는지 검사한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    (environment_dir / ".validator-environment.json").write_text(
+        '{"schema": 1, "schema": 1}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(EnvironmentStateError, match="duplicate key: schema"):
+        read_environment_state(environment_dir)
+
+
+def test_inspect_active_environment_accepts_matching_state_without_hashing_assets(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """빠른 active 검사가 asset 본문 hash 없이 fingerprint만 확인하는지 검사한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, state = _active_environment_fixture(tmp_path, definition)
+    asset_path = tmp_path / state.assets[0].path
+    hashed: list[Path] = []
+    real_sha256_file = sha256_file
+
+    def recording_sha256_file(path: Path) -> str:
+        """overlay hash 호출만 허용하고 asset deep hash 호출을 기록한다."""
+        hashed.append(Path(path))
+        if Path(path) == asset_path:
+            raise AssertionError("active inspection must not hash a runtime asset")
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(model_environment, "sha256_file", recording_sha256_file)
+
+    assert inspect_active_environment(paths, definition, "a" * 64) == (
+        ActiveEnvironmentCheck(True, "ready", environment_dir.resolve(), state)
+    )
+    assert hashed == [environment_dir / ".ros-overlay-manifest.json"]
+
+
+@pytest.mark.parametrize(
+    "kind,reason",
+    (
+        ("missing", "current"),
+        ("regular", "symlink"),
+        ("dangling", "dangling"),
+        ("outside", "builds"),
+        ("nested", "immediate"),
+    ),
+)
+def test_inspect_active_environment_rejects_invalid_current_selection(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    kind: str,
+    reason: str,
+):
+    """current가 없거나 안전한 immediate build symlink가 아니면 거부하는지 검사한다."""
+    definition = manifest.models["interfuser"]
+    paths = environment_paths(tmp_path, definition.model_id)
+    paths.model_root.mkdir(parents=True)
+    if kind == "regular":
+        paths.current.write_text("not a symlink\n", encoding="utf-8")
+    elif kind == "dangling":
+        paths.current.symlink_to(Path("builds") / "missing")
+    elif kind == "outside":
+        outside = tmp_path / "outside-build"
+        outside.mkdir()
+        paths.current.symlink_to(outside)
+    elif kind == "nested":
+        nested = paths.builds / "group" / "build-001"
+        nested.mkdir(parents=True)
+        paths.current.symlink_to(Path("builds") / "group" / "build-001")
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert reason in check.reason
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ("missing", "directory", "not-executable"),
+)
+def test_inspect_active_environment_rejects_unusable_selected_python(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    kind: str,
+):
+    """선택 build의 bin/python이 일반 실행 파일이 아니면 거부하는지 검사한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, _ = _active_environment_fixture(tmp_path, definition)
+    python = environment_dir / "bin" / "python"
+    python.unlink()
+    if kind == "directory":
+        python.mkdir()
+    elif kind == "not-executable":
+        python.write_text("#!/bin/sh\n", encoding="utf-8")
+        python.chmod(0o600)
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert "bin/python" in check.reason
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    (
+        (lambda state: replace(state, model_id="tfv6"), "model"),
+        (lambda state: replace(state, python_version="3.8.19"), "Python"),
+        (lambda state: replace(state, manifest_sha256="c" * 64), "manifest"),
+        (lambda state: replace(state, lock_sha256="c" * 64), "lock"),
+        (lambda state: replace(state, source_commit="c" * 40), "source"),
+        (
+            lambda state: replace(state, python_executable=Path("bin/python3")),
+            "python_executable",
+        ),
+    ),
+)
+def test_inspect_active_environment_rejects_stale_definition_state(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    change: Callable[[EnvironmentState], EnvironmentState],
+    reason: str,
+):
+    """모델·Python·definition digest·source가 달라진 active state를 거부한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, state = _active_environment_fixture(tmp_path, definition)
+    write_environment_state(
+        environment_dir / ".validator-environment.json", change(state)
+    )
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert reason in check.reason
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("schema", 2),
+        ("python_platform", "x86_64-manylinux_2_30"),
+        ("uv_version", "0.11.13"),
+    ),
+)
+def test_inspect_active_environment_converts_malformed_state_to_invalid_result(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    field: str,
+    value: Any,
+):
+    """지원하지 않는 schema·platform·uv state가 정상 run에서 예외를 내지 않는지 검사한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, state = _active_environment_fixture(tmp_path, definition)
+    payload = _state_payload(state)
+    payload[field] = value
+    (environment_dir / ".validator-environment.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert "state" in check.reason
+
+
+@pytest.mark.parametrize("kind", ("missing", "directory", "mutated"))
+def test_inspect_active_environment_rejects_invalid_overlay_manifest(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    kind: str,
+):
+    """ROS overlay manifest가 없거나 일반 파일이 아니거나 바뀌면 거부한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, _ = _active_environment_fixture(tmp_path, definition)
+    overlay_manifest = environment_dir / ".ros-overlay-manifest.json"
+    overlay_manifest.unlink()
+    if kind == "directory":
+        overlay_manifest.mkdir()
+    elif kind == "mutated":
+        overlay_manifest.write_text('{"packages": ["changed"]}\n', encoding="utf-8")
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert "overlay manifest" in check.reason
+
+
+@pytest.mark.parametrize(
+    "kind,reason",
+    (
+        ("missing", "missing"),
+        ("directory", "regular"),
+        ("symlink", "symlink"),
+        ("size", "size"),
+        ("mtime", "mtime"),
+    ),
+)
+def test_inspect_active_environment_rejects_stale_or_unsafe_assets(
+    tmp_path: Path,
+    manifest: EnvironmentManifest,
+    kind: str,
+    reason: str,
+):
+    """asset의 존재·형식·size·nanosecond mtime fingerprint를 검사한다."""
+    definition = manifest.models["interfuser"]
+    paths, _, state = _active_environment_fixture(tmp_path, definition)
+    asset = tmp_path / state.assets[0].path
+    if kind == "missing":
+        asset.unlink()
+    elif kind == "directory":
+        asset.unlink()
+        asset.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "other-weights.bin"
+        target.write_bytes(b"runtime asset")
+        os.utime(target, ns=(state.assets[0].mtime_ns, state.assets[0].mtime_ns))
+        asset.unlink()
+        asset.symlink_to(target)
+    elif kind == "size":
+        asset.write_bytes(b"changed asset size")
+    elif kind == "mtime":
+        changed = state.assets[0].mtime_ns + 1_000_000
+        os.utime(asset, ns=(changed, changed))
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert reason in check.reason
+
+
+def test_inspect_active_environment_rejects_symlinked_asset_parent(
+    tmp_path: Path, manifest: EnvironmentManifest
+):
+    """repository-relative asset 경로의 중간 directory symlink도 거부한다."""
+    definition = manifest.models["interfuser"]
+    paths, _, state = _active_environment_fixture(tmp_path, definition)
+    models = tmp_path / "models"
+    relocated = tmp_path / "relocated-models"
+    models.rename(relocated)
+    models.symlink_to(relocated, target_is_directory=True)
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert "symlink" in check.reason
+
+
+def test_inspect_active_environment_rejects_untrusted_path_layout(
+    tmp_path: Path, manifest: EnvironmentManifest
+):
+    """project/.venvs/MODEL에서 안전하게 유도할 수 없는 path 묶음을 거부한다."""
+    definition = manifest.models["interfuser"]
+    model_root = tmp_path / ".venvs" / definition.model_id
+    wrong_paths = EnvironmentPaths(
+        model_root=model_root,
+        builds=tmp_path / "foreign-builds",
+        current=model_root / "current",
+    )
+
+    check = inspect_active_environment(wrong_paths, definition, "a" * 64)
+
+    assert not check.valid
+    assert "layout" in check.reason
+
+
+def test_build_model_process_environment_sanitizes_python_activation_state(
+    tmp_path: Path,
+):
+    """child process 환경이 선택 venv와 ROS path만 사용하고 ROS 변수는 보존한다."""
+    project_root = tmp_path.resolve()
+    environment_dir = project_root / ".venvs" / "interfuser" / "builds" / "build-1"
+    selected_bin = environment_dir / "bin"
+    selected_bin.mkdir(parents=True)
+    python = selected_bin / "python"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o700)
+    ros_overlay = environment_dir / ".ros-overlay"
+    catkin_python_path = project_root / "devel" / "lib" / "python3" / "dist-packages"
+    ros_overlay.mkdir()
+    catkin_python_path.mkdir(parents=True)
+    foreign = project_root / "foreign venv"
+    inherited = {
+        "HOME": "/home/operator",
+        "PATH": os.pathsep.join(
+            (
+                str(foreign / "bin"),
+                "/usr/local/bin",
+                str(selected_bin),
+                "/usr/bin",
+                "/usr/local/bin",
+                "",
+                "/bin",
+            )
+        ),
+        "PYTHONPATH": "/untrusted/python:/another/python",
+        "PYTHONHOME": "/foreign/python",
+        "PYTHONUSERBASE": "/foreign/userbase",
+        "PYTHONNOUSERSITE": "0",
+        "VIRTUAL_ENV": str(foreign),
+        "VIRTUAL_ENV_PROMPT": "(foreign) ",
+        "CONDA_PREFIX": "/opt/conda/envs/foreign",
+        "CONDA_DEFAULT_ENV": "foreign",
+        "CONDA_SHLVL": "2",
+        "CONDA_EXE": "/opt/conda/bin/conda",
+        "_CE_CONDA": "conda",
+        "_CE_M": "-m",
+        "TORCH_HOME": "/foreign/torch-cache",
+        "ROS_MASTER_URI": "http://127.0.0.1:11311",
+        "ROS_IP": "127.0.0.1",
+        "CUSTOM_RUNTIME_FLAG": "keep-me",
+    }
+
+    actual = build_model_process_environment(
+        inherited,
+        environment_dir,
+        ros_overlay,
+        catkin_python_path,
+        project_root,
+    )
+
+    assert actual == {
+        "HOME": "/home/operator",
+        "PATH": os.pathsep.join(
+            (str(selected_bin), "/usr/local/bin", "/usr/bin", "/bin")
+        ),
+        "VIRTUAL_ENV": str(environment_dir),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": os.pathsep.join((str(ros_overlay), str(catkin_python_path))),
+        "TORCH_HOME": str(project_root / "models" / "shared" / "torch-cache"),
+        "ROS_MASTER_URI": "http://127.0.0.1:11311",
+        "ROS_IP": "127.0.0.1",
+        "CUSTOM_RUNTIME_FLAG": "keep-me",
+    }
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        "relative-environment",
+        "relative-overlay",
+        "relative-catkin",
+        "relative-project",
+        "missing-python",
+        "non-executable-python",
+        "missing-overlay",
+        "missing-catkin",
+    ),
+)
+def test_build_model_process_environment_rejects_invalid_paths(
+    tmp_path: Path, invalid: str
+):
+    """child 환경을 만들기 전에 모든 입력 절대 경로와 필수 파일·directory를 검증한다."""
+    project_root = tmp_path.resolve()
+    environment_dir = project_root / "environment"
+    python = environment_dir / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o700)
+    ros_overlay = project_root / "overlay"
+    catkin_python_path = project_root / "catkin"
+    ros_overlay.mkdir()
+    catkin_python_path.mkdir()
+    if invalid == "relative-environment":
+        environment_dir = Path("environment")
+    elif invalid == "relative-overlay":
+        ros_overlay = Path("overlay")
+    elif invalid == "relative-catkin":
+        catkin_python_path = Path("catkin")
+    elif invalid == "relative-project":
+        project_root = Path("project")
+    elif invalid == "missing-python":
+        python.unlink()
+    elif invalid == "non-executable-python":
+        python.chmod(0o600)
+    elif invalid == "missing-overlay":
+        ros_overlay.rmdir()
+    elif invalid == "missing-catkin":
+        catkin_python_path.rmdir()
+
+    with pytest.raises(EnvironmentStateError):
+        build_model_process_environment(
+            {}, environment_dir, ros_overlay, catkin_python_path, project_root
+        )
 
 
 def test_manifest_defines_exact_common_contract(manifest: EnvironmentManifest):

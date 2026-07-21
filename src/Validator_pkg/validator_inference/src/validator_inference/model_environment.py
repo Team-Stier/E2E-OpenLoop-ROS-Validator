@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
@@ -23,6 +27,11 @@ SUPPORTED_MODEL_IDS = (
     "diffusiondrive_v2",
     "sparsedrive_v2",
 )
+ENVIRONMENT_STATE_FILENAME = ".validator-environment.json"
+ROS_OVERLAY_MANIFEST_FILENAME = ".ros-overlay-manifest.json"
+ENVIRONMENT_STATE_SCHEMA = 1
+EXPECTED_PYTHON_PLATFORM = "x86_64-manylinux_2_31"
+EXPECTED_UV_VERSION = "0.11.14"
 _TOP_LEVEL_KEYS = {
     "schema",
     "uv_version",
@@ -53,6 +62,27 @@ _IMPORT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\
 _TORCH_BACKEND = re.compile(r"cu[0-9]{3}\Z")
 _SETUP_ACTION_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 _SETUP_ACTIONS = {"build_sparsedrive_cuda_extensions"}
+_PREFLIGHT_ID = re.compile(r"[a-z][a-z0-9_]*\Z")
+_UTC_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
+)
+_STATE_KEYS = {
+    "schema",
+    "model_id",
+    "python_version",
+    "python_platform",
+    "uv_version",
+    "manifest_sha256",
+    "lock_sha256",
+    "ros_overlay_sha256",
+    "source_commit",
+    "installed_packages_sha256",
+    "python_executable",
+    "assets",
+    "completed_at",
+    "preflight_ids",
+}
+_ASSET_KEYS = {"path", "sha256", "size", "mtime_ns"}
 
 
 class EnvironmentConfigError(ValueError):
@@ -142,6 +172,260 @@ class ActiveEnvironmentCheck:
     reason: str
     environment_dir: Optional[Path]
     state: Optional[EnvironmentState]
+
+
+def _reject_duplicate_state_keys(
+    pairs: Sequence[tuple[str, Any]],
+) -> dict[str, Any]:
+    """state JSON object의 중복 key를 손상으로 분류해 거부한다."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise EnvironmentStateError(f"duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _require_state_object(value: Any, context: str) -> dict[str, Any]:
+    """state 값이 JSON object인지 확인한다."""
+    if not isinstance(value, dict):
+        raise EnvironmentStateError(f"{context} must be an object")
+    return value
+
+
+def _require_state_exact_keys(
+    value: Mapping[str, Any], expected: set[str], context: str
+) -> None:
+    """state object의 누락 key와 알려지지 않은 key를 거부한다."""
+    missing = expected - set(value)
+    unknown = set(value) - expected
+    if missing:
+        raise EnvironmentStateError(
+            f"{context} missing keys: {', '.join(sorted(missing))}"
+        )
+    if unknown:
+        raise EnvironmentStateError(
+            f"{context} unknown keys: {', '.join(sorted(unknown))}"
+        )
+
+
+def _require_state_string(value: Any, context: str) -> str:
+    """state 값이 비어 있지 않은 문자열인지 확인한다."""
+    if not isinstance(value, str) or not value:
+        raise EnvironmentStateError(f"{context} must be a nonempty string")
+    return value
+
+
+def _require_state_sha256(value: Any, context: str) -> str:
+    """state digest가 lowercase SHA-256 형식인지 확인한다."""
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise EnvironmentStateError(
+            f"{context} must be a lowercase 64-digit SHA-256"
+        )
+    return value
+
+
+def _require_safe_state_path(value: Any, context: str) -> Path:
+    """state의 repository 상대 POSIX 경로가 탈출하거나 변형되지 않게 한다."""
+    raw_path = _require_state_string(value, context)
+    relative = PurePosixPath(raw_path)
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or "." in relative.parts
+        or "\\" in raw_path
+        or relative.as_posix() != raw_path
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw_path)
+    ):
+        raise EnvironmentStateError(f"{context} must be a safe relative POSIX path")
+    return Path(*relative.parts)
+
+
+def _parse_asset_fingerprint(value: Any, index: int) -> AssetFingerprint:
+    """한 asset fingerprint object를 엄격히 검증한다."""
+    context = f"state.assets[{index}]"
+    payload = _require_state_object(value, context)
+    _require_state_exact_keys(payload, _ASSET_KEYS, context)
+    size = payload["size"]
+    mtime_ns = payload["mtime_ns"]
+    if type(size) is not int or size < 0:
+        raise EnvironmentStateError("state.assets.size must be a nonnegative integer")
+    if type(mtime_ns) is not int or mtime_ns < 0:
+        raise EnvironmentStateError("state.assets.mtime_ns must be a nonnegative integer")
+    return AssetFingerprint(
+        path=_require_safe_state_path(payload["path"], "state.assets.path"),
+        sha256=_require_state_sha256(payload["sha256"], "state.assets.sha256"),
+        size=size,
+        mtime_ns=mtime_ns,
+    )
+
+
+def _parse_environment_state(value: Any) -> EnvironmentState:
+    """decoded JSON object를 검증된 불변 환경 state로 변환한다."""
+    payload = _require_state_object(value, "state")
+    _require_state_exact_keys(payload, _STATE_KEYS, "state")
+    if type(payload["schema"]) is not int or payload["schema"] != ENVIRONMENT_STATE_SCHEMA:
+        raise EnvironmentStateError("state schema must be integer 1")
+
+    model_id = _require_state_string(payload["model_id"], "state.model_id")
+    if model_id not in SUPPORTED_MODEL_IDS:
+        raise EnvironmentStateError("state.model_id is unsupported")
+    python_version = _require_state_string(
+        payload["python_version"], "state.python_version"
+    )
+    if not _PATCH_VERSION.fullmatch(python_version):
+        raise EnvironmentStateError("state.python_version must be an exact patch version")
+    python_platform = _require_state_string(
+        payload["python_platform"], "state.python_platform"
+    )
+    if python_platform != EXPECTED_PYTHON_PLATFORM:
+        raise EnvironmentStateError(
+            f"state.python_platform must be {EXPECTED_PYTHON_PLATFORM}"
+        )
+    uv_version = _require_state_string(payload["uv_version"], "state.uv_version")
+    if uv_version != EXPECTED_UV_VERSION:
+        raise EnvironmentStateError(f"state.uv_version must be {EXPECTED_UV_VERSION}")
+
+    source_commit = payload["source_commit"]
+    if not isinstance(source_commit, str) or not _GIT_SHA.fullmatch(source_commit):
+        raise EnvironmentStateError(
+            "state.source_commit must be a lowercase 40-digit SHA"
+        )
+    completed_at = _require_state_string(payload["completed_at"], "state.completed_at")
+    if not _UTC_TIMESTAMP.fullmatch(completed_at):
+        raise EnvironmentStateError("state.completed_at must be a UTC second timestamp")
+    try:
+        datetime.strptime(completed_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise EnvironmentStateError(
+            "state.completed_at must be a valid UTC second timestamp"
+        ) from exc
+
+    assets_value = payload["assets"]
+    if not isinstance(assets_value, list):
+        raise EnvironmentStateError("state.assets must be an array")
+    assets = tuple(
+        _parse_asset_fingerprint(asset, index)
+        for index, asset in enumerate(assets_value)
+    )
+    asset_paths = [asset.path.as_posix() for asset in assets]
+    if len(set(asset_paths)) != len(asset_paths):
+        raise EnvironmentStateError("state contains a duplicate asset path")
+
+    preflight_value = payload["preflight_ids"]
+    if not isinstance(preflight_value, list):
+        raise EnvironmentStateError("state.preflight_ids must be an array")
+    if any(
+        not isinstance(identifier, str) or not _PREFLIGHT_ID.fullmatch(identifier)
+        for identifier in preflight_value
+    ):
+        raise EnvironmentStateError(
+            "state.preflight_ids must contain lowercase identifiers"
+        )
+    if len(set(preflight_value)) != len(preflight_value):
+        raise EnvironmentStateError("state.preflight_ids must not contain duplicates")
+
+    return EnvironmentState(
+        schema=ENVIRONMENT_STATE_SCHEMA,
+        model_id=model_id,
+        python_version=python_version,
+        python_platform=python_platform,
+        uv_version=uv_version,
+        manifest_sha256=_require_state_sha256(
+            payload["manifest_sha256"], "state.manifest_sha256"
+        ),
+        lock_sha256=_require_state_sha256(
+            payload["lock_sha256"], "state.lock_sha256"
+        ),
+        ros_overlay_sha256=_require_state_sha256(
+            payload["ros_overlay_sha256"], "state.ros_overlay_sha256"
+        ),
+        source_commit=source_commit,
+        installed_packages_sha256=_require_state_sha256(
+            payload["installed_packages_sha256"],
+            "state.installed_packages_sha256",
+        ),
+        python_executable=_require_safe_state_path(
+            payload["python_executable"], "state.python_executable"
+        ),
+        assets=assets,
+        completed_at=completed_at,
+        preflight_ids=tuple(preflight_value),
+    )
+
+
+def _environment_state_payload(state: EnvironmentState) -> dict[str, Any]:
+    """환경 state를 deterministic JSON용 기본 자료형으로 변환한다."""
+    return {
+        "schema": state.schema,
+        "model_id": state.model_id,
+        "python_version": state.python_version,
+        "python_platform": state.python_platform,
+        "uv_version": state.uv_version,
+        "manifest_sha256": state.manifest_sha256,
+        "lock_sha256": state.lock_sha256,
+        "ros_overlay_sha256": state.ros_overlay_sha256,
+        "source_commit": state.source_commit,
+        "installed_packages_sha256": state.installed_packages_sha256,
+        "python_executable": state.python_executable.as_posix(),
+        "assets": [
+            {
+                "path": asset.path.as_posix(),
+                "sha256": asset.sha256,
+                "size": asset.size,
+                "mtime_ns": asset.mtime_ns,
+            }
+            for asset in state.assets
+        ],
+        "completed_at": state.completed_at,
+        "preflight_ids": list(state.preflight_ids),
+    }
+
+
+def read_environment_state(environment_dir: Path) -> EnvironmentState:
+    """선택 build의 고정 state 파일을 읽어 엄격히 검증한다."""
+    state_path = Path(environment_dir) / ENVIRONMENT_STATE_FILENAME
+    try:
+        payload = json.loads(
+            state_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_state_keys,
+        )
+    except EnvironmentStateError:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EnvironmentStateError(f"cannot read environment state: {state_path}") from exc
+    return _parse_environment_state(payload)
+
+
+def write_environment_state(path: Path, state: EnvironmentState) -> None:
+    """검증한 state JSON을 sibling 임시 파일에서 원자적으로 교체한다."""
+    state_path = Path(path)
+    payload = _environment_state_payload(state)
+    parsed = _parse_environment_state(payload)
+    if parsed != state:
+        raise EnvironmentStateError("environment state is not canonically serializable")
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{state_path.name}.", suffix=".tmp", dir=str(state_path.parent)
+    )
+    temporary_path = Path(temporary_name)
+    descriptor_open = True
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as target:
+            descriptor_open = False
+            target.write(serialized)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary_path, state_path)
+    except BaseException:
+        if descriptor_open:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _reject_duplicate_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
@@ -497,3 +781,290 @@ def build_uv_sync_argv(
         definition.torch_backend,
         str(definition.requirements_lock),
     )
+
+
+def _invalid_active_environment(
+    reason: str,
+    environment_dir: Optional[Path] = None,
+    state: Optional[EnvironmentState] = None,
+) -> ActiveEnvironmentCheck:
+    """active 환경의 한 가지 실패 이유를 표준 invalid 결과로 만든다."""
+    return ActiveEnvironmentCheck(False, reason, environment_dir, state)
+
+
+def _path_contains_symlink(root: Path, relative: Path) -> bool:
+    """root 아래 상대 경로 구성 요소 중 symlink가 있는지 확인한다."""
+    candidate = root
+    for part in relative.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            return True
+    return False
+
+
+def inspect_active_environment(
+    paths: EnvironmentPaths,
+    definition: ModelEnvironmentDefinition,
+    manifest_sha256: str,
+) -> ActiveEnvironmentCheck:
+    """active build와 state를 변경 없이 빠른 fingerprint 방식으로 검사한다."""
+    model_root = Path(paths.model_root)
+    builds = Path(paths.builds)
+    current = Path(paths.current)
+    if (
+        not model_root.is_absolute()
+        or model_root.name != definition.model_id
+        or model_root.parent.name != ".venvs"
+        or builds != model_root / "builds"
+        or current != model_root / "current"
+        or model_root.resolve() != model_root
+    ):
+        return _invalid_active_environment("environment path layout is invalid")
+    project_root = model_root.parent.parent
+    if not project_root.is_dir():
+        return _invalid_active_environment("project root directory is missing")
+    if not isinstance(manifest_sha256, str) or not _SHA256.fullmatch(manifest_sha256):
+        return _invalid_active_environment("expected manifest SHA-256 is invalid")
+
+    if not current.is_symlink():
+        if current.exists():
+            return _invalid_active_environment("current must be a symlink")
+        return _invalid_active_environment("current environment is missing")
+    try:
+        environment_dir = current.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return _invalid_active_environment("current symlink is dangling")
+
+    if not builds.is_dir() or builds.is_symlink():
+        return _invalid_active_environment("builds directory is invalid")
+    builds_resolved = builds.resolve()
+    if environment_dir.parent != builds_resolved:
+        if builds_resolved in environment_dir.parents:
+            return _invalid_active_environment(
+                "current must select an immediate build child", environment_dir
+            )
+        return _invalid_active_environment(
+            "current must select a build inside builds", environment_dir
+        )
+    if not environment_dir.is_dir():
+        return _invalid_active_environment(
+            "selected build is not a directory", environment_dir
+        )
+
+    python = environment_dir / "bin" / "python"
+    if not python.exists():
+        return _invalid_active_environment("selected bin/python is missing", environment_dir)
+    if not python.is_file():
+        return _invalid_active_environment(
+            "selected bin/python is not a regular file", environment_dir
+        )
+    if not os.access(str(python), os.X_OK):
+        return _invalid_active_environment(
+            "selected bin/python is not executable", environment_dir
+        )
+
+    try:
+        state_value = read_environment_state(environment_dir)
+    except EnvironmentStateError as exc:
+        return _invalid_active_environment(
+            f"invalid environment state: {exc}", environment_dir
+        )
+    expected_values = (
+        (state_value.schema, ENVIRONMENT_STATE_SCHEMA, "state schema is stale"),
+        (state_value.model_id, definition.model_id, "state model is stale"),
+        (
+            state_value.python_version,
+            definition.python_version,
+            "environment Python version is stale",
+        ),
+        (
+            state_value.python_platform,
+            EXPECTED_PYTHON_PLATFORM,
+            "state Python platform is stale",
+        ),
+        (state_value.uv_version, EXPECTED_UV_VERSION, "state uv version is stale"),
+        (
+            state_value.manifest_sha256,
+            manifest_sha256,
+            "environment manifest digest is stale",
+        ),
+        (
+            state_value.lock_sha256,
+            definition.requirements_lock_sha256,
+            "environment lock digest is stale",
+        ),
+        (
+            state_value.source_commit,
+            definition.source_commit,
+            "environment source commit is stale",
+        ),
+    )
+    for actual, expected, reason in expected_values:
+        if actual != expected:
+            return _invalid_active_environment(reason, environment_dir, state_value)
+    if state_value.python_executable != Path("bin") / "python":
+        return _invalid_active_environment(
+            "state python_executable must be bin/python",
+            environment_dir,
+            state_value,
+        )
+
+    overlay_manifest = environment_dir / ROS_OVERLAY_MANIFEST_FILENAME
+    if not overlay_manifest.exists():
+        return _invalid_active_environment(
+            "ROS overlay manifest is missing", environment_dir, state_value
+        )
+    if overlay_manifest.is_symlink() or not overlay_manifest.is_file():
+        return _invalid_active_environment(
+            "ROS overlay manifest is not a regular file",
+            environment_dir,
+            state_value,
+        )
+    try:
+        overlay_sha256 = sha256_file(overlay_manifest)
+    except OSError:
+        return _invalid_active_environment(
+            "ROS overlay manifest cannot be read", environment_dir, state_value
+        )
+    if overlay_sha256 != state_value.ros_overlay_sha256:
+        return _invalid_active_environment(
+            "ROS overlay manifest digest is stale", environment_dir, state_value
+        )
+
+    project_root_resolved = project_root.resolve()
+    for fingerprint in state_value.assets:
+        relative = fingerprint.path
+        if _path_contains_symlink(project_root, relative):
+            return _invalid_active_environment(
+                f"asset path contains a symlink: {relative.as_posix()}",
+                environment_dir,
+                state_value,
+            )
+        asset_path = project_root.joinpath(*relative.parts)
+        try:
+            metadata = asset_path.lstat()
+        except OSError:
+            return _invalid_active_environment(
+                f"asset is missing: {relative.as_posix()}",
+                environment_dir,
+                state_value,
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            return _invalid_active_environment(
+                f"asset is not a regular file: {relative.as_posix()}",
+                environment_dir,
+                state_value,
+            )
+        try:
+            asset_path.resolve(strict=True).relative_to(project_root_resolved)
+        except (OSError, ValueError):
+            return _invalid_active_environment(
+                f"asset escapes project root: {relative.as_posix()}",
+                environment_dir,
+                state_value,
+            )
+        if metadata.st_size != fingerprint.size:
+            return _invalid_active_environment(
+                f"asset size changed: {relative.as_posix()}",
+                environment_dir,
+                state_value,
+            )
+        if metadata.st_mtime_ns != fingerprint.mtime_ns:
+            return _invalid_active_environment(
+                f"asset mtime_ns changed: {relative.as_posix()}",
+                environment_dir,
+                state_value,
+            )
+
+    return ActiveEnvironmentCheck(True, "ready", environment_dir, state_value)
+
+
+def _require_absolute_directory(path: Path, context: str) -> Path:
+    """process 환경 입력이 존재하는 절대 directory인지 확인한다."""
+    value = Path(path)
+    if not value.is_absolute():
+        raise EnvironmentStateError(f"{context} must be an absolute path")
+    if not value.is_dir():
+        raise EnvironmentStateError(f"{context} must be an existing directory")
+    return value
+
+
+def _is_activation_variable(name: str) -> bool:
+    """상속하면 안 되는 Python, virtualenv와 Conda 활성화 변수를 식별한다."""
+    return (
+        name in {"PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "_CE_CONDA", "_CE_M"}
+        or name.startswith("VIRTUAL_ENV")
+        or name.startswith("_OLD_VIRTUAL_")
+        or name.startswith("CONDA_")
+        or name.startswith("_CONDA")
+        or name.startswith("__CONDA")
+    )
+
+
+def _path_entry_key(value: str) -> str:
+    """PATH 항목의 중복과 제거 대상을 비교할 정규화 key를 만든다."""
+    return os.path.normcase(os.path.normpath(value))
+
+
+def build_model_process_environment(
+    inherited: Mapping[str, str],
+    environment_dir: Path,
+    ros_overlay: Path,
+    catkin_python_path: Path,
+    project_root: Path,
+) -> dict[str, str]:
+    """선택 모델 interpreter만 사용하는 격리된 child process 환경을 만든다."""
+    selected_environment = _require_absolute_directory(
+        environment_dir, "environment_dir"
+    )
+    selected_overlay = _require_absolute_directory(ros_overlay, "ros_overlay")
+    selected_catkin = _require_absolute_directory(
+        catkin_python_path, "catkin_python_path"
+    )
+    selected_project = _require_absolute_directory(project_root, "project_root")
+    selected_bin = selected_environment / "bin"
+    selected_python = selected_bin / "python"
+    if not selected_python.exists() or not selected_python.is_file():
+        raise EnvironmentStateError("selected bin/python must be a regular file")
+    if not os.access(str(selected_python), os.X_OK):
+        raise EnvironmentStateError("selected bin/python must be executable")
+    if any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in inherited.items()
+    ):
+        raise EnvironmentStateError("inherited environment must contain strings")
+
+    foreign_bins: set[str] = set()
+    for name, value in inherited.items():
+        if name == "VIRTUAL_ENV" or name.startswith("CONDA_PREFIX"):
+            if value:
+                foreign_bins.add(_path_entry_key(str(Path(value) / "bin")))
+    selected_bin_key = _path_entry_key(str(selected_bin))
+    retained_path: list[str] = []
+    retained_keys: set[str] = set()
+    for entry in inherited.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        key = _path_entry_key(entry)
+        if key == selected_bin_key or key in foreign_bins or key in retained_keys:
+            continue
+        retained_path.append(entry)
+        retained_keys.add(key)
+
+    result = {
+        key: value
+        for key, value in inherited.items()
+        if key != "PATH" and not _is_activation_variable(key)
+    }
+    result.update(
+        {
+            "PATH": os.pathsep.join((str(selected_bin), *retained_path)),
+            "VIRTUAL_ENV": str(selected_environment),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": os.pathsep.join(
+                (str(selected_overlay), str(selected_catkin))
+            ),
+            "TORCH_HOME": str(selected_project / "models" / "shared" / "torch-cache"),
+        }
+    )
+    return result
