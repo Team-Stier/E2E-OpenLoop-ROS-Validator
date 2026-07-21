@@ -201,20 +201,18 @@ def test_shipped_sparse_null_calibration_fails_before_worker_construction(monkey
     assert worker_calls == []
 
 
-def test_operator_docs_name_the_reproducible_rosbag_clock_sequence():
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    design = (PROJECT_ROOT / "docs" / "inference_engine_design.md").read_text(
-        encoding="utf-8"
-    )
-    contracts = (PROJECT_ROOT / "docs" / "model_io_contracts.md").read_text(
-        encoding="utf-8"
-    )
+def test_operator_docs_name_the_canonical_openloop_sequence():
+    """운영 문서가 모델 setup, validator 실행과 clock bag 순서를 고정하는지 검사한다."""
     required = (
-        "catkin_make",
-        "source devel/setup.bash",
-        "fetch_model_assets.py --model-id",
-        "roslaunch validator_inference openloop_inference.launch",
-        "rosbag play --clock rosbag/2026-07-16-17-13-14.bag",
+        "./openloop setup interfuser",
+        "./openloop interfuser --rviz",
+        "./openloop bag",
+        "./openloop verify interfuser",
+        "./openloop prune interfuser",
     )
-    for document in (readme, design, contracts):
+    for path in (
+        PROJECT_ROOT / "README.md",
+        PROJECT_ROOT / "docs" / "openloop_validator.md",
+    ):
+        document = path.read_text(encoding="utf-8")
         assert all(command in document for command in required)

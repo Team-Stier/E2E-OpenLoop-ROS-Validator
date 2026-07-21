@@ -5,6 +5,7 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   morai_msgs
   nav_msgs
+  rosgraph_msgs
   rospy
   sensor_msgs
   std_msgs
@@ -20,6 +21,7 @@ catkin_package(
     geometry_msgs
     morai_msgs
     nav_msgs
+    rosgraph_msgs
     rospy
     sensor_msgs
     std_msgs
@@ -44,8 +46,25 @@ catkin_install_python(PROGRAMS scripts/inference_engine_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+catkin_install_python(PROGRAMS scripts/openloop_cli.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# Keep the system-Python shebang: this wrapper selects the model interpreter itself.
+install(PROGRAMS scripts/model_env_exec
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/scripts
+)
+
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../config/profile.json
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/config
+)
+
+install(FILES config/model_environments.json
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/config
+)
+
+install(DIRECTORY requirements/
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/requirements
 )
 
 install(DIRECTORY launch/

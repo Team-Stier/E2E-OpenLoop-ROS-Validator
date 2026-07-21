@@ -272,22 +272,30 @@ lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
 
 ## 3. Open-loop 실행
 
-아래 예시는 `interfuser`를 선택해 preprocessing, inference, visualization을 하나의 launch로 시작한다. 다른 모델은 두 명령의 model ID를 동일하게 바꾼다. SparseDrive V2는 실행 전에 `src/Validator_pkg/config/profile.json`의 front/left/right inline calibration(`K_original_3x3`, distortion metadata, `T_lidar_from_camera_4x4`)을 모두 채워야 하며, 하나라도 비어 있으면 worker 생성 전에 시작을 차단한다.
+아래 세 명령으로 `interfuser` 환경을 만들고 validator와 RViz를 시작한 뒤, 다른 terminal에서 기본 bag을 재생한다.
 
 ```bash
-catkin_make
-source devel/setup.bash
-rosrun validator_inference fetch_model_assets.py --model-id interfuser
-roslaunch Validator_pkg openloop_validator.launch model_id:=interfuser show_rviz:=true
+./openloop setup interfuser
+./openloop interfuser --rviz
+./openloop bag
 ```
 
-`openloop_validator.launch`는 `/use_sim_time=true`를 설정하고 선택한 model ID를 preprocessing의 `model_profiles`와 inference의 `model_id`에 동일하게 전달한 뒤 visualizer/RViz까지 시작한다. 다른 terminal에서 bag clock과 함께 재생한다. Inference layer만 독립적으로 점검할 때에만 `roslaunch validator_inference openloop_inference.launch model_id:=...`를 사용한다.
-
-이 저장소의 기본 Docker 이미지는 ROS Noetic의 Catkin/메시지/launch 및 전처리·시각화 계약을 검증하는 환경이다. 실제 네 모델 forward에는 `fetch_model_assets.py`로 받는 checkpoint/source 외에도 각 고정 source가 요구하는 PyTorch·Python·CUDA 런타임이 별도로 필요하며, 특히 TFv6는 LEAD 호환 Python/CUDA 환경에서 실행해야 한다.
+`setup`은 모델별 고정 Python/CUDA dependency를 `.venvs/<model>/builds/`에 만들고 검증이 끝난 build만 `current`로 선택한다. `run`과 모델 shorthand는 환경을 설치하거나 변경하지 않는다. 전체 hash 무결성 검사와 이전 build 정리는 각각 다음 명령을 사용한다.
 
 ```bash
-source devel/setup.bash
-rosbag play --clock rosbag/2026-07-16-17-13-14.bag
+./openloop verify interfuser
+./openloop prune interfuser
 ```
 
-기본 결과 위치는 프로젝트의 `records/openloop/`이며 launch 인자 `profile_file:=...`, `record_dir:=...`로 로컬 경로를 바꿀 수 있다. `/waypoints`는 `Lidar3D-4` frame이고 매 tick 결과는 `/inference_metric` 하나를 통해 CSV에 기록된다.
+네 모델의 환경 정의와 setup/preflight 경로를 제공하지만, 현재 실제 설치와 bag acceptance 범위는 InterFuser다. InterFuser checkpoint는 공식 배포본으로 가장하지 않고 Drivora 호환 mirror의 `third-party compatibility artifact`로 hash와 provenance를 고정한다. 자세한 준비 조건, 직접 launch, 오류 복구 절차는 [Open-loop 운영 절차](docs/openloop_validator.md)를 참고한다.
+
+고급 사용자가 launch 인자를 직접 제어할 때는 setup을 먼저 완료하고 절대 환경 root를 전달한다.
+
+```bash
+roslaunch Validator_pkg openloop_validator.launch \
+  model_id:=interfuser \
+  model_env_root:=/home/stier/E2E-OpenLoop-ROS-Validator/.venvs \
+  show_rviz:=true
+```
+
+기본 결과 위치는 프로젝트의 `records/openloop/`이다. `/waypoints`는 `Lidar3D-4` frame이고 매 tick 결과는 `/inference_metric` 하나를 통해 CSV에 기록된다.
