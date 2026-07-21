@@ -355,6 +355,10 @@ def test_build_ros_overlay_accepts_external_optional_and_exported_symbol_imports
 ):
     """allowlist 밖 optional import와 from-dot exported symbol은 module로 오판하지 않는다."""
     source = _fake_ros_tree(tmp_path)
+    with (source / "rospy" / "__init__.py").open("a", encoding="utf-8") as stream:
+        stream.write("exported_symbol = 1\n")
+    with (source / "rosgraph" / "__init__.py").open("a", encoding="utf-8") as stream:
+        stream.write("exported_symbol = 1\n")
     (source / "rospy" / "client.py").write_text(
         "import rosnode\n"
         "import rosservice\n"
@@ -368,6 +372,140 @@ def test_build_ros_overlay_accepts_external_optional_and_exported_symbol_imports
     manifest = build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
 
     assert any(record.destination_path == Path("rospy/client.py") for record in manifest.files)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ("from rosgraph import missing_export\n", "from . import missing_export\n"),
+)
+def test_build_ros_overlay_rejects_missing_ambiguous_import_aliases(
+    tmp_path: Path, statement: str
+):
+    """submodule도 base export도 아닌 from-import alias를 closure 누락으로 거부한다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rospy" / "client.py").write_text(statement, encoding="utf-8")
+
+    with pytest.raises(EnvironmentSetupError, match="export"):
+        build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+
+def test_build_ros_overlay_accepts_static_symbol_exports(tmp_path: Path):
+    """top-level 정의·할당·import binding을 base module static export로 해석한다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rosgraph" / "provider.py").write_text(
+        "def provided():\n    pass\n", encoding="utf-8"
+    )
+    (source / "rosgraph" / "__init__.py").write_text(
+        "def function_export():\n    pass\n"
+        "class ClassExport:\n    pass\n"
+        "assigned_export = 1\n"
+        "annotated_export: int = 1\n"
+        "import math as imported_export\n"
+        "from math import pi as external_explicit_export\n"
+        "from .provider import provided as explicit_export\n",
+        encoding="utf-8",
+    )
+    (source / "rospy" / "client.py").write_text(
+        "from rosgraph import function_export\n"
+        "from rosgraph import ClassExport\n"
+        "from rosgraph import assigned_export\n"
+        "from rosgraph import annotated_export\n"
+        "from rosgraph import imported_export\n"
+        "from rosgraph import external_explicit_export\n"
+        "from rosgraph import explicit_export\n",
+        encoding="utf-8",
+    )
+
+    manifest = build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+    assert any(
+        record.destination_path == Path("rosgraph/provider.py")
+        for record in manifest.files
+    )
+
+
+def test_build_ros_overlay_resolves_recursive_local_and_selected_wildcards(
+    tmp_path: Path,
+):
+    """local·selected wildcard re-export chain에서 static export를 재귀 탐색한다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rosgraph" / "__init__.py").write_text(
+        "from .local_exports import *\n", encoding="utf-8"
+    )
+    (source / "rosgraph" / "local_exports.py").write_text(
+        "from rosgraph.selected_exports import *\n", encoding="utf-8"
+    )
+    (source / "rosgraph" / "selected_exports.py").write_text(
+        "wildcard_export = 1\n", encoding="utf-8"
+    )
+    (source / "rospy" / "client.py").write_text(
+        "from rosgraph import wildcard_export\n", encoding="utf-8"
+    )
+
+    manifest = build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+    assert manifest.packages == EXPECTED_ROS_PACKAGES
+
+
+def test_build_ros_overlay_resolves_export_through_wildcard_cycle(tmp_path: Path):
+    """wildcard cycle 안의 실제 static export는 cycle guard 중에도 찾는다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rosgraph" / "__init__.py").write_text(
+        "from .cycle_a import *\n", encoding="utf-8"
+    )
+    (source / "rosgraph" / "cycle_a.py").write_text(
+        "from .cycle_b import *\n", encoding="utf-8"
+    )
+    (source / "rosgraph" / "cycle_b.py").write_text(
+        "from .cycle_a import *\ncycle_export = 1\n", encoding="utf-8"
+    )
+    (source / "rospy" / "client.py").write_text(
+        "from rosgraph import cycle_export\n", encoding="utf-8"
+    )
+
+    manifest = build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+    assert manifest.packages == EXPECTED_ROS_PACKAGES
+
+
+def test_build_ros_overlay_rejects_missing_export_after_wildcard_cycle(tmp_path: Path):
+    """wildcard re-export cycle을 종료하고 명백히 없는 export를 거부한다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rosgraph" / "__init__.py").write_text(
+        "from .cycle import *\n", encoding="utf-8"
+    )
+    (source / "rosgraph" / "cycle.py").write_text(
+        "from rosgraph import *\n", encoding="utf-8"
+    )
+    (source / "rospy" / "client.py").write_text(
+        "from rosgraph import absent_after_cycle\n", encoding="utf-8"
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="export"):
+        build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+
+@pytest.mark.parametrize(
+    "provider",
+    (
+        "from external_runtime_package import *\n",
+        "def __getattr__(name):\n    return name\n",
+        "if runtime_condition:\n    def __getattr__(name):\n        return name\n",
+    ),
+)
+def test_build_ros_overlay_defers_unresolved_dynamic_exports(
+    tmp_path: Path, provider: str
+):
+    """외부 wildcard와 module __getattr__ export는 runtime 판정으로 넘긴다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rosgraph" / "__init__.py").write_text(provider, encoding="utf-8")
+    (source / "rospy" / "client.py").write_text(
+        "from rosgraph import dynamic_export\n", encoding="utf-8"
+    )
+
+    manifest = build_ros_overlay(source, tmp_path / "candidate" / ".ros-overlay")
+
+    assert manifest.packages == EXPECTED_ROS_PACKAGES
 
 
 def test_build_ros_overlay_rejects_python_syntax_errors(tmp_path: Path):

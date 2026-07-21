@@ -382,6 +382,207 @@ def _module_is_copied(module: Sequence[str], copied: set[Path]) -> bool:
     ) in copied
 
 
+@dataclass(frozen=True)
+class _ParsedModule:
+    """한 copied module의 AST와 static export 판정 자료를 보관한다."""
+
+    relative_path: Path
+    tree: ast.Module
+    direct_bindings: frozenset[str]
+    conditional_bindings: frozenset[str]
+    wildcard_imports: tuple[ast.ImportFrom, ...]
+    has_conditional_wildcard: bool
+    has_dynamic_getattr: bool
+    static_all_known: bool
+    static_all: Optional[frozenset[str]]
+
+
+def _target_names(target: ast.AST) -> set[str]:
+    """assignment target가 현재 scope에 묶는 단순 name set을 반환한다."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        names: set[str] = set()
+        for element in target.elts:
+            names.update(_target_names(element))
+        return names
+    return set()
+
+
+def _statement_binding_names(statement: ast.stmt) -> set[str]:
+    """한 statement가 실행될 때 현재 scope에 묶을 수 있는 name을 찾는다."""
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {statement.name}
+    if isinstance(statement, ast.Assign):
+        names: set[str] = set()
+        for target in statement.targets:
+            names.update(_target_names(target))
+        return names
+    if isinstance(statement, ast.AnnAssign):
+        return _target_names(statement.target) if statement.value is not None else set()
+    if isinstance(statement, ast.AugAssign):
+        return _target_names(statement.target)
+    if isinstance(statement, ast.Import):
+        return {
+            alias.asname if alias.asname is not None else alias.name.split(".")[0]
+            for alias in statement.names
+        }
+    if isinstance(statement, ast.ImportFrom):
+        return {
+            alias.asname if alias.asname is not None else alias.name
+            for alias in statement.names
+            if alias.name != "*"
+        }
+    return set()
+
+
+def _nested_statement_bindings(statements: Sequence[ast.stmt]) -> tuple[set[str], bool]:
+    """conditional module statement 아래의 잠재 binding과 wildcard 여부를 찾는다."""
+    names: set[str] = set()
+    has_wildcard = False
+    for statement in statements:
+        names.update(_statement_binding_names(statement))
+        if isinstance(statement, ast.ImportFrom) and any(
+            alias.name == "*" for alias in statement.names
+        ):
+            has_wildcard = True
+        nested_groups: list[Sequence[ast.stmt]] = []
+        if isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+            nested_groups.extend((statement.body, statement.orelse))
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                names.update(_target_names(statement.target))
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            nested_groups.append(statement.body)
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    names.update(_target_names(item.optional_vars))
+        elif isinstance(statement, ast.Try):
+            nested_groups.extend((statement.body, statement.orelse, statement.finalbody))
+            nested_groups.extend(handler.body for handler in statement.handlers)
+        for group in nested_groups:
+            nested_names, nested_wildcard = _nested_statement_bindings(group)
+            names.update(nested_names)
+            has_wildcard = has_wildcard or nested_wildcard
+    return names, has_wildcard
+
+
+def _literal_string_collection(value: ast.AST) -> Optional[frozenset[str]]:
+    """literal string list/tuple/set이면 순서와 중복을 제거한 값을 반환한다."""
+    try:
+        evaluated = ast.literal_eval(value)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    if not isinstance(evaluated, (list, tuple, set, frozenset)) or not all(
+        isinstance(item, str) for item in evaluated
+    ):
+        return None
+    return frozenset(evaluated)
+
+
+def _static_all_policy(
+    tree: ast.Module, conditional_bindings: set[str]
+) -> tuple[bool, Optional[frozenset[str]]]:
+    """module의 static __all__ set, 기본 정책 또는 동적 여부를 판정한다."""
+    known = True
+    explicit: Optional[frozenset[str]] = None
+    for statement in tree.body:
+        assigned_value: Optional[ast.AST] = None
+        assigns_all = False
+        if isinstance(statement, ast.Assign):
+            assigns_all = any("__all__" in _target_names(target) for target in statement.targets)
+            if assigns_all:
+                assigned_value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            assigns_all = "__all__" in _target_names(statement.target)
+            assigned_value = statement.value
+        if assigns_all:
+            if assigned_value is None:
+                known = False
+                explicit = None
+                continue
+            literal = _literal_string_collection(assigned_value)
+            known = literal is not None
+            explicit = literal
+            continue
+        if isinstance(statement, ast.AugAssign) and "__all__" in _target_names(
+            statement.target
+        ):
+            addition = _literal_string_collection(statement.value)
+            if (
+                known
+                and explicit is not None
+                and isinstance(statement.op, ast.Add)
+                and addition is not None
+            ):
+                explicit = explicit | addition
+            else:
+                known = False
+                explicit = None
+            continue
+        if isinstance(statement, ast.Delete) and any(
+            "__all__" in _target_names(target) for target in statement.targets
+        ):
+            known = True
+            explicit = None
+            continue
+        if "__all__" in _statement_binding_names(statement):
+            known = False
+            explicit = None
+    if "__all__" in conditional_bindings:
+        return False, None
+    return known, explicit
+
+
+def _parsed_module(relative: Path, tree: ast.Module) -> _ParsedModule:
+    """module body에서 static/conditional export 판정 자료를 구성한다."""
+    direct: set[str] = set()
+    conditional: set[str] = set()
+    wildcard_imports: list[ast.ImportFrom] = []
+    has_conditional_wildcard = False
+    for statement in tree.body:
+        if isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                direct.difference_update(_target_names(target))
+            continue
+        direct.update(_statement_binding_names(statement))
+        if isinstance(statement, ast.ImportFrom) and any(
+            alias.name == "*" for alias in statement.names
+        ):
+            wildcard_imports.append(statement)
+        if isinstance(
+            statement,
+            (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try),
+        ):
+            nested, nested_wildcard = _nested_statement_bindings([statement])
+            conditional.update(nested)
+            has_conditional_wildcard = (
+                has_conditional_wildcard or nested_wildcard
+            )
+    static_all_known, static_all = _static_all_policy(tree, conditional)
+    return _ParsedModule(
+        relative_path=relative,
+        tree=tree,
+        direct_bindings=frozenset(direct),
+        conditional_bindings=frozenset(conditional),
+        wildcard_imports=tuple(wildcard_imports),
+        has_conditional_wildcard=has_conditional_wildcard,
+        has_dynamic_getattr=(
+            "__getattr__" in direct or "__getattr__" in conditional
+        ),
+        static_all_known=static_all_known,
+        static_all=static_all,
+    )
+
+
+def _module_name(relative: Path) -> tuple[str, ...]:
+    """overlay-relative Python path를 import module parts로 변환한다."""
+    if relative.name == "__init__.py":
+        return tuple(relative.parent.parts)
+    return tuple(relative.with_suffix("").parts)
+
+
 def _relative_import_module(
     source: Path, node: ast.ImportFrom, action: str
 ) -> tuple[str, ...]:
@@ -413,11 +614,125 @@ def _require_imported_module(
         )
 
 
+class _StaticExportResolver:
+    """copied module의 static export를 cache와 cycle guard로 판정한다."""
+
+    def __init__(
+        self,
+        modules: Mapping[tuple[str, ...], _ParsedModule],
+        packages: tuple[str, ...],
+    ) -> None:
+        """parsed module map과 selected package set을 보관한다."""
+        self._modules = modules
+        self._selected = set(packages)
+        self._cache: dict[tuple[tuple[str, ...], str], Optional[bool]] = {}
+        self._visiting: set[tuple[tuple[str, ...], str]] = set()
+
+    def _wildcard_target(
+        self, source: Path, node: ast.ImportFrom, action: str
+    ) -> Optional[tuple[str, ...]]:
+        """local/selected wildcard target은 parts, 외부 target은 None으로 반환한다."""
+        if node.level:
+            return _relative_import_module(source, node, action)
+        if node.module:
+            module = tuple(node.module.split("."))
+            if module[0] in self._selected:
+                return module
+        return None
+
+    def _star_export_status(
+        self, module: tuple[str, ...], symbol: str, action: str
+    ) -> Optional[bool]:
+        """provider module의 wildcard import가 symbol을 묶는지 판정한다."""
+        parsed = self._modules.get(module)
+        if parsed is None:
+            return False
+        if parsed.static_all_known:
+            if parsed.static_all is None:
+                allowed = not symbol.startswith("_")
+            else:
+                allowed = symbol in parsed.static_all
+            if not allowed:
+                return False
+            return self.export_status(module, symbol, action)
+        status = self.export_status(module, symbol, action)
+        return False if status is False else None
+
+    def export_status(
+        self, module: tuple[str, ...], symbol: str, action: str
+    ) -> Optional[bool]:
+        """module symbol을 known present/absent 또는 runtime unknown으로 판정한다."""
+        key = (module, symbol)
+        if key in self._cache:
+            return self._cache[key]
+        if key in self._visiting:
+            return False
+        parsed = self._modules.get(module)
+        if parsed is None:
+            self._cache[key] = False
+            return False
+        self._visiting.add(key)
+        try:
+            if symbol in parsed.direct_bindings:
+                status: Optional[bool] = True
+            else:
+                unknown = (
+                    symbol in parsed.conditional_bindings
+                    or parsed.has_conditional_wildcard
+                    or parsed.has_dynamic_getattr
+                )
+                status = None if unknown else False
+                for wildcard in parsed.wildcard_imports:
+                    target = self._wildcard_target(
+                        parsed.relative_path, wildcard, action
+                    )
+                    if target is None:
+                        status = None
+                        continue
+                    inherited = self._star_export_status(target, symbol, action)
+                    if inherited is True:
+                        status = True
+                        break
+                    if inherited is None:
+                        status = None
+        finally:
+            self._visiting.remove(key)
+        self._cache[key] = status
+        return status
+
+
+def _validate_imported_aliases(
+    node: ast.ImportFrom,
+    module: tuple[str, ...],
+    source: Path,
+    copied: set[Path],
+    resolver: _StaticExportResolver,
+    action: str,
+) -> None:
+    """from-import alias가 copied submodule 또는 base static export인지 검사한다."""
+    for alias in node.names:
+        if alias.name == "*":
+            continue
+        candidate = (*module, *alias.name.split("."))
+        if _module_is_copied(candidate, copied):
+            continue
+        if resolver.export_status(module, alias.name, action) is False:
+            _raise(
+                action,
+                "import closure is missing export "
+                + alias.name
+                + " from "
+                + ".".join(module)
+                + f" referenced by {source.as_posix()}",
+            )
+
+
 def _validate_import_node(
     node: ast.AST,
     source: Path,
     packages: tuple[str, ...],
     copied: set[Path],
+    resolver: _StaticExportResolver,
     action: str,
 ) -> None:
     """한 AST import node가 선택 package copied closure 안에서 해석되는지 검사한다."""
@@ -433,21 +748,18 @@ def _validate_import_node(
     if node.level:
         module = _relative_import_module(source, node, action)
         _require_imported_module(module, copied, source, action)
-        if node.module is None:
-            for alias in node.names:
-                if alias.name == "*":
-                    continue
-                candidate = (*module, *alias.name.split("."))
-                # ``from . import x``의 x는 submodule일 수도 exported symbol일 수도
-                # 있다. 실제 copied module이 있을 때만 module로 분류한다.
-                if _module_is_copied(candidate, copied):
-                    _require_imported_module(candidate, copied, source, action)
+        _validate_imported_aliases(
+            node, module, source, copied, resolver, action
+        )
         return
     if not node.module:
         return
     module = tuple(node.module.split("."))
     if module[0] in selected:
         _require_imported_module(module, copied, source, action)
+        _validate_imported_aliases(
+            node, module, source, copied, resolver, action
+        )
 
 
 def _validate_import_closure(
@@ -457,6 +769,7 @@ def _validate_import_closure(
 ) -> None:
     """모든 복사 예정 Python source의 선택 package와 relative import closure를 검사한다."""
     copied = {relative for _source, relative in discovered}
+    parsed_modules: dict[tuple[str, ...], _ParsedModule] = {}
     for source_path, relative in discovered:
         try:
             tree = ast.parse(source_path.read_bytes(), filename=str(source_path))
@@ -468,10 +781,21 @@ def _validate_import_closure(
             raise EnvironmentSetupError(
                 action, f"cannot read ROS Python source: {source_path}"
             ) from exc
-        for node in ast.walk(tree):
+        module = _module_name(relative)
+        if module in parsed_modules:
+            _raise(action, f"import closure has duplicate module: {'.'.join(module)}")
+        parsed_modules[module] = _parsed_module(relative, tree)
+    resolver = _StaticExportResolver(parsed_modules, packages)
+    for parsed in parsed_modules.values():
+        for node in ast.walk(parsed.tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 _validate_import_node(
-                    node, relative, packages, copied, action
+                    node,
+                    parsed.relative_path,
+                    packages,
+                    copied,
+                    resolver,
+                    action,
                 )
 
 
