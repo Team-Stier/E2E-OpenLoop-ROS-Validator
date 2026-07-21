@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
+import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -18,6 +20,7 @@ import secrets
 import shutil
 import stat
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
@@ -53,6 +56,11 @@ _MANIFEST_KEYS = {"schema", "packages", "files"}
 _FILE_KEYS = {"source", "destination", "sha256"}
 _NATIVE_SUFFIXES = (".so", ".pyd", ".dylib", ".dll")
 _LIFECYCLE_LOCK_FILENAME = ".lifecycle.lock"
+_MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_MAX_MANIFEST_RECORDS = 4096
+_MAX_PATH_STRING_LENGTH = 4096
+_MAX_OVERLAY_FILE_BYTES = 64 * 1024 * 1024
+_READ_BLOCK_SIZE = 1024 * 1024
 
 
 class EnvironmentSetupError(RuntimeError):
@@ -116,6 +124,8 @@ def _canonical_absolute_posix_path(value: Any, context: str, action: str) -> Pat
         raise EnvironmentSetupError(
             action, f"{context} must be a canonical absolute POSIX path"
         ) from exc
+    if isinstance(raw, str) and len(raw) > _MAX_PATH_STRING_LENGTH:
+        _raise(action, f"{context} path length limit exceeded")
     if (
         not isinstance(raw, str)
         or not raw
@@ -132,6 +142,161 @@ def _canonical_absolute_posix_path(value: Any, context: str, action: str) -> Pat
     ):
         _raise(action, f"{context} must be a canonical absolute POSIX path")
     return Path(*pure.parts)
+
+
+@contextmanager
+def _open_absolute_nofollow(
+    path: Path,
+    final_flags: int,
+    action: str,
+    context: str,
+) -> Iterator[int]:
+    """절대 path를 root dir_fd부터 component별 O_NOFOLLOW로 열어 fd를 반환한다."""
+    canonical = _canonical_absolute_posix_path(path, context, action)
+    components = canonical.parts[1:]
+    if not components:
+        _raise(action, f"{context} must not be the filesystem root")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        _raise(action, f"{context} requires O_NOFOLLOW support")
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | close_on_exec
+    parent_descriptor: Optional[int] = None
+    final_descriptor: Optional[int] = None
+    try:
+        parent_descriptor = os.open("/", directory_flags)
+        for component in components[:-1]:
+            child_descriptor = os.open(
+                component,
+                directory_flags | no_follow,
+                dir_fd=parent_descriptor,
+            )
+            previous_descriptor = parent_descriptor
+            parent_descriptor = child_descriptor
+            os.close(previous_descriptor)
+        final_descriptor = os.open(
+            components[-1],
+            final_flags | no_follow | close_on_exec,
+            dir_fd=parent_descriptor,
+        )
+    except FileNotFoundError as exc:
+        raise EnvironmentSetupError(action, f"{context} is missing: {path}") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            message = f"{context} path contains a symlink: {path}"
+        elif exc.errno == errno.ENOTDIR:
+            message = f"{context} path component is not a directory or is a symlink: {path}"
+        else:
+            message = f"cannot securely open {context}: {path}"
+        raise EnvironmentSetupError(action, message) from exc
+    finally:
+        if final_descriptor is None and parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+    try:
+        yield final_descriptor
+    finally:
+        try:
+            os.close(final_descriptor)
+        finally:
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
+
+
+@contextmanager
+def _open_regular_file(
+    path: Path, action: str, context: str
+) -> Iterator[tuple[int, os.stat_result]]:
+    """special file에서 block하지 않고 final regular file fd와 metadata를 반환한다."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOCTTY", 0)
+    )
+    with _open_absolute_nofollow(path, flags, action, context) as descriptor:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                action, f"cannot inspect opened {context}: {path}"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            _raise(action, f"{context} is not a regular file: {path}")
+        yield descriptor, metadata
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    maximum_bytes: int,
+    action: str,
+    context: str,
+) -> bytes:
+    """같은 regular fd에서 maximum_bytes 이하의 bytes만 읽는다."""
+    with _open_regular_file(path, action, context) as (descriptor, metadata):
+        if metadata.st_size > maximum_bytes:
+            _raise(action, f"{context} size limit exceeded")
+        encoded = bytearray()
+        try:
+            while True:
+                remaining = maximum_bytes + 1 - len(encoded)
+                block = os.read(descriptor, min(_READ_BLOCK_SIZE, remaining))
+                if not block:
+                    break
+                encoded.extend(block)
+                if len(encoded) > maximum_bytes:
+                    _raise(action, f"{context} size limit exceeded")
+        except EnvironmentSetupError:
+            raise
+        except MemoryError as exc:
+            raise EnvironmentSetupError(
+                action, f"{context} exceeds safe allocation limits"
+            ) from exc
+        except OSError as exc:
+            raise EnvironmentSetupError(action, f"cannot read {context}: {path}") from exc
+    return bytes(encoded)
+
+
+def _sha256_open_regular_file(path: Path, action: str, context: str) -> str:
+    """같은 regular fd를 bounded streaming read해 SHA-256을 계산한다."""
+    with _open_regular_file(path, action, context) as (descriptor, metadata):
+        if metadata.st_size > _MAX_OVERLAY_FILE_BYTES:
+            _raise(action, f"{context} size limit exceeded")
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            while True:
+                remaining = _MAX_OVERLAY_FILE_BYTES + 1 - total
+                block = os.read(descriptor, min(_READ_BLOCK_SIZE, remaining))
+                if not block:
+                    break
+                total += len(block)
+                if total > _MAX_OVERLAY_FILE_BYTES:
+                    _raise(action, f"{context} size limit exceeded")
+                digest.update(block)
+        except EnvironmentSetupError:
+            raise
+        except (MemoryError, OSError) as exc:
+            raise EnvironmentSetupError(action, f"cannot hash {context}: {path}") from exc
+    return digest.hexdigest()
+
+
+def _fsync_directory(path: Path, action: str, context: str) -> None:
+    """secure하게 연 directory fd를 fsync해 name 변경의 내구성을 보장한다."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    with _open_absolute_nofollow(path, flags, action, context) as descriptor:
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                _raise(action, f"{context} is not a directory: {path}")
+            os.fsync(descriptor)
+        except EnvironmentSetupError:
+            raise
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                action, f"cannot fsync {context}: {path}"
+            ) from exc
 
 
 def _reject_existing_symlink_chain(path: Path, action: str, context: str) -> None:
@@ -178,12 +343,64 @@ def _ensure_real_directory(path: Path, action: str, context: str) -> None:
     _require_real_directory(path, action, context)
 
 
-@contextmanager
-def _lifecycle_lock(paths: EnvironmentPaths, action: str) -> Iterator[None]:
-    """model root의 안전한 advisory lock으로 lifecycle 변경을 직렬화한다."""
-    _validate_environment_paths(paths, action)
-    model_root = Path(paths.model_root)
-    _require_real_directory(model_root, action, "model root")
+@dataclass
+class _ModelOperationLockState:
+    """한 process의 model root별 thread gate, flock fd와 재진입 깊이를 보관한다."""
+
+    process_id: int
+    thread_lock: Any
+    users: int = 0
+    depth: int = 0
+    descriptor: Optional[int] = None
+
+
+_MODEL_OPERATION_STATES: dict[Path, _ModelOperationLockState] = {}
+_MODEL_OPERATION_STATES_GUARD = threading.Lock()
+
+
+def _reset_model_operation_states_after_fork() -> None:
+    """child process에서 상속 flock fd를 닫고 thread lock registry를 새로 만든다."""
+    global _MODEL_OPERATION_STATES
+    global _MODEL_OPERATION_STATES_GUARD
+    inherited_states = tuple(_MODEL_OPERATION_STATES.values())
+    _MODEL_OPERATION_STATES = {}
+    _MODEL_OPERATION_STATES_GUARD = threading.Lock()
+    for state in inherited_states:
+        if state.descriptor is not None:
+            try:
+                os.close(state.descriptor)
+            except OSError:
+                pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_model_operation_states_after_fork)
+
+
+def _reserve_model_operation_state(model_root: Path) -> _ModelOperationLockState:
+    """model root state의 사용자 수를 올리고 process-local state를 반환한다."""
+    process_id = os.getpid()
+    with _MODEL_OPERATION_STATES_GUARD:
+        state = _MODEL_OPERATION_STATES.get(model_root)
+        if state is None or state.process_id != process_id:
+            state = _ModelOperationLockState(process_id, threading.RLock())
+            _MODEL_OPERATION_STATES[model_root] = state
+        state.users += 1
+        return state
+
+
+def _release_model_operation_state(
+    model_root: Path, state: _ModelOperationLockState
+) -> None:
+    """model root state 사용자 수를 내리고 마지막 사용 뒤 registry에서 제거한다."""
+    with _MODEL_OPERATION_STATES_GUARD:
+        state.users -= 1
+        if state.users == 0 and _MODEL_OPERATION_STATES.get(model_root) is state:
+            del _MODEL_OPERATION_STATES[model_root]
+
+
+def _acquire_lifecycle_file_lock(model_root: Path, action: str) -> int:
+    """secure lifecycle lock file을 열고 cross-process exclusive flock을 획득한다."""
     lock_path = model_root / _LIFECYCLE_LOCK_FILENAME
     _reject_existing_symlink_chain(lock_path, action, "lifecycle lock")
     no_follow = getattr(os, "O_NOFOLLOW", 0)
@@ -200,7 +417,7 @@ def _lifecycle_lock(paths: EnvironmentPaths, action: str) -> Iterator[None]:
         descriptor = os.open(str(lock_path), flags, 0o600)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            _raise(action, "lifecycle lock must be a regular unlinked file")
+            _raise(action, "lifecycle lock must be a regular single-link file")
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         path_metadata = lock_path.lstat()
@@ -227,28 +444,81 @@ def _lifecycle_lock(paths: EnvironmentPaths, action: str) -> Iterator[None]:
         raise EnvironmentSetupError(
             action, f"cannot acquire lifecycle lock: {lock_path}"
         ) from exc
+    return descriptor
 
+
+def _release_lifecycle_file_lock(
+    descriptor: int, model_root: Path, action: str
+) -> None:
+    """cross-process flock과 descriptor를 해제하고 release 오류를 정규화한다."""
+    lock_path = model_root / _LIFECYCLE_LOCK_FILENAME
+    release_error: Optional[OSError] = None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError as exc:
+        release_error = exc
+    try:
+        os.close(descriptor)
+    except OSError as exc:
+        if release_error is None:
+            release_error = exc
+    if release_error is not None:
+        raise EnvironmentSetupError(
+            action, f"cannot release lifecycle lock: {lock_path}"
+        ) from release_error
+
+
+@contextmanager
+def _model_operation_lock(
+    paths: EnvironmentPaths, action: str, create_root: bool
+) -> Iterator[None]:
+    """RLock 재진입과 한 flock fd를 결합해 model operation을 직렬화한다."""
+    _validate_environment_paths(paths, action)
+    model_root = _canonical_absolute_posix_path(
+        paths.model_root, "model root", action
+    )
+    if create_root:
+        _ensure_real_directory(model_root.parent, action, ".venvs")
+        _ensure_real_directory(model_root, action, "model root")
+    else:
+        _require_real_directory(model_root, action, "model root")
+    state = _reserve_model_operation_state(model_root)
+    acquired_thread_lock = False
     body_failed = False
     try:
-        yield
-    except BaseException:
-        body_failed = True
-        raise
+        state.thread_lock.acquire()
+        acquired_thread_lock = True
+        if state.depth == 0:
+            state.descriptor = _acquire_lifecycle_file_lock(model_root, action)
+        state.depth += 1
+        try:
+            yield
+        except BaseException:
+            body_failed = True
+            raise
+        finally:
+            state.depth -= 1
+            if state.depth == 0:
+                descriptor = state.descriptor
+                state.descriptor = None
+                if descriptor is None:
+                    _raise(action, "lifecycle lock state lost its descriptor")
+                try:
+                    _release_lifecycle_file_lock(descriptor, model_root, action)
+                except EnvironmentSetupError:
+                    if not body_failed:
+                        raise
     finally:
-        release_error: Optional[OSError] = None
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        except OSError as exc:
-            release_error = exc
-        try:
-            os.close(descriptor)
-        except OSError as exc:
-            if release_error is None:
-                release_error = exc
-        if release_error is not None and not body_failed:
-            raise EnvironmentSetupError(
-                action, f"cannot release lifecycle lock: {lock_path}"
-            ) from release_error
+        if acquired_thread_lock:
+            state.thread_lock.release()
+        _release_model_operation_state(model_root, state)
+
+
+@contextmanager
+def model_operation_lock(paths: EnvironmentPaths) -> Iterator[None]:
+    """create부터 activate까지 재사용할 수 있는 reentrant model operation lease다."""
+    with _model_operation_lock(paths, "model_operation_lock", create_root=True):
+        yield
 
 
 def create_candidate(paths: EnvironmentPaths, build_id: str) -> Path:
@@ -828,6 +1098,8 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any], action: str) -> N
         ).encode("utf-8")
         + b"\n"
     )
+    if len(encoded) > _MAX_MANIFEST_BYTES:
+        _raise(action, "manifest size limit exceeded")
     temporary: Optional[Path] = None
     try:
         handle = tempfile.NamedTemporaryFile(
@@ -882,6 +1154,8 @@ def build_ros_overlay(
             _raise(action, f"declared ROS package has no Python source: {package}")
         discovered.extend(package_files)
     discovered.sort(key=lambda item: item[1].as_posix())
+    if len(discovered) > _MAX_MANIFEST_RECORDS:
+        _raise(action, "manifest file record limit exceeded")
     _validate_import_closure(discovered, selected_packages, action)
 
     try:
@@ -949,6 +1223,8 @@ def _require_exact_keys(
 
 def _safe_destination(value: Any, packages: tuple[str, ...], action: str) -> Path:
     """manifest destination을 package 아래 canonical 상대 POSIX Python path로 검증한다."""
+    if isinstance(value, str) and len(value) > _MAX_PATH_STRING_LENGTH:
+        _raise(action, "file destination path length limit exceeded")
     if (
         not isinstance(value, str)
         or not value
@@ -979,31 +1255,10 @@ def _safe_source(value: Any, destination: Path, action: str) -> Path:
     return source
 
 
-def _read_overlay_manifest(path: Path, action: str) -> RosOverlayManifest:
-    """overlay manifest bytes를 strict immutable record로 읽고 검증한다."""
-    if not path.is_absolute():
-        _raise(action, "manifest path must be absolute")
-    _reject_existing_symlink_chain(path, action, "manifest")
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError as exc:
-        raise EnvironmentSetupError(action, f"manifest is missing: {path}") from exc
-    except OSError as exc:
-        raise EnvironmentSetupError(action, f"cannot inspect manifest: {path}") from exc
-    if not stat.S_ISREG(metadata.st_mode):
-        _raise(action, f"manifest is not a regular file: {path}")
-    try:
-        encoded = path.read_bytes()
-    except OSError as exc:
-        raise EnvironmentSetupError(action, f"cannot read manifest: {path}") from exc
-    try:
-        payload = json.loads(
-            encoded.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
-        )
-    except EnvironmentSetupError:
-        raise
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise EnvironmentSetupError(action, "manifest is not valid UTF-8 JSON") from exc
+def _overlay_manifest_from_payload(
+    payload: Any, path: Path, action: str
+) -> RosOverlayManifest:
+    """decoded manifest payload를 bounded immutable record로 검증한다."""
     if not isinstance(payload, dict):
         _raise(action, "manifest must be a JSON object")
     _require_exact_keys(payload, _MANIFEST_KEYS, "manifest", action)
@@ -1020,6 +1275,8 @@ def _read_overlay_manifest(path: Path, action: str) -> RosOverlayManifest:
     raw_files = payload["files"]
     if not isinstance(raw_files, list) or not raw_files:
         _raise(action, "manifest files must be a nonempty array")
+    if len(raw_files) > _MAX_MANIFEST_RECORDS:
+        _raise(action, "manifest file record limit exceeded")
     records: list[RosOverlayFile] = []
     destinations: set[Path] = set()
     sources: set[Path] = set()
@@ -1057,6 +1314,32 @@ def _read_overlay_manifest(path: Path, action: str) -> RosOverlayManifest:
         files=tuple(records),
         manifest_path=path,
     )
+
+
+def _read_overlay_manifest(
+    path: Path, action: str
+) -> tuple[RosOverlayManifest, str]:
+    """manifest를 같은 bounded regular fd에서 읽고 record와 digest를 반환한다."""
+    if not path.is_absolute():
+        _raise(action, "manifest path must be absolute")
+    encoded = _read_bounded_regular_file(
+        path, _MAX_MANIFEST_BYTES, action, "manifest"
+    )
+    try:
+        payload = json.loads(
+            encoded.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
+        )
+        manifest = _overlay_manifest_from_payload(payload, path, action)
+    except EnvironmentSetupError:
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        MemoryError,
+        RecursionError,
+    ) as exc:
+        raise EnvironmentSetupError(action, "manifest is not valid UTF-8 JSON") from exc
+    return manifest, hashlib.sha256(encoded).hexdigest()
 
 
 def _scan_overlay_tree(destination: Path, action: str) -> tuple[set[Path], set[Path]]:
@@ -1107,27 +1390,12 @@ def _expected_overlay_directories(files: Sequence[RosOverlayFile]) -> set[Path]:
 
 
 def _verify_overlay_file(record: RosOverlayFile, destination: Path, action: str) -> None:
-    """한 provenance source와 복사 destination이 일반 파일이고 hash가 같은지 검사한다."""
+    """provenance source와 destination을 secure fd로 열어 같은 hash인지 검사한다."""
     source = record.source_path
     target = destination / record.destination_path
     for path, context in ((source, "source"), (target, "destination")):
-        _reject_existing_symlink_chain(path, action, context)
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError as exc:
-            raise EnvironmentSetupError(
-                action, f"recorded {context} file is missing: {path}"
-            ) from exc
-        except OSError as exc:
-            raise EnvironmentSetupError(
-                action, f"cannot inspect recorded {context} file: {path}"
-            ) from exc
-        if not stat.S_ISREG(metadata.st_mode):
-            _raise(action, f"recorded {context} is not a regular file: {path}")
-        try:
-            digest = sha256_file(path)
-        except OSError as exc:
-            raise EnvironmentSetupError(action, f"cannot hash {context} file: {path}") from exc
+        recorded_context = f"recorded {context} file"
+        digest = _sha256_open_regular_file(path, action, recorded_context)
         if digest != record.sha256:
             _raise(action, f"recorded {context} file hash changed: {path}")
 
@@ -1142,7 +1410,7 @@ def verify_ros_overlay(destination: Path, manifest_path: Path) -> str:
     if manifest_file != target.parent / ROS_OVERLAY_MANIFEST_FILENAME:
         _raise(action, "manifest path must be the fixed overlay sibling")
     _require_real_directory(target, action, "overlay destination")
-    manifest = _read_overlay_manifest(manifest_file, action)
+    manifest, manifest_digest = _read_overlay_manifest(manifest_file, action)
     actual_files, actual_directories = _scan_overlay_tree(target, action)
     expected_files = {record.destination_path for record in manifest.files}
     expected_directories = _expected_overlay_directories(manifest.files)
@@ -1174,10 +1442,7 @@ def verify_ros_overlay(destination: Path, manifest_path: Path) -> str:
         )
     for record in manifest.files:
         _verify_overlay_file(record, target, action)
-    try:
-        return sha256_file(manifest_file)
-    except OSError as exc:
-        raise EnvironmentSetupError(action, f"cannot hash manifest: {manifest_file}") from exc
+    return manifest_digest
 
 
 def _validate_candidate(
@@ -1210,7 +1475,7 @@ def _validate_candidate(
 def activate_candidate(paths: EnvironmentPaths, candidate: Path) -> None:
     """candidate를 임시 상대 symlink와 os.replace로 원자적으로 활성화한다."""
     action = "activate_candidate"
-    with _lifecycle_lock(paths, action):
+    with _model_operation_lock(paths, action, create_root=False):
         _, relative = _validate_candidate(paths, Path(candidate), action)
         current = Path(paths.current)
         model_root = Path(paths.model_root)
@@ -1232,6 +1497,7 @@ def activate_candidate(paths: EnvironmentPaths, candidate: Path) -> None:
                 _raise(action, "cannot allocate a temporary current symlink")
             os.replace(str(temporary), str(current))
             temporary = None
+            _fsync_directory(model_root, action, "model root directory")
         except EnvironmentSetupError:
             raise
         except OSError as exc:
@@ -1276,6 +1542,29 @@ def _active_build(paths: EnvironmentPaths, action: str) -> Optional[Path]:
     return None
 
 
+def _require_unchanged_build(
+    candidate: Path, expected_device: int, expected_inode: int, action: str
+) -> None:
+    """scan 뒤 candidate의 directory inode/device가 바뀌지 않았는지 재검증한다."""
+    try:
+        metadata = candidate.lstat()
+    except FileNotFoundError as exc:
+        raise EnvironmentSetupError(
+            action, f"build changed since scan: {candidate}"
+        ) from exc
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, f"cannot revalidate build before prune: {candidate}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_dev != expected_device
+        or metadata.st_ino != expected_inode
+    ):
+        _raise(action, f"build changed since scan: {candidate}")
+
+
 def prune_inactive_builds(paths: EnvironmentPaths) -> tuple[Path, ...]:
     """active build를 보존하고 검증된 inactive immediate directory만 정리한다."""
     action = "prune_inactive_builds"
@@ -1284,14 +1573,14 @@ def prune_inactive_builds(paths: EnvironmentPaths) -> tuple[Path, ...]:
     builds = Path(paths.builds)
     if not model_root.exists() and not model_root.is_symlink():
         return ()
-    with _lifecycle_lock(paths, action):
+    with _model_operation_lock(paths, action, create_root=False):
         active = _active_build(paths, action)
         if not builds.exists() and not builds.is_symlink():
             if active is not None:
                 _raise(action, "active build exists while builds directory is missing")
             return ()
         _require_real_directory(builds, action, "builds")
-        candidates: list[Path] = []
+        candidates: list[tuple[Path, int, int]] = []
         try:
             with os.scandir(str(builds)) as entries:
                 ordered = sorted(entries, key=lambda entry: entry.name)
@@ -1300,25 +1589,31 @@ def prune_inactive_builds(paths: EnvironmentPaths) -> tuple[Path, ...]:
         for entry in ordered:
             candidate = builds / entry.name
             _validate_component(entry.name, "build_id", action)
-            if entry.is_symlink():
-                _raise(action, f"suspicious symlink in builds: {candidate}")
             try:
-                is_directory = entry.is_dir(follow_symlinks=False)
+                metadata = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise EnvironmentSetupError(
                     action, f"cannot inspect build: {candidate}"
                 ) from exc
-            if not is_directory:
+            if stat.S_ISLNK(metadata.st_mode):
+                _raise(action, f"suspicious symlink in builds: {candidate}")
+            if not stat.S_ISDIR(metadata.st_mode):
                 _raise(action, f"suspicious non-directory entry in builds: {candidate}")
-            candidates.append(candidate)
-        if active is not None and active not in candidates:
+            candidates.append((candidate, metadata.st_dev, metadata.st_ino))
+        candidate_paths = tuple(candidate for candidate, _device, _inode in candidates)
+        if active is not None and active not in candidate_paths:
             _raise(action, "active build is not an immediate builds entry")
-        inactive = tuple(candidate for candidate in candidates if candidate != active)
-        for candidate in inactive:
+        inactive_snapshots = tuple(
+            snapshot for snapshot in candidates if snapshot[0] != active
+        )
+        for candidate, device, inode in inactive_snapshots:
+            _require_unchanged_build(candidate, device, inode, action)
+        for candidate, device, inode in inactive_snapshots:
+            _require_unchanged_build(candidate, device, inode, action)
             try:
                 shutil.rmtree(str(candidate))
             except OSError as exc:
                 raise EnvironmentSetupError(
                     action, f"cannot prune build: {candidate}"
                 ) from exc
-        return inactive
+        return tuple(candidate for candidate, _device, _inode in inactive_snapshots)

@@ -6,7 +6,10 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import threading
+import time
 from typing import Any, Callable
 
 import pytest
@@ -99,6 +102,7 @@ def test_public_api_and_exact_ros_allowlist_are_stable(tmp_path: Path):
             verify_ros_overlay,
             activate_candidate,
             prune_inactive_builds,
+            environment_setup.model_operation_lock,
         )
     )
 
@@ -588,6 +592,87 @@ def test_verify_ros_overlay_returns_manifest_digest(tmp_path: Path):
     assert verify_ros_overlay(destination, manifest_path) == sha256_file(manifest_path)
 
 
+def test_verify_ros_overlay_hashes_open_file_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """verify가 검증 뒤 path를 sha256_file로 다시 열지 않고 같은 fd를 hash한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    expected = sha256_file(manifest.manifest_path)
+
+    def reject_path_hash(path: Path) -> str:
+        """verify 중 path 기반 reopen을 즉시 실패시킨다."""
+        raise AssertionError(f"path hash attempted: {path}")
+
+    monkeypatch.setattr(environment_setup, "sha256_file", reject_path_hash)
+
+    assert verify_ros_overlay(destination, manifest.manifest_path) == expected
+
+
+def test_verify_ros_overlay_rejects_fifo_swapped_before_final_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """manifest final component가 open 직전 FIFO로 바뀌어도 block 없이 거부한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        """manifest final open 직전에 regular file을 FIFO로 교체한다."""
+        nonlocal swapped
+        if path == manifest.manifest_path.name and dir_fd is not None and not swapped:
+            swapped = True
+            manifest.manifest_path.unlink()
+            os.mkfifo(str(manifest.manifest_path))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(environment_setup.os, "open", swapping_open)
+
+    with pytest.raises(EnvironmentSetupError, match="regular"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+    assert swapped
+
+
+def test_verify_ros_overlay_rejects_file_symlink_swap_before_final_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """hash 대상 final component의 symlink swap을 O_NOFOLLOW open으로 거부한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    target = destination / "rospy" / "client.py"
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(target.read_bytes())
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(
+        path: str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        """destination client.py final open 직전에 동일 내용 symlink로 교체한다."""
+        nonlocal swapped
+        if path == target.name and dir_fd is not None and not swapped:
+            parent = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+            if parent == target.parent:
+                swapped = True
+                target.unlink()
+                target.symlink_to(outside)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(environment_setup.os, "open", swapping_open)
+
+    with pytest.raises(EnvironmentSetupError, match="symlink"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+    assert swapped
+
+
 def test_verify_ros_overlay_requires_fixed_sibling_manifest_path(tmp_path: Path):
     """검증할 manifest를 overlay 형제 고정 이름 밖에서 주입하지 못하게 한다."""
     _, destination, manifest = _build_overlay(tmp_path)
@@ -840,6 +925,61 @@ def test_verify_ros_overlay_normalizes_recursive_json(tmp_path: Path):
         verify_ros_overlay(destination, manifest.manifest_path)
 
 
+def test_verify_ros_overlay_rejects_oversized_manifest_bytes(tmp_path: Path):
+    """JSON whitespace도 포함한 manifest 전체 byte 수를 read 전에 제한한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    encoded = manifest.manifest_path.read_bytes()
+    padding = environment_setup._MAX_MANIFEST_BYTES - len(encoded) + 1
+    manifest.manifest_path.write_bytes(b" " * padding + encoded)
+
+    with pytest.raises(EnvironmentSetupError, match="manifest size limit"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
+def test_verify_ros_overlay_rejects_too_many_flat_records(tmp_path: Path):
+    """깊지 않은 JSON도 file record 상한을 넘으면 collection 생성 전에 거부한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    payload = _manifest_payload(manifest.manifest_path)
+    record = payload["files"][0]
+    payload["files"] = [
+        dict(record) for _index in range(environment_setup._MAX_MANIFEST_RECORDS + 1)
+    ]
+    _write_manifest_payload(manifest.manifest_path, payload)
+
+    with pytest.raises(EnvironmentSetupError, match="record limit"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
+def test_verify_ros_overlay_rejects_oversized_path_strings(tmp_path: Path):
+    """canonical 형태여도 manifest provenance path string 길이를 제한한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    payload = _manifest_payload(manifest.manifest_path)
+    suffix = payload["files"][0]["destination"]
+    payload["files"][0]["source"] = (
+        "/" + "a" * environment_setup._MAX_PATH_STRING_LENGTH + "/" + suffix
+    )
+    _write_manifest_payload(manifest.manifest_path, payload)
+
+    with pytest.raises(EnvironmentSetupError, match="path length limit"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
+def test_verify_ros_overlay_normalizes_parser_memory_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """JSON parser의 MemoryError를 process 예외 대신 manifest domain 오류로 바꾼다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+
+    def fail_json_loads(*_args: object, **_kwargs: object) -> object:
+        """JSON decode allocation 실패를 주입한다."""
+        raise MemoryError("injected parser allocation failure")
+
+    monkeypatch.setattr(environment_setup.json, "loads", fail_json_loads)
+
+    with pytest.raises(EnvironmentSetupError, match="JSON"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
 def test_activate_candidate_uses_relative_atomic_current_link(tmp_path: Path):
     """검증된 immediate candidate를 상대 symlink로 선택한다."""
     paths = environment_paths(tmp_path, "interfuser")
@@ -918,6 +1058,151 @@ def test_activate_candidate_preserves_old_current_when_replace_fails(
     assert Path(os.readlink(str(paths.current))) == Path("builds/old")
     assert paths.current.resolve() == old.resolve()
     assert not list(paths.model_root.glob(".current.*"))
+
+
+def test_activate_candidate_fsyncs_model_root_after_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """current atomic replace 뒤 model root directory를 fsync해 이름 변경을 내구화한다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    candidate = create_candidate(paths, "candidate")
+    events: list[str] = []
+    real_replace = os.replace
+    real_fsync = os.fsync
+
+    def recording_replace(source: str | Path, destination: str | Path) -> None:
+        """current replace 순서를 기록하고 실제 교체를 수행한다."""
+        if Path(destination) == paths.current:
+            events.append("replace")
+        real_replace(source, destination)
+
+    def recording_fsync(file_descriptor: int) -> None:
+        """directory fsync 순서를 기록하고 실제 fsync를 수행한다."""
+        events.append("fsync")
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(environment_setup.os, "replace", recording_replace)
+    monkeypatch.setattr(environment_setup.os, "fsync", recording_fsync)
+
+    activate_candidate(paths, candidate)
+
+    assert events == ["replace", "fsync"]
+
+
+def test_activate_candidate_cleans_temp_when_directory_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """replace 뒤 directory fsync 실패를 domain 오류로 바꾸고 temp link를 남기지 않는다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    candidate = create_candidate(paths, "candidate")
+
+    def fail_fsync(_file_descriptor: int) -> None:
+        """model root directory durability 실패를 주입한다."""
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(environment_setup.os, "fsync", fail_fsync)
+
+    with pytest.raises(EnvironmentSetupError, match="fsync"):
+        activate_candidate(paths, candidate)
+    assert Path(os.readlink(str(paths.current))) == Path("builds/candidate")
+    assert not list(paths.model_root.glob(".current.*"))
+
+
+def test_model_operation_lock_is_reentrant_across_lifecycle_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """outer setup lease 안의 activate/prune가 같은 flock을 재진입해 한 번만 획득한다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    calls: list[int] = []
+    real_flock = environment_setup.fcntl.flock
+
+    def recording_flock(file_descriptor: int, operation: int) -> None:
+        """실제 flock을 수행하며 outer lease의 acquire/release만 기록한다."""
+        calls.append(operation)
+        real_flock(file_descriptor, operation)
+
+    monkeypatch.setattr(environment_setup.fcntl, "flock", recording_flock)
+
+    with environment_setup.model_operation_lock(paths):
+        active = create_candidate(paths, "active")
+        inactive = create_candidate(paths, "inactive")
+        activate_candidate(paths, active)
+        assert prune_inactive_builds(paths) == (inactive,)
+
+    assert calls == [environment_setup.fcntl.LOCK_EX, environment_setup.fcntl.LOCK_UN]
+
+
+def test_outer_model_operation_lease_blocks_concurrent_prune(tmp_path: Path):
+    """create부터 activate까지 잡은 outer lease 동안 같은 process prune thread를 막는다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    prune_finished = threading.Event()
+    release_prune = threading.Event()
+    errors: list[BaseException] = []
+    removed: list[tuple[Path, ...]] = []
+
+    def run_prune() -> None:
+        """outer lease와 경쟁하는 prune 결과를 수집한다."""
+        try:
+            removed.append(prune_inactive_builds(paths))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            prune_finished.set()
+            release_prune.set()
+
+    with environment_setup.model_operation_lock(paths):
+        candidate = create_candidate(paths, "candidate")
+        prune_thread = threading.Thread(target=run_prune)
+        prune_thread.start()
+        assert not prune_finished.wait(0.2)
+        activate_candidate(paths, candidate)
+    assert release_prune.wait(5.0)
+    prune_thread.join(5.0)
+
+    assert not prune_thread.is_alive()
+    assert errors == []
+    assert removed == [()]
+    assert paths.current.resolve() == candidate.resolve()
+
+
+def test_model_operation_lock_blocks_a_separate_process(tmp_path: Path):
+    """process-local RLock 밖에서도 lifecycle file flock이 child process를 막는다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    started = tmp_path / "child-started"
+    acquired = tmp_path / "child-acquired"
+    script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from validator_inference.environment_setup import model_operation_lock\n"
+        "from validator_inference.model_environment import environment_paths\n"
+        "project, started, acquired = map(Path, sys.argv[1:])\n"
+        "started.write_text('started\\n', encoding='utf-8')\n"
+        "with model_operation_lock(environment_paths(project, 'interfuser')):\n"
+        "    acquired.write_text('acquired\\n', encoding='utf-8')\n"
+    )
+    process: subprocess.Popen[str] | None = None
+    try:
+        with environment_setup.model_operation_lock(paths):
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(tmp_path), str(started), str(acquired)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _attempt in range(100):
+                if started.exists():
+                    break
+                time.sleep(0.01)
+            assert started.exists()
+            time.sleep(0.1)
+            assert not acquired.exists()
+        stdout, stderr = process.communicate(timeout=5.0)
+        assert process.returncode == 0, stdout + stderr
+        assert acquired.is_file()
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5.0)
 
 
 def test_activate_and_prune_share_lifecycle_lock_and_secure_mode(
@@ -1070,6 +1355,34 @@ def test_prune_inactive_builds_handles_missing_current(tmp_path: Path):
 
     assert prune_inactive_builds(paths) == (candidate,)
     assert not candidate.exists()
+
+
+def test_prune_inactive_builds_rejects_inode_replacement_after_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """scan한 inactive directory가 삭제 전 교체되면 새 inode를 지우지 않는다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    victim = create_candidate(paths, "victim")
+    displaced = paths.builds / "displaced"
+    real_lstat = Path.lstat
+    swapped = False
+
+    def swapping_lstat(path: Path) -> os.stat_result:
+        """victim의 삭제 전 revalidation 시 directory inode를 교체한다."""
+        nonlocal swapped
+        if path == victim and not swapped:
+            swapped = True
+            victim.rename(displaced)
+            victim.mkdir()
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", swapping_lstat)
+
+    with pytest.raises(EnvironmentSetupError, match="changed since scan"):
+        prune_inactive_builds(paths)
+    assert swapped
+    assert victim.is_dir()
+    assert displaced.is_dir()
 
 
 @pytest.mark.parametrize("kind", ("symlink", "file", "malformed-current", "dangling-current"))
