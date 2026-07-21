@@ -176,12 +176,11 @@ def _requirement_blocks(lock_text: str) -> list[str]:
         unexpected_options = [
             token
             for token in tokens
-            if token.startswith("--")
-            and not hash_option.fullmatch(token)
-            and "--hash=sha256:" not in token
+            if token.startswith("--") and not hash_option.fullmatch(token)
         ]
         assert not unexpected_options, (
-            "unexpected requirement option: " + ", ".join(unexpected_options)
+            "unexpected requirement option; every option must be a valid SHA-256 "
+            "hash option: " + ", ".join(unexpected_options)
         )
         assert hash_tokens, "installable entry lacks a valid SHA-256 hash option"
         blocks.append("\n".join(current))
@@ -215,6 +214,42 @@ def _requirement_blocks(lock_text: str) -> list[str]:
             current = []
     assert not continuing, "unexpected end of continued requirement"
     return blocks
+
+
+def _assert_compile_command_contract(
+    command: list[str], input_path: str, expected_values: dict[str, str]
+) -> None:
+    """uv compile argv를 strict flag grammar로 해석해 exact 계약과 대조한다."""
+    valueless_flags = {
+        "--generate-hashes",
+        "--emit-index-url",
+        "--emit-index-annotation",
+    }
+    assert command[:3] == ["uv", "pip", "compile"]
+    parsed_values: dict[str, str] = {}
+    parsed_valueless: set[str] = set()
+    positional: list[str] = []
+    index = 3
+    while index < len(command):
+        token = command[index]
+        if token in expected_values:
+            assert token not in parsed_values, f"duplicate valued flag: {token}"
+            assert index + 1 < len(command), f"missing value for flag: {token}"
+            parsed_values[token] = command[index + 1]
+            index += 2
+        elif token in valueless_flags:
+            assert token not in parsed_valueless, f"duplicate valueless flag: {token}"
+            parsed_valueless.add(token)
+            index += 1
+        elif token.startswith("--"):
+            raise AssertionError(f"unknown compile flag: {token}")
+        else:
+            positional.append(token)
+            index += 1
+
+    assert positional == [input_path], "compile command must have one exact input path"
+    assert parsed_values == expected_values
+    assert parsed_valueless == valueless_flags
 
 
 def test_manifest_defines_exact_common_contract(manifest: EnvironmentManifest):
@@ -763,29 +798,60 @@ def test_lock_compile_commands_match_manifest_contract(
         command = commands[0]
         input_path = str(PACKAGE_RELATIVE_ROOT / f"requirements/{model_id}.in")
         output_path = str(PACKAGE_RELATIVE_ROOT / f"requirements/{model_id}.lock")
-        expected_arguments = [
+        _assert_compile_command_contract(
+            command,
             input_path,
-            "--output-file",
-            output_path,
-            "--python-version",
-            definition.python_version,
-            "--python-platform",
-            manifest.python_platform,
-            "--default-index",
-            manifest.default_index,
-            "--index-strategy",
-            manifest.index_strategy,
-            "--torch-backend",
-            definition.torch_backend,
-            "--exclude-newer",
-            manifest.exclude_newer,
-            "--generate-hashes",
-            "--emit-index-url",
-            "--emit-index-annotation",
-        ]
-        assert command[:3] == ["uv", "pip", "compile"]
-        assert sorted(command[3:]) == sorted(expected_arguments)
-        assert command[command.index("--output-file") + 1] == output_path
+            {
+                "--output-file": output_path,
+                "--python-version": definition.python_version,
+                "--python-platform": manifest.python_platform,
+                "--default-index": manifest.default_index,
+                "--index-strategy": manifest.index_strategy,
+                "--torch-backend": definition.torch_backend,
+                "--exclude-newer": manifest.exclude_newer,
+            },
+        )
+
+
+def test_compile_command_parser_rejects_swapped_valued_flag_values():
+    """같은 token 집합이어도 valued flag의 값이 바뀌면 거부하는지 검사한다."""
+    expected_values = {
+        "--output-file": "requirements/model.lock",
+        "--python-version": "3.8.20",
+        "--python-platform": "x86_64-manylinux_2_31",
+        "--default-index": "https://pypi.org/simple",
+        "--index-strategy": "first-index",
+        "--torch-backend": "cu121",
+        "--exclude-newer": "2026-07-21T00:00:00Z",
+    }
+    command = [
+        "uv",
+        "pip",
+        "compile",
+        "requirements/model.in",
+        "--output-file",
+        "requirements/model.lock",
+        "--python-version",
+        "x86_64-manylinux_2_31",
+        "--python-platform",
+        "3.8.20",
+        "--default-index",
+        "https://pypi.org/simple",
+        "--index-strategy",
+        "first-index",
+        "--torch-backend",
+        "cu121",
+        "--exclude-newer",
+        "2026-07-21T00:00:00Z",
+        "--generate-hashes",
+        "--emit-index-url",
+        "--emit-index-annotation",
+    ]
+
+    with pytest.raises(AssertionError):
+        _assert_compile_command_contract(
+            command, "requirements/model.in", expected_values
+        )
 
 
 @pytest.mark.parametrize(
@@ -811,8 +877,16 @@ def test_requirement_block_parser_rejects_invalid_hash_options(hash_content: str
         "    --hash=sha256:" + "a" * 64 + "\n",
         "--find-links https://example.com/packages\n",
         "example==1.0.0 \\\n    --no-deps\n",
+        "example==1.0.0 \\\n"
+        "    --evil=--hash=sha256:" + "a" * 64 + " \\\n"
+        "    --hash=sha256:" + "b" * 64 + "\n",
     ),
-    ids=("orphan-indentation", "unexpected-directive", "unexpected-continuation"),
+    ids=(
+        "orphan-indentation",
+        "unexpected-directive",
+        "unexpected-continuation",
+        "misleading-hash-option",
+    ),
 )
 def test_requirement_block_parser_rejects_unexpected_content(lock_text: str):
     """installable block 밖의 들여쓰기와 미지원 directive를 거부하는지 검사한다."""
