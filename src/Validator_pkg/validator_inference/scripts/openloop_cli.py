@@ -107,6 +107,7 @@ def _launch_argv(project_root: Path, model_id: str, rviz: bool) -> list[str]:
         "roslaunch",
         "Validator_pkg",
         "openloop_validator.launch",
+        f"project_root:={root}",
         f"model_id:={model_id}",
         f"model_env_root:={root / '.venvs'}",
         f"show_rviz:={'true' if rviz else 'false'}",

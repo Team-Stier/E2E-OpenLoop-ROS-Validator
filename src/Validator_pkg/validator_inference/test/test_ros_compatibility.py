@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import runpy
 import signal
 import shutil
 import subprocess
@@ -1181,6 +1182,31 @@ def test_real_install_prefix_and_roslaunch_signal_contract(tmp_path):
         tmp_path, install_prefix
     )
     ros_home = tmp_path / "ros home"
+    launch_environment = _installed_environment(
+        install_prefix, ros_home, 1
+    )
+    installed_cli = runpy.run_path(
+        str(install_prefix / "lib/validator_inference/openloop_cli.py")
+    )
+    launch_argv = installed_cli["_launch_argv"](
+        project_root, "interfuser", False
+    )
+    launch_arguments = subprocess.run(
+        [launch_argv[0], "--args", "/inference_engine", *launch_argv[1:]],
+        env=launch_environment,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+    ).stdout
+    assert 'OPENLOOP_PROJECT_ROOT="{}"'.format(project_root) in launch_arguments
+    assert 'OPENLOOP_MODEL_ENV_ROOT="{}"'.format(
+        project_root / ".venvs"
+    ) in launch_arguments
+    assert str(wrapper) in launch_arguments
+    assert str(relay) in launch_arguments
+
     signal_capture = tmp_path / "signal capture.json"
     signal_launch = tmp_path / "signal.launch"
     _write_installed_launch(

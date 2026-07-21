@@ -128,6 +128,7 @@ def test_launch_argv_is_exact_array_contract(
         "roslaunch",
         "Validator_pkg",
         "openloop_validator.launch",
+        f"project_root:={root}",
         "model_id:=interfuser",
         f"model_env_root:={root / '.venvs'}",
         f"show_rviz:={'true' if rviz else 'false'}",
