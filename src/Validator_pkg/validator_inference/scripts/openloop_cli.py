@@ -26,6 +26,9 @@ from validator_inference.model_environment import (
 _PACKAGE_RELATIVE_ROOT = Path("src/Validator_pkg/validator_inference")
 _MANIFEST_RELATIVE_PATH = _PACKAGE_RELATIVE_ROOT / "config/model_environments.json"
 _PROFILE_RELATIVE_PATH = Path("src/Validator_pkg/config/profile.json")
+_SENSOR_CONFIG_RELATIVE_PATH = Path(
+    "src/Validator_pkg/validator_pipeline/config/0716demo.json"
+)
 
 
 class OpenLoopCliError(RuntimeError):
@@ -108,6 +111,8 @@ def _launch_argv(project_root: Path, model_id: str, rviz: bool) -> list[str]:
         "Validator_pkg",
         "openloop_validator.launch",
         f"project_root:={root}",
+        f"profile_file:={root / _PROFILE_RELATIVE_PATH}",
+        f"sensor_config:={root / _SENSOR_CONFIG_RELATIVE_PATH}",
         f"model_id:={model_id}",
         f"model_env_root:={root / '.venvs'}",
         f"show_rviz:={'true' if rviz else 'false'}",

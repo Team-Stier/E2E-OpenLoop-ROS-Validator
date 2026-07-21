@@ -15,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 warnings.filterwarnings(
     "ignore",
@@ -1032,6 +1033,9 @@ def _prepare_installed_model_environment(tmp_path, install_prefix):
     current = project_root / ".venvs/interfuser/current"
     current.parent.mkdir(parents=True, exist_ok=True)
     current.symlink_to(Path("builds") / environment_dir.name)
+    lifecycle_lock = current.parent / ".lifecycle.lock"
+    lifecycle_lock.write_text("", encoding="utf-8")
+    lifecycle_lock.chmod(0o600)
     return project_root, environment_dir, overlay
 
 
@@ -1206,6 +1210,36 @@ def test_real_install_prefix_and_roslaunch_signal_contract(tmp_path):
     ) in launch_arguments
     assert str(wrapper) in launch_arguments
     assert str(relay) in launch_arguments
+
+    launch_parameters = yaml.safe_load(
+        subprocess.run(
+            [launch_argv[0], "--dump-params", *launch_argv[1:]],
+            env=launch_environment,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        ).stdout
+    )
+    profile_file = project_root / "src/Validator_pkg/config/profile.json"
+    sensor_config = (
+        project_root
+        / "src/Validator_pkg/validator_pipeline/config/0716demo.json"
+    )
+    assert launch_parameters["/inference_engine/profile_file"] == str(profile_file)
+    assert launch_parameters["/opt_feeder/profile_file"] == str(profile_file)
+    assert launch_parameters["/bev_visualizer/profile_file"] == str(profile_file)
+    assert launch_parameters["/recorder/record_dir"] == str(
+        project_root / "records/openloop"
+    )
+    assert launch_parameters["/image_adaptor/config_path"] == str(sensor_config)
+    assert launch_parameters["/lidar_bev_processor/config_path"] == str(
+        sensor_config
+    )
+    assert launch_parameters["/camera_bev_stitcher/config_path"] == str(
+        sensor_config
+    )
 
     signal_capture = tmp_path / "signal capture.json"
     signal_launch = tmp_path / "signal.launch"

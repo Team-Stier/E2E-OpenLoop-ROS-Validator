@@ -368,17 +368,36 @@ Inference layer의 `/waypoints`는 `Lidar3D-4` frame으로 발행된다. BEV Vis
 
 ### 통합 실행(권장)
 
-Preprocessing, inference, visualization의 model 선택을 하나로 묶으려면 다음 launch를 사용한다.
+저장소 root에서 모델 환경을 한 번 준비한 뒤 validator와 RViz를 시작한다.
+
+```bash
+./openloop setup interfuser
+./openloop interfuser --rviz
+```
+
+별도 terminal에서 기본 bag과 `/clock`을 재생한다.
+
+```bash
+./openloop bag
+```
+
+다른 모델은 해당 모델 환경 준비가 완료된 경우에만 `interfuser`를 해당 model ID로 바꾼다. SparseDrive V2를 선택하는 경우 `src/Validator_pkg/config/profile.json`의 front/left/right inline calibration(`K_original_3x3`, distortion metadata, `T_lidar_from_camera_4x4`)을 모두 채워야 한다. Bag에 `CameraInfo`가 없으므로 비어 있는 값을 임의로 만들지 않는다.
+
+### 고급 직접 launch
+
+CLI가 전달하는 경로를 직접 제어할 때만 ROS setup을 source한 terminal에서 다음 형식을 사용한다. 먼저 해당 모델의 `./openloop setup MODEL_ID`를 완료해야 한다.
 
 ```bash
 roslaunch Validator_pkg openloop_validator.launch \
-  model_id:=tfv6 \
+  project_root:=/home/stier/E2E-OpenLoop-ROS-Validator \
+  profile_file:=/home/stier/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/config/profile.json \
+  sensor_config:=/home/stier/E2E-OpenLoop-ROS-Validator/src/Validator_pkg/validator_pipeline/config/0716demo.json \
+  model_id:=interfuser \
+  model_env_root:=/home/stier/E2E-OpenLoop-ROS-Validator/.venvs \
   show_rviz:=true
 ```
 
-SparseDrive V2를 선택하는 경우 `src/Validator_pkg/config/profile.json`의 front/left/right inline calibration(`K_original_3x3`, distortion metadata, `T_lidar_from_camera_4x4`)을 모두 채워야 한다. Bag에 `CameraInfo`가 없으므로 비어 있는 값을 임의로 만들지 않는다.
-
-아래 절은 각 component를 따로 점검할 때의 실행 순서다.
+아래 절도 정상 운영 절차가 아니라 각 component를 분리해 점검하는 고급 진단 절차다.
 
 ### 터미널 1: ROS Master
 

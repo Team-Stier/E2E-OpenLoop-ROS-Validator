@@ -3,8 +3,8 @@
   <arg name="project_root" default="$(eval '/'.join(find('Validator_pkg').split('/')[:-3]))"/>
   <arg name="model_env_root" default="$(arg project_root)/.venvs"/>
   <arg name="profile_file" default=""/>
-  <arg name="record_dir" default="$(find validator_inference)/../../../records/openloop"/>
-  <arg name="sensor_config" default="$(find Validator_pkg)/config/0716demo.json"/>
+  <arg name="record_dir" default="$(arg project_root)/records/openloop"/>
+  <arg name="sensor_config" default="$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0716demo.json"/>
 
   <arg name="show_gui" default="false"/>
   <arg name="show_rviz" default="false"/>

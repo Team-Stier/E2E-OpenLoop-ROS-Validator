@@ -42,7 +42,7 @@ def test_launch_uses_sim_time_arguments_and_exactly_three_runtime_nodes():
     assert '<arg name="profile_file" default=""/>' in launch
     assert (
         '<arg name="record_dir" '
-        'default="$(find validator_inference)/../../../records/openloop"/>'
+        'default="$(arg project_root)/records/openloop"/>'
         in launch
     )
     assert launch.count("<node ") == 3

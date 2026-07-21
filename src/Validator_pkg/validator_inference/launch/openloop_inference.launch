@@ -4,7 +4,7 @@
   <arg name="model_env_root" default="$(arg project_root)/.venvs"/>
   <!-- Empty means: let each node resolve the source/install profile location. -->
   <arg name="profile_file" default=""/>
-  <arg name="record_dir" default="$(find validator_inference)/../../../records/openloop"/>
+  <arg name="record_dir" default="$(arg project_root)/records/openloop"/>
 
   <param name="/use_sim_time" value="true"/>
 

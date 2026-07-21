@@ -17,6 +17,7 @@
     output="screen"
     required="true"
   >
+    <param name="config_path" value="$(arg config_path)" />
     <param name="model_profiles" value="$(arg model_profiles)" />
   </node>
 

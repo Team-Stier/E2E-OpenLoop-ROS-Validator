@@ -120,6 +120,10 @@ def test_launch_argv_is_exact_array_contract(
     cli: ModuleType, tmp_path: Path, rviz: bool
 ):
     root = tmp_path.resolve()
+    profile_file = root / "src/Validator_pkg/config/profile.json"
+    sensor_config = (
+        root / "src/Validator_pkg/validator_pipeline/config/0716demo.json"
+    )
 
     result = cli._launch_argv(root, "interfuser", rviz)
 
@@ -129,6 +133,8 @@ def test_launch_argv_is_exact_array_contract(
         "Validator_pkg",
         "openloop_validator.launch",
         f"project_root:={root}",
+        f"profile_file:={profile_file}",
+        f"sensor_config:={sensor_config}",
         "model_id:=interfuser",
         f"model_env_root:={root / '.venvs'}",
         f"show_rviz:={'true' if rviz else 'false'}",

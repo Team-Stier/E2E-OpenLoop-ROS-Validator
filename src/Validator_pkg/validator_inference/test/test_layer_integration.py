@@ -259,6 +259,12 @@ def test_integrated_launch_wires_one_model_id_through_all_layers():
     assert top_level_args["model_env_root"].attrib["default"] == (
         "$(arg project_root)/.venvs"
     )
+    assert top_level_args["record_dir"].attrib["default"] == (
+        "$(arg project_root)/records/openloop"
+    )
+    assert top_level_args["sensor_config"].attrib["default"] == (
+        "$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0716demo.json"
+    )
 
     includes = {
         Path(element.attrib["file"]).name: element for element in root.findall("include")
@@ -282,15 +288,31 @@ def test_integrated_launch_wires_one_model_id_through_all_layers():
         for arg in includes["bev_visualization.launch"].findall("arg")
     }
     assert preprocessing_args["model_profiles"] == "$(arg model_id)"
+    assert preprocessing_args["config_path"] == "$(arg sensor_config)"
     assert inference_args["model_id"] == "$(arg model_id)"
     assert inference_args["profile_file"] == "$(arg profile_file)"
     assert inference_args["project_root"] == "$(arg project_root)"
     assert inference_args["model_env_root"] == "$(arg model_env_root)"
+    assert inference_args["record_dir"] == "$(arg record_dir)"
     assert visualization_args["profile_file"] == "$(arg profile_file)"
     for geometry_argument in ("forward_range", "lateral_range", "resolution"):
         expected = f"$(arg {geometry_argument})"
         assert preprocessing_args[geometry_argument] == expected
         assert visualization_args[geometry_argument] == expected
+
+    preprocessing = ElementTree.parse(
+        PIPELINE_PACKAGE / "launch" / "camera_bev_pipeline.launch"
+    ).getroot()
+    image_adaptor = next(
+        node
+        for node in preprocessing.findall("node")
+        if node.attrib["name"] == "image_adaptor"
+    )
+    image_parameters = {
+        parameter.attrib["name"]: parameter.attrib["value"]
+        for parameter in image_adaptor.findall("param")
+    }
+    assert image_parameters["config_path"] == "$(arg config_path)"
 
 
 def test_visualization_geometry_matches_preprocessing_and_path_frame_transform():
