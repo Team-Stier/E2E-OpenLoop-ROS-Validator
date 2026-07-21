@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -1542,6 +1544,24 @@ def _write_executable(path: Path) -> Path:
     return path
 
 
+def _link_managed_candidate_python(
+    candidate: Path, python_version: str, managed_root: Path
+) -> Path:
+    """runtime path policy가 검증할 versioned base Python과 candidate link를 만든다."""
+    major_minor = ".".join(python_version.split(".")[:2])
+    base_python = _write_executable(
+        managed_root / f"python-{major_minor}" / "bin" / f"python{major_minor}"
+    )
+    (base_python.parent.parent / "lib" / f"python{major_minor}").mkdir(
+        parents=True, exist_ok=True
+    )
+    candidate_python = candidate / "bin" / "python"
+    candidate_python.parent.mkdir(parents=True, exist_ok=True)
+    candidate_python.unlink(missing_ok=True)
+    candidate_python.symlink_to(base_python)
+    return candidate_python
+
+
 def _complete_sparse_calibration(profile_path: Path) -> None:
     """SparseDrive 테스트 profile의 세 카메라 calibration을 완성한다."""
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -2771,6 +2791,8 @@ class _SetupRunner:
         self.post_sparse_git_status_output = ""
         self.write_sparse_extensions = True
         self.required_import_origins_override: list[str] | None = None
+        self.loaded_module_origins_override: dict[str, object] | None = None
+        self.target_ros_module_origins_override: dict[str, object] | None = None
         self.phase_hooks: dict[
             str, Callable[[tuple[str, ...], dict[str, Any]], None]
         ] = {}
@@ -2808,7 +2830,10 @@ class _SetupRunner:
             code = ""
         if "platform.python_version" in code:
             return "python_version"
-        if "deformable_aggregation_with_depth_ext" in code and "origins =" in code:
+        if (
+            "deformable_aggregation_with_depth_ext" in code
+            and "origins = [pathlib.Path(importlib.import_module" in code
+        ):
             return "sparse_imports"
         if "torch.cuda.is_available" in code:
             return "cuda_runtime"
@@ -2855,11 +2880,39 @@ class _SetupRunner:
             )
         elif phase == "uv_venv":
             candidate = Path(command[-1])
-            python = candidate / "bin" / "python"
-            _write_executable(python)
+            _link_managed_candidate_python(
+                candidate, self.python_version, self.root.parent / "managed-pythons"
+            )
             stdout = ""
         elif phase == "python_version":
             stdout = self.python_version + "\n"
+        elif phase == "target_ros_import":
+            candidate = Path(command[0]).parent.parent
+            origins = (
+                self.target_ros_module_origins_override
+                if self.target_ros_module_origins_override is not None
+                else {
+                    "rospy": str(candidate / ".ros-overlay" / "rospy" / "__init__.py"),
+                    "std_msgs.msg": str(
+                        candidate / ".ros-overlay" / "std_msgs" / "msg" / "__init__.py"
+                    ),
+                    "validator_msgs.msg": str(
+                        self.root
+                        / "devel/lib/python3/dist-packages/validator_msgs/msg/__init__.py"
+                    ),
+                    "validator_inference.engine": str(
+                        self.root
+                        / "src/Validator_pkg/validator_inference/src/"
+                        "validator_inference/engine.py"
+                    ),
+                    "validator_inference.models.select": str(
+                        self.root
+                        / "devel/lib/python3/dist-packages/"
+                        "validator_inference/models/select.py"
+                    ),
+                }
+            )
+            stdout = json.dumps(origins)
         elif phase == "required_imports":
             names = {
                 "interfuser": (
@@ -2916,10 +2969,21 @@ class _SetupRunner:
                 else:
                     origin = candidate / "lib/python/site-packages" / name / "__init__.py"
                 origins.append(str(origin))
-            stdout = json.dumps(
+            required_origins = (
                 self.required_import_origins_override
                 if self.required_import_origins_override is not None
                 else origins
+            )
+            module_origins = (
+                self.loaded_module_origins_override
+                if self.loaded_module_origins_override is not None
+                else dict(zip(names, required_origins))
+            )
+            stdout = json.dumps(
+                {
+                    "required_import_origins": required_origins,
+                    "module_origins": module_origins,
+                }
             )
         elif phase == "cuda_runtime":
             stdout = "1\n" if self.candidate_cuda_available else "0\n"
@@ -5323,6 +5387,119 @@ def test_run_preflight_holds_model_lock_against_current_switch(
     assert paths.current.resolve() == replacement
 
 
+def test_target_ros_import_probe_audits_inference_source_and_catkin_boundaries(
+    tmp_path: Path,
+):
+    """launch probe는 inference entry points를 import하고 source/Catkin origin을 허용한다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    preflight = preflight_environment(
+        root,
+        "tfv6",
+        runner=runner,
+        dependencies=dependencies.preflight_dependencies,
+    )
+    candidate = create_candidate(preflight.paths, "target-ros-origin")
+    python = _link_managed_candidate_python(
+        candidate, preflight.definition.python_version, tmp_path / "managed"
+    )
+    (candidate / ".ros-overlay").mkdir()
+    catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
+    catkin_python.mkdir(parents=True)
+    runner.calls.clear()
+
+    environment_setup._run_target_ros_import_smoke(
+        preflight, python, candidate, catkin_python, {}, runner
+    )
+
+    command, kwargs, _ = _setup_call(runner, "target_ros_import")
+    assert "import validator_inference.engine" in command[3]
+    assert "import validator_inference.models.select" in command[3]
+    assert kwargs["capture_output"] is True
+
+
+@pytest.mark.parametrize("action", ("required_imports", "target_ros_import"))
+def test_runtime_origin_validator_normalizes_import_failure_to_caller_action(
+    monkeypatch: pytest.MonkeyPatch, action: str
+):
+    """origin validator를 import할 수 없어도 caller action의 domain error로 실패한다."""
+    real_import = builtins.__import__
+
+    def blocked_import(name: str, *args: Any, **kwargs: Any):
+        if name == "validator_inference.ros_compatibility":
+            raise ImportError("blocked origin validator")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+    with pytest.raises(EnvironmentSetupError, match="origin audit is unavailable") as caught:
+        environment_setup._validate_runtime_module_origins(
+            None, Path("/candidate/bin/python"), Path("/catkin"), {}, action
+        )
+
+    assert caught.value.action == action
+
+
+@pytest.mark.parametrize(
+    ("module_name", "foreign_origin", "reason"),
+    (
+        (
+            "rospy",
+            "/opt/ros/noetic/lib/python3/dist-packages/rospy/__init__.py",
+            "ROS package",
+        ),
+        (
+            "tf2_py._tf2",
+            "/opt/ros/noetic/lib/python3/dist-packages/tf2_py/_tf2.so",
+            "native extension",
+        ),
+        (
+            "validator_inference.engine",
+            "/tmp/foreign/validator_inference/engine.py",
+            "project module",
+        ),
+        (
+            "validator_inference.models.select",
+            "/tmp/foreign/validator_inference/models/select.py",
+            "project module",
+        ),
+    ),
+)
+def test_target_ros_import_probe_rejects_foreign_module_origins(
+    tmp_path: Path, module_name: str, foreign_origin: str, reason: str
+):
+    """launch 직전 probe도 system ROS/native와 foreign project module을 차단한다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    preflight = preflight_environment(
+        root,
+        "tfv6",
+        runner=runner,
+        dependencies=dependencies.preflight_dependencies,
+    )
+    candidate = create_candidate(preflight.paths, "target-ros-foreign")
+    python = _link_managed_candidate_python(
+        candidate, preflight.definition.python_version, tmp_path / "managed"
+    )
+    (candidate / ".ros-overlay").mkdir()
+    catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
+    catkin_python.mkdir(parents=True)
+    runner.target_ros_module_origins_override = {
+        "validator_inference.engine": str(
+            preflight.package_root / "src" / "validator_inference" / "engine.py"
+        ),
+        "validator_inference.models.select": str(
+            catkin_python / "validator_inference" / "models" / "select.py"
+        ),
+        module_name: foreign_origin,
+    }
+
+    with pytest.raises(EnvironmentSetupError, match=reason) as caught:
+        environment_setup._run_target_ros_import_smoke(
+            preflight, python, candidate, catkin_python, {}, runner
+        )
+
+    assert caught.value.action == "target_ros_import"
+
+
 def test_interfuser_runtime_probe_prepends_and_attests_vendored_timm(
     tmp_path: Path,
 ):
@@ -5342,11 +5519,15 @@ def test_interfuser_runtime_probe_prepends_and_attests_vendored_timm(
         "", encoding="utf-8"
     )
     candidate = create_candidate(preflight.paths, "probe")
-    _write_executable(candidate / "bin" / "python")
+    _link_managed_candidate_python(
+        candidate, preflight.definition.python_version, tmp_path / "managed"
+    )
+    catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
+    catkin_python.mkdir(parents=True)
     runner.calls.clear()
 
     environment_setup._run_candidate_import_cuda_checks(
-        preflight, candidate, {}, runner
+        preflight, candidate, catkin_python, {}, runner
     )
 
     command, _, _ = _setup_call(runner, "required_imports")
@@ -5361,7 +5542,7 @@ def test_interfuser_runtime_probe_prepends_and_attests_vendored_timm(
     ]
     with pytest.raises(EnvironmentSetupError, match="timm origin") as caught:
         environment_setup._run_candidate_import_cuda_checks(
-            preflight, candidate, {}, runner
+            preflight, candidate, catkin_python, {}, runner
         )
     assert caught.value.action == "required_imports"
 
@@ -5384,7 +5565,7 @@ def test_interfuser_runtime_probe_prepends_and_attests_vendored_timm(
     ]
     with pytest.raises(EnvironmentSetupError, match="timm origin"):
         environment_setup._run_candidate_import_cuda_checks(
-            preflight, candidate, {}, runner
+            preflight, candidate, catkin_python, {}, runner
         )
 
 
@@ -5408,7 +5589,11 @@ def test_sparsedrive_runtime_probe_rejects_foreign_extension_origin(tmp_path: Pa
     ):
         (ops / f"{module}.cpython-39-x86_64-linux-gnu.so").write_bytes(b"native")
     candidate = create_candidate(preflight.paths, "probe")
-    _write_executable(candidate / "bin" / "python")
+    _link_managed_candidate_python(
+        candidate, preflight.definition.python_version, tmp_path / "managed"
+    )
+    catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
+    catkin_python.mkdir(parents=True)
     names = preflight.definition.required_imports
     runner.required_import_origins_override = [
         str(candidate / "lib" / "python" / "site-packages" / name / "__init__.py")
@@ -5417,7 +5602,150 @@ def test_sparsedrive_runtime_probe_rejects_foreign_extension_origin(tmp_path: Pa
 
     with pytest.raises(EnvironmentSetupError, match="extension origin") as caught:
         environment_setup._run_candidate_import_cuda_checks(
-            preflight, candidate, {}, runner
+            preflight, candidate, catkin_python, {}, runner
         )
 
     assert caught.value.action == "required_imports"
+
+
+def test_runtime_probe_rejects_foreign_native_loaded_through_candidate_pth(
+    tmp_path: Path,
+):
+    """candidate .pth가 주입한 외부 전이 native module을 normal run에서 차단한다."""
+    root, dependencies, fixture_runner, _ = _setup_fixture(tmp_path)
+    preflight = preflight_environment(
+        root,
+        "tfv6",
+        runner=fixture_runner,
+        dependencies=dependencies.preflight_dependencies,
+    )
+    preflight = dataclasses.replace(
+        preflight,
+        definition=dataclasses.replace(
+            preflight.definition,
+            required_imports=("foreign_required",),
+            cuda_policy="recommended",
+        ),
+    )
+    checkout = root / "models" / "sources" / "lead"
+    checkout.mkdir(parents=True)
+    candidate = create_candidate(preflight.paths, "foreign-pth")
+    subprocess.run(
+        ["/usr/bin/python3", "-m", "venv", "--without-pip", str(candidate)],
+        check=True,
+        shell=False,
+    )
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site_packages = candidate / "lib" / version / "site-packages"
+    required_module = site_packages / "foreign_required.py"
+    required_module.write_text("import _ssl\n", encoding="utf-8")
+    foreign = tmp_path / "foreign-native"
+    foreign.mkdir()
+    ssl_spec = importlib.util.find_spec("_ssl")
+    assert ssl_spec is not None and ssl_spec.origin is not None
+    shutil.copy2(ssl_spec.origin, foreign / Path(ssl_spec.origin).name)
+    (site_packages / "foreign-native.pth").write_text(
+        f"import sys; sys.path.insert(0, {str(foreign)!r})\n",
+        encoding="utf-8",
+    )
+    overlay = candidate / ".ros-overlay"
+    overlay.mkdir()
+    catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
+    catkin_python.mkdir(parents=True)
+    child_environment = environment_setup._build_candidate_child_environment(
+        preflight, candidate, catkin_python
+    )
+
+    def runtime_runner(argv: list[str], **kwargs: Any):
+        code = argv[argv.index("-c") + 1]
+        if "torch.cuda.is_available" in code:
+            return subprocess.CompletedProcess(argv, 0, stdout="1\n", stderr="")
+        return subprocess.run(argv, **kwargs)
+
+    with pytest.raises(EnvironmentSetupError, match="outside the target interpreter"):
+        environment_setup._run_candidate_import_cuda_checks(
+            preflight,
+            candidate,
+            catkin_python,
+            child_environment,
+            runtime_runner,
+        )
+
+
+def test_runtime_probe_rejects_foreign_top_level_required_import(tmp_path: Path):
+    """required import 자체가 다른 venv의 pure module이면 normal run을 막는다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    preflight = preflight_environment(
+        root,
+        "tfv6",
+        runner=runner,
+        dependencies=dependencies.preflight_dependencies,
+    )
+    (root / "models" / "sources" / "lead").mkdir(parents=True)
+    candidate = create_candidate(preflight.paths, "foreign-required")
+    _link_managed_candidate_python(
+        candidate, preflight.definition.python_version, tmp_path / "managed"
+    )
+    (candidate / ".ros-overlay").mkdir()
+    catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
+    catkin_python.mkdir(parents=True)
+    foreign = tmp_path / "foreign-venv" / "site-packages"
+    foreign.mkdir(parents=True)
+    runner.required_import_origins_override = []
+    for name in preflight.definition.required_imports:
+        origin = foreign / f"{name.replace('.', '_')}.py"
+        origin.write_text("FOREIGN = True\n", encoding="utf-8")
+        runner.required_import_origins_override.append(str(origin))
+
+    with pytest.raises(EnvironmentSetupError, match="outside every allowed runtime root"):
+        environment_setup._run_candidate_import_cuda_checks(
+            preflight, candidate, catkin_python, {}, runner
+        )
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ("interfuser", "tfv6", "diffusiondrive_v2", "sparsedrive_v2"),
+)
+def test_runtime_origin_audit_accepts_normal_model_fixture(
+    tmp_path: Path, model_id: str
+):
+    """네 model의 venv import와 명시된 source 예외만 runtime audit가 허용한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, model_id=model_id, strip_asset_hashes=model_id == "sparsedrive_v2"
+    )
+    preflight = preflight_environment(
+        root,
+        model_id,
+        runner=runner,
+        dependencies=dependencies.preflight_dependencies,
+    )
+    checkout_names = {
+        "interfuser": "interfuser",
+        "tfv6": "lead",
+        "diffusiondrive_v2": "diffusiondrive_v2",
+        "sparsedrive_v2": "sparsedrive_v2",
+    }
+    checkout = root / "models" / "sources" / checkout_names[model_id]
+    checkout.mkdir(parents=True)
+    if model_id == "interfuser":
+        (checkout / "interfuser" / "timm").mkdir(parents=True)
+        (checkout / "interfuser" / "timm" / "__init__.py").write_text(
+            "", encoding="utf-8"
+        )
+    if model_id == "sparsedrive_v2":
+        ops = checkout / "navsim" / "agents" / "sparsedrive" / "ops"
+        ops.mkdir(parents=True)
+        for extension in _SPARSE_EXTENSION_PATHS:
+            (root / extension).write_bytes(b"native")
+    candidate = create_candidate(preflight.paths, "origin-audit")
+    _link_managed_candidate_python(
+        candidate, preflight.definition.python_version, tmp_path / "managed"
+    )
+    (candidate / ".ros-overlay").mkdir()
+    catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
+    catkin_python.mkdir(parents=True)
+
+    environment_setup._run_candidate_import_cuda_checks(
+        preflight, candidate, catkin_python, {}, runner
+    )

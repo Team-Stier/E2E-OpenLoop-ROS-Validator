@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -99,6 +100,9 @@ class RuntimePathPolicy:
     catkin_python_path: Path
     target_stdlib_paths: tuple[Path, ...]
     project_source_paths: tuple[Path, ...] = ()
+    trusted_source_module_paths: tuple[tuple[str, Path], ...] = ()
+    trusted_native_source_paths: tuple[Path, ...] = ()
+    trusted_native_extension_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -203,6 +207,93 @@ def _validate_runtime_path_policy(policy: RuntimePathPolicy) -> None:
         source = Path(source_path)
         if not source.is_absolute() or source == Path("/"):
             raise RosCompatibilityError("project source paths must be bounded and absolute")
+    trusted_source_modules: list[tuple[str, Path]] = []
+    for module_name, source_path in policy.trusted_source_module_paths:
+        if not isinstance(module_name, str) or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", module_name
+        ) is None:
+            raise RosCompatibilityError("trusted source module name is invalid")
+        source = Path(source_path)
+        try:
+            metadata = source.lstat()
+            resolved_source = source.resolve(strict=True)
+        except OSError as exc:
+            raise RosCompatibilityError(
+                f"trusted source module path is missing: {source}"
+            ) from exc
+        if (
+            not source.is_absolute()
+            or source == Path("/")
+            or stat.S_ISLNK(metadata.st_mode)
+            or resolved_source != source
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise RosCompatibilityError(
+                f"trusted source module path must be a canonical real directory: {source}"
+            )
+        if _is_within(source, opt_ros):
+            raise RosCompatibilityError(
+                f"trusted source module path must not originate in /opt/ros: {source}"
+            )
+        trusted_source_modules.append((module_name, resolved_source))
+    trusted_native_sources: list[Path] = []
+    for source_path in policy.trusted_native_source_paths:
+        source = Path(source_path)
+        try:
+            metadata = source.lstat()
+            resolved_source = source.resolve(strict=True)
+        except OSError as exc:
+            raise RosCompatibilityError(
+                f"trusted native project source root is missing: {source}"
+            ) from exc
+        if (
+            not source.is_absolute()
+            or source == Path("/")
+            or stat.S_ISLNK(metadata.st_mode)
+            or resolved_source != source
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise RosCompatibilityError(
+                f"trusted native project source root must be a canonical real directory: {source}"
+            )
+        if _is_within(source, opt_ros):
+            raise RosCompatibilityError(
+                f"trusted native project source root must not originate in /opt/ros: {source}"
+            )
+        trusted_native_sources.append(resolved_source)
+    for trusted_path in policy.trusted_native_extension_paths:
+        native = Path(trusted_path)
+        if not native.is_absolute() or native == Path("/"):
+            raise RosCompatibilityError(
+                "trusted native extension paths must be bounded and absolute"
+            )
+        try:
+            metadata = native.lstat()
+            resolved_native = native.resolve(strict=True)
+        except OSError as exc:
+            raise RosCompatibilityError(
+                f"trusted native extension is missing: {native}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or resolved_native != native:
+            raise RosCompatibilityError(
+                f"trusted native extension path must be canonical and contain no symlink: {native}"
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RosCompatibilityError(
+                f"trusted native extension must be a regular file: {native}"
+            )
+        if not _is_native_extension(native):
+            raise RosCompatibilityError(
+                f"trusted native extension has an invalid suffix: {native}"
+            )
+        if _is_within(native, opt_ros):
+            raise RosCompatibilityError(
+                f"trusted native extension must not originate in /opt/ros: {native}"
+            )
+        if not any(_is_within(native, source) for source in trusted_native_sources):
+            raise RosCompatibilityError(
+                f"trusted native extension is outside every project source root: {native}"
+            )
 
 
 def validate_loaded_module_origins(
@@ -219,6 +310,13 @@ def validate_loaded_module_origins(
     stdlib_paths = tuple(_resolved_path(path) for path in policy.target_stdlib_paths)
     stdlib_lib_dynload = stdlib_paths[0] / "lib-dynload"
     source_paths = tuple(_resolved_path(path) for path in policy.project_source_paths)
+    trusted_source_modules = tuple(
+        (module_name, _resolved_path(path))
+        for module_name, path in policy.trusted_source_module_paths
+    )
+    trusted_native_extensions = tuple(
+        _resolved_path(path) for path in policy.trusted_native_extension_paths
+    )
     allowed_roots = (
         target_environment,
         ros_overlay,
@@ -235,6 +333,11 @@ def validate_loaded_module_origins(
             continue
 
         top_level = module_name.partition(".")[0]
+        in_trusted_source_module = any(
+            (module_name == trusted_name or module_name.startswith(trusted_name + "."))
+            and _is_within(origin, trusted_root)
+            for trusted_name, trusted_root in trusted_source_modules
+        )
         if _is_native_extension(origin) and _is_within(origin, ros_overlay):
             raise RosCompatibilityError(
                 f"native extension {module_name} must not originate in the ROS overlay: {origin}"
@@ -247,7 +350,11 @@ def validate_loaded_module_origins(
                 raise RosCompatibilityError(
                     f"native extension {module_name} is outside exact stdlib lib-dynload: {origin}"
                 )
-            if not in_target_environment and not in_lib_dynload:
+            if (
+                not in_target_environment
+                and not in_lib_dynload
+                and origin not in trusted_native_extensions
+            ):
                 raise RosCompatibilityError(
                     f"native extension {module_name} is outside the target interpreter: {origin}"
                 )
@@ -266,7 +373,11 @@ def validate_loaded_module_origins(
             raise RosCompatibilityError(
                 f"project module {module_name} is outside active Catkin/source: {origin}"
             )
-        if not any(_is_within(origin, root) for root in allowed_roots):
+        if (
+            not any(_is_within(origin, root) for root in allowed_roots)
+            and not in_trusted_source_module
+            and origin not in trusted_native_extensions
+        ):
             raise RosCompatibilityError(
                 f"module {module_name} is outside every allowed runtime root: {origin}"
             )

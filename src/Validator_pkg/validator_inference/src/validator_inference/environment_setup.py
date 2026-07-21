@@ -146,6 +146,25 @@ _SPARSE_EXTENSION_MODULES = (
     "deformable_aggregation_ext",
     "deformable_aggregation_with_depth_ext",
 )
+_TARGET_INFERENCE_IMPORTS = (
+    "validator_inference.engine",
+    "validator_inference.models.select",
+)
+_MODULE_ORIGIN_REPORT_CODE = (
+    "module_origins = {}\n"
+    "for loaded_name, loaded_module in sorted(sys.modules.items()):\n"
+    "    if loaded_module is None:\n"
+    "        continue\n"
+    "    loaded_origin = getattr(loaded_module, '__file__', None)\n"
+    "    if loaded_origin is None:\n"
+    "        loaded_origin = getattr(\n"
+    "            getattr(loaded_module, '__spec__', None), 'origin', None\n"
+    "        )\n"
+    "    if isinstance(loaded_origin, pathlib.Path):\n"
+    "        loaded_origin = str(loaded_origin)\n"
+    "    if isinstance(loaded_origin, str):\n"
+    "        module_origins[loaded_name] = loaded_origin\n"
+)
 
 
 def _read_host_os_release() -> Mapping[str, str]:
@@ -5408,9 +5427,13 @@ def _ros_runtime_path_policy(
     preflight: EnvironmentPreflight,
     candidate_python: Path,
     catkin_python: Path,
+    *,
+    action: str = "ros_smoke",
+    trusted_source_module_paths: Sequence[tuple[str, Path]] = (),
+    trusted_native_source_paths: Sequence[Path] = (),
+    trusted_native_extension_paths: Sequence[Path] = (),
 ) -> Any:
     """resolved candidate interpreter의 base stdlib 하나로 ROS path policy를 만든다."""
-    action = "ros_smoke"
     candidate = candidate_python.parent.parent
     if candidate_python != candidate / "bin" / "python":
         _raise(action, "target Python must be candidate/bin/python")
@@ -5457,6 +5480,9 @@ def _ros_runtime_path_policy(
         catkin_python_path=catkin_python,
         target_stdlib_paths=(resolved_stdlib,),
         project_source_paths=(source_root,),
+        trusted_source_module_paths=tuple(trusted_source_module_paths),
+        trusted_native_source_paths=tuple(trusted_native_source_paths),
+        trusted_native_extension_paths=tuple(trusted_native_extension_paths),
     )
 
 
@@ -5470,26 +5496,97 @@ def _run_ros_compatibility_smoke(policy: Any) -> None:
     )
 
 
+def _validate_runtime_module_origins(
+    preflight: EnvironmentPreflight,
+    candidate_python: Path,
+    catkin_python: Path,
+    module_origins: Mapping[str, object],
+    action: str,
+    *,
+    trusted_source_module_paths: Sequence[tuple[str, Path]] = (),
+    trusted_native_source_paths: Sequence[Path] = (),
+    trusted_native_extension_paths: Sequence[Path] = (),
+) -> None:
+    """loaded module mapping을 공통 runtime path policy로 fail-closed 검증한다."""
+    try:
+        from validator_inference.ros_compatibility import (
+            RosCompatibilityError,
+            validate_loaded_module_origins,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise EnvironmentSetupError(
+            action, "runtime module origin audit is unavailable"
+        ) from exc
+    try:
+        policy = _ros_runtime_path_policy(
+            preflight,
+            candidate_python,
+            catkin_python,
+            action=action,
+            trusted_source_module_paths=trusted_source_module_paths,
+            trusted_native_source_paths=trusted_native_source_paths,
+            trusted_native_extension_paths=trusted_native_extension_paths,
+        )
+        validate_loaded_module_origins(module_origins, policy)
+    except RosCompatibilityError as exc:
+        raise EnvironmentSetupError(
+            action, f"runtime module origin audit failed: {exc}"
+        ) from exc
+
+
 def _run_target_ros_import_smoke(
+    preflight: EnvironmentPreflight,
     candidate_python: Path,
     candidate: Path,
+    catkin_python: Path,
     child_environment: Mapping[str, str],
     runner: Callable[..., Any],
 ) -> None:
-    """roslaunch 직전 target interpreter의 overlay와 generated message imports를 검사한다."""
+    """roslaunch 직전 ROS imports와 그 process의 모든 module origin을 검사한다."""
     code = (
-        "import rospy; import std_msgs.msg; import sensor_msgs.msg; "
-        "import geometry_msgs.msg; import nav_msgs.msg; import tf2_msgs.msg; "
-        "import actionlib_msgs.msg; from validator_msgs.msg import "
-        "CameraCalibration, DrivingFeature, InferenceMetric"
+        "import json, pathlib, sys\n"
+        "import rospy\n"
+        "import std_msgs.msg\n"
+        "import sensor_msgs.msg\n"
+        "import geometry_msgs.msg\n"
+        "import nav_msgs.msg\n"
+        "import tf2_msgs.msg\n"
+        "import actionlib_msgs.msg\n"
+        "from validator_msgs.msg import CameraCalibration, DrivingFeature, InferenceMetric\n"
+        + "".join(f"import {module_name}\n" for module_name in _TARGET_INFERENCE_IMPORTS)
+        + _MODULE_ORIGIN_REPORT_CODE
+        + "print(json.dumps(module_origins, sort_keys=True))\n"
     )
-    _run_setup_command(
+    result = _run_setup_command(
         runner,
         (str(candidate_python), "-B", "-c", code),
         "target_ros_import",
         cwd=candidate,
         env=child_environment,
+        capture_output=True,
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
+    )
+    try:
+        module_origins = json.loads(
+            _setup_stdout(result, "target_ros_import", "target ROS module origins")
+        )
+    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
+        raise EnvironmentSetupError(
+            "target_ros_import", "target ROS imports returned invalid origin JSON"
+        ) from exc
+    if not isinstance(module_origins, Mapping):
+        _raise("target_ros_import", "target ROS imports returned invalid origins")
+    if any(module_name not in module_origins for module_name in _TARGET_INFERENCE_IMPORTS):
+        _raise(
+            "target_ros_import",
+            "target ROS imports omitted required inference module origins",
+        )
+    _validate_runtime_module_origins(
+        preflight,
+        candidate_python,
+        catkin_python,
+        module_origins,
+        "target_ros_import",
     )
 
 
@@ -5521,6 +5618,7 @@ def _verify_import_origin_file(
 def _run_candidate_import_cuda_checks(
     preflight: EnvironmentPreflight,
     candidate: Path,
+    catkin_python: Path,
     child_environment: Mapping[str, str],
     runner: Callable[..., Any],
 ) -> Optional[str]:
@@ -5537,12 +5635,17 @@ def _run_candidate_import_cuda_checks(
             source_import_root, "required_imports", "InterFuser vendored package root"
         )
     imports_code = (
-        "import importlib, json, pathlib, sys; names = "
-        f"{preflight.definition.required_imports!r}; "
-        "source_root = pathlib.Path(sys.argv[1]) if sys.argv[1] else None; "
-        "sys.path.insert(0, str(source_root)) if source_root is not None else None; "
-        "modules = [importlib.import_module(name) for name in names]; "
-        "print(json.dumps([getattr(module, '__file__', None) for module in modules]))"
+        "import importlib, json, pathlib, sys\n"
+        f"names = {preflight.definition.required_imports!r}\n"
+        "source_root = pathlib.Path(sys.argv[1]) if sys.argv[1] else None\n"
+        "if source_root is not None:\n"
+        "    sys.path.insert(0, str(source_root))\n"
+        "modules = [importlib.import_module(name) for name in names]\n"
+        + _MODULE_ORIGIN_REPORT_CODE
+        + "print(json.dumps({\n"
+        "    'required_import_origins': [getattr(module, '__file__', None) for module in modules],\n"
+        "    'module_origins': module_origins,\n"
+        "}, sort_keys=True))\n"
     )
     import_result = _run_setup_command(
         runner,
@@ -5560,17 +5663,25 @@ def _run_candidate_import_cuda_checks(
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
     )
     try:
-        origins = json.loads(
+        import_report = json.loads(
             _setup_stdout(import_result, "required_imports", "required import origins")
         )
     except (json.JSONDecodeError, TypeError, RecursionError) as exc:
         raise EnvironmentSetupError(
             "required_imports", "required imports returned invalid origin JSON"
         ) from exc
+    if not isinstance(import_report, Mapping) or set(import_report) != {
+        "required_import_origins",
+        "module_origins",
+    }:
+        _raise("required_imports", "required imports returned an invalid report")
+    origins = import_report["required_import_origins"]
+    module_origins = import_report["module_origins"]
     if (
         not isinstance(origins, list)
         or len(origins) != len(preflight.definition.required_imports)
         or any(not isinstance(origin, str) or not origin for origin in origins)
+        or not isinstance(module_origins, Mapping)
     ):
         _raise("required_imports", "required imports returned invalid origins")
     origin_paths = tuple(
@@ -5579,6 +5690,14 @@ def _run_candidate_import_cuda_checks(
         )
         for name, origin in zip(preflight.definition.required_imports, origins)
     )
+    if any(
+        module_origins.get(name) != origin
+        for name, origin in zip(preflight.definition.required_imports, origins)
+    ):
+        _raise("required_imports", "required imports are missing from module origins")
+    trusted_source_modules: list[tuple[str, Path]] = []
+    trusted_native_sources: tuple[Path, ...] = ()
+    trusted_native_paths: tuple[Path, ...] = ()
     if preflight.definition.model_id == "interfuser":
         if "timm" not in preflight.definition.required_imports:
             _raise("required_imports", "InterFuser requires vendored timm import")
@@ -5592,6 +5711,7 @@ def _run_candidate_import_cuda_checks(
             source_import_root / "timm",
             "InterFuser timm",
         )
+        trusted_source_modules.append(("timm", source_import_root / "timm"))
     if preflight.definition.model_id == "sparsedrive_v2":
         sparse_origins = tuple(
             origin_paths[preflight.definition.required_imports.index(module)]
@@ -5621,6 +5741,18 @@ def _run_candidate_import_cuda_checks(
             )
         if selected != _existing_sparse_generated_paths(preflight, checkout):
             _raise("required_imports", "SparseDrive extension origin is not the attested pair")
+        trusted_native_sources = (sparse_ops,)
+        trusted_native_paths = sparse_origins
+    _validate_runtime_module_origins(
+        preflight,
+        python,
+        catkin_python,
+        module_origins,
+        "required_imports",
+        trusted_source_module_paths=trusted_source_modules,
+        trusted_native_source_paths=trusted_native_sources,
+        trusted_native_extension_paths=trusted_native_paths,
+    )
     cuda_code = (
         "import torch; print('1' if torch.cuda.is_available() else '0')"
     )
@@ -5690,12 +5822,13 @@ def _run_selected_model_load(
 def _run_candidate_runtime_checks(
     preflight: EnvironmentPreflight,
     candidate: Path,
+    catkin_python: Path,
     child_environment: Mapping[str, str],
     runner: Callable[..., Any],
 ) -> Optional[str]:
     """required imports/CUDA를 확인한 뒤 strict selected-model load를 실행한다."""
     runtime_warning = _run_candidate_import_cuda_checks(
-        preflight, candidate, child_environment, runner
+        preflight, candidate, catkin_python, child_environment, runner
     )
     _run_selected_model_load(preflight, candidate, child_environment, runner)
     return runtime_warning
@@ -5805,7 +5938,7 @@ def _deep_verify_environment(
         preflight, python, child_environment, dependencies, runner
     )
     runtime_warning = _run_candidate_runtime_checks(
-        preflight, environment_dir, child_environment, runner
+        preflight, environment_dir, catkin_python, child_environment, runner
     )
     freeze_sha256 = _installed_packages_sha256(
         preflight, environment_dir, child_environment, runner
@@ -6079,7 +6212,7 @@ def setup_environment(
                 runner,
             )
             runtime_warning = _run_candidate_runtime_checks(
-                preflight, candidate, child_environment, runner
+                preflight, candidate, catkin_python, child_environment, runner
             )
             installed_packages_sha256 = _installed_packages_sha256(
                 preflight, candidate, child_environment, runner
@@ -6333,10 +6466,19 @@ def preflight_run_environment(
             preflight, active.environment_dir, catkin_python
         )
         _run_target_ros_import_smoke(
-            python, active.environment_dir, child_environment, runner
+            preflight,
+            python,
+            active.environment_dir,
+            catkin_python,
+            child_environment,
+            runner,
         )
         runtime_warning = _run_candidate_import_cuda_checks(
-            preflight, active.environment_dir, child_environment, runner
+            preflight,
+            active.environment_dir,
+            catkin_python,
+            child_environment,
+            runner,
         )
         return EnvironmentOperationResult(
             environment_dir=active.environment_dir,

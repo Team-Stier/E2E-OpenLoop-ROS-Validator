@@ -138,6 +138,81 @@ def test_validate_loaded_module_origins_accepts_only_declared_runtime_roots():
     )
 
 
+def test_validate_loaded_module_origins_accepts_only_exact_attested_source_native():
+    """source tree native는 policy가 명시한 exact artifact만 예외로 허용한다."""
+    policy = _path_policy()
+    native = (
+        policy.project_source_paths[0]
+        / "ops"
+        / "declared.cpython-38-x86_64-linux-gnu.so"
+    )
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"native")
+    attested = replace(
+        policy,
+        trusted_native_source_paths=(native.parent,),
+        trusted_native_extension_paths=(native,),
+    )
+
+    validate_loaded_module_origins({"declared": native}, attested)
+
+    sibling = native.with_name("undeclared.cpython-38-x86_64-linux-gnu.so")
+    sibling.write_bytes(b"native")
+    with pytest.raises(RosCompatibilityError, match="outside the target interpreter"):
+        validate_loaded_module_origins({"undeclared": sibling}, attested)
+
+
+@pytest.mark.parametrize("invalid_kind", ("directory", "outside", "symlink"))
+def test_runtime_path_policy_rejects_unsafe_attested_source_native(invalid_kind):
+    """attested native 예외도 canonical source regular file만 허용한다."""
+    policy = _path_policy()
+    source = policy.project_source_paths[0]
+    outside = source.parent / f"outside-{invalid_kind}.cpython-38-x86_64-linux-gnu.so"
+    outside.write_bytes(b"outside")
+    candidate = (
+        source
+        / "ops"
+        / f"candidate-{invalid_kind}.cpython-38-x86_64-linux-gnu.so"
+    )
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    if invalid_kind == "directory":
+        candidate.mkdir()
+        reason = "regular file"
+    elif invalid_kind == "outside":
+        candidate = outside
+        reason = "project source"
+    else:
+        real = candidate.with_name("real.cpython-38-x86_64-linux-gnu.so")
+        real.write_bytes(b"native")
+        candidate.symlink_to(real.name)
+        reason = "symlink"
+    unsafe = replace(
+        policy,
+        trusted_native_source_paths=(source,),
+        trusted_native_extension_paths=(candidate,),
+    )
+
+    with pytest.raises(RosCompatibilityError, match=reason):
+        validate_loaded_module_origins({"candidate": candidate}, unsafe)
+
+
+def test_trusted_source_module_path_is_scoped_to_exact_module_namespace():
+    """vendored pure source root는 선언한 module namespace에만 적용한다."""
+    policy = _path_policy()
+    project_root = policy.target_environment.parents[3]
+    timm = project_root / "models" / "sources" / "interfuser" / "interfuser" / "timm"
+    timm.mkdir(parents=True)
+    module = timm / "models" / "interfuser.py"
+    module.parent.mkdir()
+    module.write_text("", encoding="utf-8")
+    scoped = replace(policy, trusted_source_module_paths=(("timm", timm),))
+
+    validate_loaded_module_origins({"timm.models.interfuser": module}, scoped)
+
+    with pytest.raises(RosCompatibilityError, match="allowed runtime root"):
+        validate_loaded_module_origins({"foreign.models.interfuser": module}, scoped)
+
+
 @pytest.mark.parametrize(
     ("module_name", "origin", "reason"),
     (
