@@ -169,6 +169,7 @@ def _exec_model_environment(
     try:
         from validator_inference.environment_setup import (
             EnvironmentSetupError,
+            model_runtime_lease,
             verify_ros_overlay,
         )
         from validator_inference.model_environment import (
@@ -194,31 +195,32 @@ def _exec_model_environment(
         paths = environment_paths(project_root, model_id)
         if paths.model_root != model_env_root / model_id:
             raise ModelEnvironmentExecError("model environment path layout is invalid")
-        check = inspect_active_environment(paths, definition, manifest_digest)
-        if not check.valid:
-            raise ModelEnvironmentExecError(check.reason)
-        if check.environment_dir is None or check.state is None:
-            raise ModelEnvironmentExecError("active environment snapshot is incomplete")
+        with model_runtime_lease(paths, "model_env_exec", inheritable=True):
+            check = inspect_active_environment(paths, definition, manifest_digest)
+            if not check.valid:
+                raise ModelEnvironmentExecError(check.reason)
+            if check.environment_dir is None or check.state is None:
+                raise ModelEnvironmentExecError("active environment snapshot is incomplete")
 
-        environment_dir = check.environment_dir
-        overlay = environment_dir / ".ros-overlay"
-        overlay_manifest = environment_dir / ROS_OVERLAY_MANIFEST_FILENAME
-        verified_digest = verify_ros_overlay(overlay, overlay_manifest)
-        if verified_digest != check.state.ros_overlay_sha256:
-            raise ModelEnvironmentExecError("ROS overlay manifest digest changed")
-        child_environment = build_model_process_environment(
-            environ,
-            environment_dir,
-            overlay,
-            catkin_python_path,
-            project_root,
-        )
-        venv_python = environment_dir / check.state.python_executable
-        os.execve(
-            str(venv_python),
-            [str(venv_python), str(node_executable), *argv[2:]],
-            child_environment,
-        )
+            environment_dir = check.environment_dir
+            overlay = environment_dir / ".ros-overlay"
+            overlay_manifest = environment_dir / ROS_OVERLAY_MANIFEST_FILENAME
+            verified_digest = verify_ros_overlay(overlay, overlay_manifest)
+            if verified_digest != check.state.ros_overlay_sha256:
+                raise ModelEnvironmentExecError("ROS overlay manifest digest changed")
+            child_environment = build_model_process_environment(
+                environ,
+                environment_dir,
+                overlay,
+                catkin_python_path,
+                project_root,
+            )
+            venv_python = environment_dir / check.state.python_executable
+            os.execve(
+                str(venv_python),
+                [str(venv_python), str(node_executable), *argv[2:]],
+                child_environment,
+            )
     except ModelEnvironmentExecError:
         raise
     except (

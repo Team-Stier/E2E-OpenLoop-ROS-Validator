@@ -8,17 +8,25 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import subprocess
+import threading
+import time
 from typing import Mapping, Optional, Sequence, Union
 
 import pytest
 
-from validator_inference.environment_setup import PURE_ROS_PACKAGES, build_ros_overlay
+from validator_inference.environment_setup import (
+    PURE_ROS_PACKAGES,
+    activate_candidate,
+    build_ros_overlay,
+    prune_inactive_builds,
+)
 from validator_inference.model_environment import (
     ENVIRONMENT_STATE_FILENAME,
     EXPECTED_PYTHON_PLATFORM,
     EXPECTED_UV_VERSION,
     ROS_OVERLAY_MANIFEST_FILENAME,
     EnvironmentState,
+    environment_paths,
     load_environment_manifest,
     select_model_environment,
     sha256_file,
@@ -155,6 +163,14 @@ def _write_capture_python(path: Path) -> None:
         "}\n"
         "with open(os.environ['CAPTURE_PATH'], 'w', encoding='utf-8') as target:\n"
         "    json.dump(payload, target, sort_keys=True)\n"
+        "if os.environ.get('CHILD_STARTED_PATH'):\n"
+        "    from pathlib import Path\n"
+        "    import time\n"
+        "    started = Path(os.environ['CHILD_STARTED_PATH'])\n"
+        "    release = Path(os.environ['CHILD_RELEASE_PATH'])\n"
+        "    started.write_text('started\\n', encoding='utf-8')\n"
+        "    while not release.exists():\n"
+        "        time.sleep(0.01)\n"
         "raise SystemExit(int(os.environ.get('CHILD_EXIT', '0')))\n",
         encoding="utf-8",
     )
@@ -226,6 +242,9 @@ def _wrapper_fixture(tmp_path: Path, layout: str = "devel") -> _WrapperFixture:
     write_environment_state(environment_dir / ENVIRONMENT_STATE_FILENAME, state)
     current = model_env_root / MODEL_ID / "current"
     current.symlink_to(Path("builds") / environment_dir.name)
+    lifecycle_lock = current.parent / ".lifecycle.lock"
+    lifecycle_lock.write_text("", encoding="utf-8")
+    lifecycle_lock.chmod(0o600)
     return _WrapperFixture(
         wrapper=wrapper,
         package_root=package_root,
@@ -398,10 +417,14 @@ def test_wrapper_uses_inspected_build_snapshot_when_current_switches(tmp_path: P
     replacement = current.parent / "builds" / "build-002"
     replacement.mkdir()
     fixture.copied_environment_setup.write_text(
+        "from contextlib import contextmanager\n"
         "import os\n"
         "from pathlib import Path\n"
         "class EnvironmentSetupError(RuntimeError):\n"
         "    pass\n"
+        "@contextmanager\n"
+        "def model_runtime_lease(paths, action, inheritable=False):\n"
+        "    yield\n"
         "def verify_ros_overlay(destination, manifest_path):\n"
         "    expected = Path(os.environ['EXPECTED_OVERLAY'])\n"
         "    if Path(destination) != expected:\n"
@@ -426,3 +449,103 @@ def test_wrapper_uses_inspected_build_snapshot_when_current_switches(tmp_path: P
     payload = json.loads(fixture.capture.read_text(encoding="utf-8"))
     assert payload["environment"]["VIRTUAL_ENV"] == str(fixture.environment_dir)
     assert current.resolve(strict=True) == replacement
+
+
+def test_wrapper_revalidates_after_previous_build_is_replaced_and_pruned(
+    tmp_path: Path,
+):
+    """CLI preflight 뒤 교체가 끝났다면 wrapper는 새 current를 다시 검사한다."""
+    fixture = _wrapper_fixture(tmp_path)
+    paths = environment_paths(fixture.project_root, MODEL_ID)
+    replacement = shutil.copytree(
+        fixture.environment_dir, paths.builds / "build-002"
+    )
+
+    activate_candidate(paths, replacement)
+    assert prune_inactive_builds(paths) == (fixture.environment_dir,)
+
+    result = fixture.run()
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(fixture.capture.read_text(encoding="utf-8"))
+    assert payload["argv"][0] == str(replacement / "bin" / "python")
+    assert payload["environment"]["VIRTUAL_ENV"] == str(replacement)
+
+
+def test_wrapper_missing_lifecycle_lock_is_stale_and_not_created(tmp_path: Path):
+    """wrapper도 missing lock을 고치지 않고 setup이 필요한 stale 상태로 거부한다."""
+    fixture = _wrapper_fixture(tmp_path)
+    lock_path = fixture.model_env_root / MODEL_ID / ".lifecycle.lock"
+    lock_path.unlink()
+
+    result = fixture.run()
+
+    _assert_one_line_error(result)
+    assert "stale" in result.stderr
+    assert not lock_path.exists()
+    assert not lock_path.is_symlink()
+
+
+def test_wrapper_holds_shared_lease_through_exec_against_switch_and_prune(
+    tmp_path: Path,
+):
+    """target process 수명 동안 active 교체와 old build prune가 대기한다."""
+    fixture = _wrapper_fixture(tmp_path)
+    paths = environment_paths(fixture.project_root, MODEL_ID)
+    replacement = paths.builds / "build-002"
+    replacement.mkdir()
+    started = tmp_path / "target-started"
+    release = tmp_path / "release-target"
+    lifecycle_finished = threading.Event()
+    results: list[subprocess.CompletedProcess[str]] = []
+    removed: list[tuple[Path, ...]] = []
+    errors: list[BaseException] = []
+
+    def run_wrapper() -> None:
+        try:
+            results.append(
+                fixture.run(
+                    overrides={
+                        "CHILD_STARTED_PATH": str(started),
+                        "CHILD_RELEASE_PATH": str(release),
+                    }
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def switch_and_prune() -> None:
+        try:
+            activate_candidate(paths, replacement)
+            removed.append(prune_inactive_builds(paths))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            lifecycle_finished.set()
+
+    wrapper_thread = threading.Thread(target=run_wrapper)
+    lifecycle_thread = threading.Thread(target=switch_and_prune)
+    wrapper_thread.start()
+    try:
+        for _attempt in range(500):
+            if started.exists():
+                break
+            time.sleep(0.01)
+        assert started.exists()
+        lifecycle_thread.start()
+        assert not lifecycle_finished.wait(0.2)
+        assert paths.current.resolve(strict=True) == fixture.environment_dir
+        assert fixture.environment_dir.is_dir()
+    finally:
+        release.write_text("release\n", encoding="utf-8")
+        wrapper_thread.join(5.0)
+        if lifecycle_thread.ident is not None:
+            lifecycle_thread.join(5.0)
+
+    assert not wrapper_thread.is_alive()
+    assert not lifecycle_thread.is_alive()
+    assert errors == []
+    assert results[0].returncode == 0, results[0].stderr
+    assert paths.current.resolve(strict=True) == replacement
+    assert removed == [(fixture.environment_dir,)]
+    assert not fixture.environment_dir.exists()

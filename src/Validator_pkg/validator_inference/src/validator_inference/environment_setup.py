@@ -1498,6 +1498,75 @@ def _acquire_lifecycle_file_lock(model_root: Path, action: str) -> int:
     return descriptor
 
 
+def _stale_lifecycle_lock_error(
+    action: str, lock_path: Path
+) -> EnvironmentSetupError:
+    """run이 lock을 생성/수정하지 않고 setup 재실행을 요구하게 한다."""
+    return EnvironmentSetupError(
+        action,
+        f"lifecycle lock is missing or unsafe; environment is stale: {lock_path}",
+    )
+
+
+def _acquire_runtime_lifecycle_file_lock(
+    model_root: Path, action: str, inheritable: bool
+) -> int:
+    """기존 secure lock file을 read-only로 열어 shared runtime lease를 잡는다."""
+    lock_path = model_root / _LIFECYCLE_LOCK_FILENAME
+    try:
+        _reject_existing_symlink_chain(lock_path, action, "lifecycle lock")
+    except EnvironmentSetupError as exc:
+        raise _stale_lifecycle_lock_error(action, lock_path) from exc
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        _raise(action, "lifecycle lock requires O_NOFOLLOW support")
+    flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(str(lock_path), flags)
+    except OSError as exc:
+        raise _stale_lifecycle_lock_error(action, lock_path) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise _stale_lifecycle_lock_error(action, lock_path)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                action, f"cannot acquire lifecycle lock: {lock_path}"
+            ) from exc
+        try:
+            path_metadata = lock_path.lstat()
+        except OSError as exc:
+            raise _stale_lifecycle_lock_error(action, lock_path) from exc
+        descriptor_metadata = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(path_metadata.st_mode)
+            or path_metadata.st_dev != descriptor_metadata.st_dev
+            or path_metadata.st_ino != descriptor_metadata.st_ino
+        ):
+            raise _stale_lifecycle_lock_error(action, lock_path)
+        try:
+            os.set_inheritable(descriptor, inheritable)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                action, f"cannot configure lifecycle lock: {lock_path}"
+            ) from exc
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    return descriptor
+
+
 def _release_lifecycle_file_lock(
     descriptor: int, model_root: Path, action: str
 ) -> None:
@@ -1570,6 +1639,36 @@ def model_operation_lock(paths: EnvironmentPaths) -> Iterator[None]:
     """create부터 activate까지 재사용할 수 있는 reentrant model operation lease다."""
     with _model_operation_lock(paths, "model_operation_lock", create_root=True):
         yield
+
+
+@contextmanager
+def model_runtime_lease(
+    paths: EnvironmentPaths,
+    action: str = "model_runtime_lease",
+    *,
+    inheritable: bool = False,
+) -> Iterator[None]:
+    """기존 lifecycle lock을 shared로 잡아 active build의 수명을 고정한다."""
+    _validate_environment_paths(paths, action)
+    model_root = _canonical_absolute_posix_path(
+        paths.model_root, "model root", action
+    )
+    _require_real_directory(model_root, action, "model root")
+    descriptor = _acquire_runtime_lifecycle_file_lock(
+        model_root, action, inheritable
+    )
+    body_failed = False
+    try:
+        yield
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        try:
+            _release_lifecycle_file_lock(descriptor, model_root, action)
+        except EnvironmentSetupError:
+            if not body_failed:
+                raise
 
 
 def create_candidate(paths: EnvironmentPaths, build_id: str) -> Path:
@@ -6188,9 +6287,7 @@ def preflight_run_environment(
         runner=runner,
         dependencies=selected_dependencies.preflight_dependencies,
     )
-    with _model_operation_lock(
-        preflight.paths, "runtime_preflight", create_root=False
-    ):
+    with model_runtime_lease(preflight.paths, "runtime_preflight"):
         manifest_sha256 = sha256_file(preflight.manifest.manifest_path)
         active = inspect_active_environment(
             preflight.paths, preflight.definition, manifest_sha256

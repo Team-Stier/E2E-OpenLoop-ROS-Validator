@@ -5195,6 +5195,75 @@ def test_run_preflight_missing_model_root_does_not_create_it(tmp_path: Path):
     assert not model_root.is_symlink()
 
 
+def test_run_preflight_uses_read_only_shared_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """run은 기존 lock을 shared/read-only로 열고 metadata를 바꾸지 않는다."""
+    root, dependencies, runner, _completed = _completed_setup_for_maintenance(
+        tmp_path
+    )
+    lock_path = environment_paths(root, "tfv6").model_root / ".lifecycle.lock"
+    before = lock_path.stat()
+    calls: list[int] = []
+    real_flock = environment_setup.fcntl.flock
+
+    def recording_flock(file_descriptor: int, operation: int) -> None:
+        calls.append(operation)
+        real_flock(file_descriptor, operation)
+
+    monkeypatch.setattr(environment_setup.fcntl, "flock", recording_flock)
+    time.sleep(0.01)
+
+    environment_setup.preflight_run_environment(
+        root, "tfv6", runner=runner, dependencies=dependencies
+    )
+
+    after = lock_path.stat()
+    assert calls == [environment_setup.fcntl.LOCK_SH, environment_setup.fcntl.LOCK_UN]
+    assert (after.st_dev, after.st_ino, after.st_mode, after.st_nlink) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_nlink,
+    )
+    assert after.st_ctime_ns == before.st_ctime_ns
+
+
+@pytest.mark.parametrize("lock_state", ("missing", "permissive", "symlink"))
+def test_run_preflight_rejects_stale_lifecycle_lock_without_repair(
+    tmp_path: Path, lock_state: str
+):
+    """run은 누락/비정상 lock을 만들거나 고치지 않고 stale로 실패시킨다."""
+    root, dependencies, runner, _completed = _completed_setup_for_maintenance(
+        tmp_path
+    )
+    lock_path = environment_paths(root, "tfv6").model_root / ".lifecycle.lock"
+    outside = tmp_path / "outside-lock"
+    if lock_state == "missing":
+        lock_path.unlink()
+    elif lock_state == "permissive":
+        lock_path.chmod(0o644)
+    else:
+        lock_path.unlink()
+        outside.write_text("keep\n", encoding="utf-8")
+        lock_path.symlink_to(outside)
+
+    with pytest.raises(EnvironmentSetupError, match="stale") as caught:
+        environment_setup.preflight_run_environment(
+            root, "tfv6", runner=runner, dependencies=dependencies
+        )
+
+    assert caught.value.action == "runtime_preflight"
+    if lock_state == "missing":
+        assert not lock_path.exists()
+        assert not lock_path.is_symlink()
+    elif lock_state == "permissive":
+        assert lock_path.stat().st_mode & 0o777 == 0o644
+    else:
+        assert lock_path.is_symlink()
+        assert outside.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_run_preflight_holds_model_lock_against_current_switch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
