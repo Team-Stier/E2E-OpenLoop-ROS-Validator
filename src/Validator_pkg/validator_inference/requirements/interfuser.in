@@ -1,5 +1,6 @@
-# Runtime-only dependencies validated against the pinned InterFuser source.
-# Training, notebook, simulator, and leaderboard packages are intentionally excluded.
+# Runtime-only dependencies validated against the pinned InterFuser source:
+# https://github.com/opendilab/InterFuser/tree/f0be8ea294c49a59febaa032dd6da40b475e3657
+# Training, simulator, and leaderboard dependencies are intentionally omitted.
 
 PyYAML==6.0.3
 rospkg==1.6.0

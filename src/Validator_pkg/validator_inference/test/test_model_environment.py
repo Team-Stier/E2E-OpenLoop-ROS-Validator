@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any, Callable
@@ -29,6 +31,7 @@ from validator_inference.model_environment import (
 
 PACKAGE_ROOT = Path(__file__).parents[1]
 MANIFEST_PATH = PACKAGE_ROOT / "config" / "model_environments.json"
+PACKAGE_RELATIVE_ROOT = Path("src/Validator_pkg/validator_inference")
 EXPECTED = {
     "interfuser": {
         "python": "3.8.20",
@@ -127,9 +130,16 @@ def _write_manifest_fixture(tmp_path: Path, payload: dict[str, Any]) -> Path:
     requirements = package_root / "requirements"
     config_dir.mkdir(parents=True)
     requirements.mkdir()
+    models = payload.get("models")
     for model_id in EXPECTED:
-        (requirements / f"{model_id}.in").write_text("fixture\n", encoding="utf-8")
-        (requirements / f"{model_id}.lock").write_text("fixture\n", encoding="utf-8")
+        input_path = requirements / f"{model_id}.in"
+        lock_path = requirements / f"{model_id}.lock"
+        input_path.write_text("fixture input\n", encoding="utf-8")
+        lock_path.write_text("fixture lock\n", encoding="utf-8")
+        if isinstance(models, dict) and isinstance(models.get(model_id), dict):
+            model = models[model_id]
+            model["requirements_input_sha256"] = sha256_file(input_path)
+            model["requirements_lock_sha256"] = sha256_file(lock_path)
     path = config_dir / "model_environments.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
@@ -146,21 +156,64 @@ def _mutated_manifest(
 
 
 def _requirement_blocks(lock_text: str) -> list[str]:
-    """uv lock에서 각 installable requirement와 hash continuation을 묶는다."""
+    """uv lock의 logical requirement를 묶고 exact SHA-256 option을 검증한다."""
+    hash_option = re.compile(r"--hash=sha256:[0-9a-f]{64}\Z")
     blocks: list[str] = []
     current: list[str] = []
+    continuing = False
+    saw_index_url = False
+
+    def finish_block() -> None:
+        """현재 physical line들을 한 requirement argv로 검증해 추가한다."""
+        logical = " ".join(
+            line.strip()[:-1].rstrip()
+            if line.strip().endswith("\\")
+            else line.strip()
+            for line in current
+        )
+        tokens = shlex.split(logical, comments=True)
+        hash_tokens = [token for token in tokens if hash_option.fullmatch(token)]
+        unexpected_options = [
+            token
+            for token in tokens
+            if token.startswith("--")
+            and not hash_option.fullmatch(token)
+            and "--hash=sha256:" not in token
+        ]
+        assert not unexpected_options, (
+            "unexpected requirement option: " + ", ".join(unexpected_options)
+        )
+        assert hash_tokens, "installable entry lacks a valid SHA-256 hash option"
+        blocks.append("\n".join(current))
+
     for line in lock_text.splitlines():
-        if not line or line.startswith("#") or line.startswith("--"):
+        stripped = line.strip()
+        if continuing:
+            assert line[:1].isspace(), "unexpected unindented continuation content"
+            current.append(line)
+            continuing = stripped.endswith("\\")
+            if not continuing:
+                finish_block()
+                current = []
+            continue
+        if not line or line.startswith("#"):
             continue
         if line[0].isspace():
-            if current:
-                current.append(line)
+            assert stripped.startswith("#"), "unexpected indented lock content"
             continue
-        if current:
-            blocks.append("\n".join(current))
+        if line.startswith("--"):
+            assert not saw_index_url, "unexpected duplicate lock directive"
+            assert line == "--index-url https://pypi.org/simple", (
+                "unexpected lock directive: " + line
+            )
+            saw_index_url = True
+            continue
         current = [line]
-    if current:
-        blocks.append("\n".join(current))
+        continuing = stripped.endswith("\\")
+        if not continuing:
+            finish_block()
+            current = []
+    assert not continuing, "unexpected end of continued requirement"
     return blocks
 
 
@@ -196,6 +249,12 @@ def test_manifest_defines_exact_supported_models(manifest: EnvironmentManifest):
         assert COMMON_INPUTS <= set(requirement_text.splitlines())
         assert definition.requirements_input.is_file()
         assert definition.requirements_lock.is_file()
+        assert definition.requirements_input_sha256 == sha256_file(
+            definition.requirements_input
+        )
+        assert definition.requirements_lock_sha256 == sha256_file(
+            definition.requirements_lock
+        )
 
     tfv6_text = manifest.models["tfv6"].requirements_input.read_text(encoding="utf-8")
     assert "torchaudio==2.5.0+cu124" in tfv6_text.splitlines()
@@ -327,6 +386,57 @@ def test_manifest_rejects_malformed_source_sha(
         ),
     )
     with pytest.raises(EnvironmentConfigError, match="source_commit"):
+        load_environment_manifest(path)
+
+
+@pytest.mark.parametrize(
+    "field,bad_sha",
+    (
+        ("requirements_input_sha256", "abc"),
+        ("requirements_input_sha256", "g" * 64),
+        ("requirements_input_sha256", "A" * 64),
+        ("requirements_lock_sha256", "0" * 63),
+        ("requirements_lock_sha256", 123),
+    ),
+)
+def test_manifest_rejects_malformed_requirement_digests(
+    tmp_path: Path,
+    manifest_payload: dict[str, Any],
+    field: str,
+    bad_sha: Any,
+):
+    """requirement digest가 정확한 lowercase SHA-256 형식인지 검사한다."""
+    path = _write_manifest_fixture(tmp_path, manifest_payload)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["models"]["interfuser"][field] = bad_sha
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        EnvironmentConfigError, match="must be a lowercase 64-digit SHA-256"
+    ):
+        load_environment_manifest(path)
+
+
+@pytest.mark.parametrize(
+    "field,filename",
+    (
+        ("requirements_input_sha256", "interfuser.in"),
+        ("requirements_lock_sha256", "interfuser.lock"),
+    ),
+)
+def test_manifest_rejects_stale_requirement_digests(
+    tmp_path: Path,
+    manifest_payload: dict[str, Any],
+    field: str,
+    filename: str,
+):
+    """manifest digest와 실제 requirement bytes가 다르면 즉시 거부하는지 검사한다."""
+    path = _write_manifest_fixture(tmp_path, manifest_payload)
+    (path.parent.parent / "requirements" / filename).write_text(
+        "changed after hashing\n", encoding="utf-8"
+    )
+
+    with pytest.raises(EnvironmentConfigError, match=f"{field} does not match"):
         load_environment_manifest(path)
 
 
@@ -490,6 +600,29 @@ def test_manifest_rejects_malformed_or_reordered_indexes(
         load_environment_manifest(path)
 
 
+@pytest.mark.parametrize("bad_character", ("\n", "\t", "\x00", "\x1f", "\x7f"))
+def test_manifest_rejects_ascii_whitespace_and_controls_in_index_urls(
+    tmp_path: Path,
+    manifest_payload: dict[str, Any],
+    bad_character: str,
+):
+    """URL parser가 제거할 수 있는 ASCII 공백과 제어 문자도 먼저 거부한다."""
+    path = _mutated_manifest(
+        tmp_path,
+        manifest_payload,
+        lambda payload: payload["models"]["interfuser"].update(
+            indexes=[
+                "https://download.pytorch.org/whl/" + bad_character + "cu121",
+                "https://pypi.org/simple",
+            ]
+        ),
+    )
+    with pytest.raises(
+        EnvironmentConfigError, match="ASCII whitespace or control character"
+    ):
+        load_environment_manifest(path)
+
+
 @pytest.mark.parametrize("field", ("requirements_input", "requirements_lock"))
 def test_manifest_rejects_missing_requirement_artifacts(
     tmp_path: Path,
@@ -598,6 +731,95 @@ def test_requirement_inputs_pin_model_specific_runtime_contracts(
     assert "protobuf==3.20.*" in inputs["sparsedrive_v2"]
 
 
+def test_interfuser_input_documents_pinned_upstream_and_runtime_scope(
+    manifest: EnvironmentManifest,
+):
+    """InterFuser input이 검증한 source와 의도적인 runtime 범위를 기록하는지 검사한다."""
+    header = manifest.models["interfuser"].requirements_input.read_text(
+        encoding="utf-8"
+    ).split("\n\n", 1)[0]
+    assert (
+        "https://github.com/opendilab/InterFuser/tree/"
+        "f0be8ea294c49a59febaa032dd6da40b475e3657"
+    ) in header
+    assert "training" in header.lower()
+    assert "simulator" in header.lower()
+    assert "leaderboard" in header.lower()
+    assert "intentionally" in header.lower()
+
+
+def test_lock_compile_commands_match_manifest_contract(
+    manifest: EnvironmentManifest,
+):
+    """각 uv compile header를 argv로 해석해 manifest resolver 계약과 대조한다."""
+    for model_id, definition in manifest.models.items():
+        lines = definition.requirements_lock.read_text(encoding="utf-8").splitlines()
+        commands = [
+            shlex.split(line[len("#    ") :])
+            for line in lines
+            if line.startswith("#    uv pip compile ")
+        ]
+        assert len(commands) == 1
+        command = commands[0]
+        input_path = str(PACKAGE_RELATIVE_ROOT / f"requirements/{model_id}.in")
+        output_path = str(PACKAGE_RELATIVE_ROOT / f"requirements/{model_id}.lock")
+        expected_arguments = [
+            input_path,
+            "--output-file",
+            output_path,
+            "--python-version",
+            definition.python_version,
+            "--python-platform",
+            manifest.python_platform,
+            "--default-index",
+            manifest.default_index,
+            "--index-strategy",
+            manifest.index_strategy,
+            "--torch-backend",
+            definition.torch_backend,
+            "--exclude-newer",
+            manifest.exclude_newer,
+            "--generate-hashes",
+            "--emit-index-url",
+            "--emit-index-annotation",
+        ]
+        assert command[:3] == ["uv", "pip", "compile"]
+        assert sorted(command[3:]) == sorted(expected_arguments)
+        assert command[command.index("--output-file") + 1] == output_path
+
+
+@pytest.mark.parametrize(
+    "hash_content",
+    (
+        "--requirement-option=--hash=sha256:" + "a" * 64,
+        "--hash=sha256:" + "a" * 63,
+        "--hash=sha256:" + "g" * 64,
+        "# --hash=sha256:" + "a" * 64,
+    ),
+    ids=("fake", "short", "nonhex", "comment-only"),
+)
+def test_requirement_block_parser_rejects_invalid_hash_options(hash_content: str):
+    """hash처럼 보이는 substring이나 comment를 installable hash로 세지 않는다."""
+    lock_text = "example==1.0.0 \\\n    " + hash_content + "\n"
+    with pytest.raises(AssertionError, match="valid SHA-256 hash option"):
+        _requirement_blocks(lock_text)
+
+
+@pytest.mark.parametrize(
+    "lock_text",
+    (
+        "    --hash=sha256:" + "a" * 64 + "\n",
+        "--find-links https://example.com/packages\n",
+        "example==1.0.0 \\\n    --no-deps\n",
+    ),
+    ids=("orphan-indentation", "unexpected-directive", "unexpected-continuation"),
+)
+def test_requirement_block_parser_rejects_unexpected_content(lock_text: str):
+    """installable block 밖의 들여쓰기와 미지원 directive를 거부하는지 검사한다."""
+    with pytest.raises(AssertionError, match="unexpected"):
+        _requirement_blocks(lock_text)
+
+
 def test_generated_locks_are_pinned_hashed_and_index_annotated(
     manifest: EnvironmentManifest,
 ):
@@ -616,7 +838,6 @@ def test_generated_locks_are_pinned_hashed_and_index_annotated(
         for block in blocks:
             first_line = block.splitlines()[0]
             assert "==" in first_line or " @ https://" in first_line, first_line
-            assert "--hash=sha256:" in block, first_line
             assert "git+" not in block
             assert " @ file:" not in block
             assert "-e " not in block

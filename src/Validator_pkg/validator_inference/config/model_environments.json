@@ -9,7 +9,9 @@
     "interfuser": {
       "python_version": "3.8.20",
       "requirements_input": "requirements/interfuser.in",
+      "requirements_input_sha256": "423c52bdabfc1a38c1ffca31a3eac3e85054ce8f980d0eb37df95c93d7b21a30",
       "requirements_lock": "requirements/interfuser.lock",
+      "requirements_lock_sha256": "9cae6d2193f431d181674c37f2c91d40d2e14c688c8f0b1f77195f0d04e19f0b",
       "indexes": [
         "https://download.pytorch.org/whl/cu121",
         "https://pypi.org/simple"
@@ -31,7 +33,9 @@
     "tfv6": {
       "python_version": "3.10.20",
       "requirements_input": "requirements/tfv6.in",
+      "requirements_input_sha256": "bcfb9fe74ade0560cd1dd2ca7e000ffbb9bc75ef95d15c0e02b2ce95abcaca1c",
       "requirements_lock": "requirements/tfv6.lock",
+      "requirements_lock_sha256": "6e8a6698283d5b075100705aceee12c05e5144a452f9efc0062a37a3108a59cd",
       "indexes": [
         "https://download.pytorch.org/whl/cu124",
         "https://pypi.org/simple"
@@ -53,7 +57,9 @@
     "diffusiondrive_v2": {
       "python_version": "3.9.25",
       "requirements_input": "requirements/diffusiondrive_v2.in",
+      "requirements_input_sha256": "27a062c6528dd9d0ae38188de8a4ecbd8359c5c3cc53a97e3353c0aeb9510e40",
       "requirements_lock": "requirements/diffusiondrive_v2.lock",
+      "requirements_lock_sha256": "8146bc9b35d7a0709798951de99f433f376491dddf6006fea0a4f94bedefaa13",
       "indexes": [
         "https://download.pytorch.org/whl/cu118",
         "https://pypi.org/simple"
@@ -73,7 +79,9 @@
     "sparsedrive_v2": {
       "python_version": "3.9.25",
       "requirements_input": "requirements/sparsedrive_v2.in",
+      "requirements_input_sha256": "e3db20cc70f7d89de89d42d39a970155cf335716f845f44ac610d27a123da651",
       "requirements_lock": "requirements/sparsedrive_v2.lock",
+      "requirements_lock_sha256": "9b5e15311b66683fb1113479c9a3a7eeb3fc0aa379c55f8957b58e38b286b5ba",
       "indexes": [
         "https://download.pytorch.org/whl/cu118",
         "https://pypi.org/simple"

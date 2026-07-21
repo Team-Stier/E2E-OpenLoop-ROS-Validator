@@ -35,7 +35,9 @@ _TOP_LEVEL_KEYS = {
 _MODEL_KEYS = {
     "python_version",
     "requirements_input",
+    "requirements_input_sha256",
     "requirements_lock",
+    "requirements_lock_sha256",
     "indexes",
     "torch_backend",
     "cuda_policy",
@@ -46,6 +48,7 @@ _MODEL_KEYS = {
 _CUDA_POLICIES = {"required", "recommended", "extension_required"}
 _PATCH_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 _GIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _IMPORT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
 _TORCH_BACKEND = re.compile(r"cu[0-9]{3}\Z")
 _SETUP_ACTION_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
@@ -67,7 +70,9 @@ class ModelEnvironmentDefinition:
     model_id: str
     python_version: str
     requirements_input: Path
+    requirements_input_sha256: str
     requirements_lock: Path
+    requirements_lock_sha256: str
     indexes: tuple[str, ...]
     torch_backend: str
     cuda_policy: str
@@ -194,6 +199,10 @@ def _require_string_tuple(
 
 def _validate_index(value: str, context: str) -> None:
     """package index가 credential 없는 고정 HTTPS URL인지 검사한다."""
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+        raise EnvironmentConfigError(
+            f"{context} contains an ASCII whitespace or control character"
+        )
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -242,6 +251,15 @@ def _resolve_requirement_path(
             f"{context} must resolve beneath the package root"
         ) from exc
     return resolved
+
+
+def _require_sha256(value: Any, context: str) -> str:
+    """manifest digest가 정확한 lowercase SHA-256인지 확인한다."""
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise EnvironmentConfigError(
+            f"{context} must be a lowercase 64-digit SHA-256"
+        )
+    return value
 
 
 def _parse_model_definition(
@@ -329,11 +347,29 @@ def _parse_model_definition(
         f"models.{model_id}.requirements_lock",
         f"requirements/{model_id}.lock",
     )
+    requirements_input_sha256 = _require_sha256(
+        payload["requirements_input_sha256"],
+        f"models.{model_id}.requirements_input_sha256",
+    )
+    requirements_lock_sha256 = _require_sha256(
+        payload["requirements_lock_sha256"],
+        f"models.{model_id}.requirements_lock_sha256",
+    )
+    if sha256_file(requirements_input) != requirements_input_sha256:
+        raise EnvironmentConfigError(
+            f"models.{model_id}.requirements_input_sha256 does not match file content"
+        )
+    if sha256_file(requirements_lock) != requirements_lock_sha256:
+        raise EnvironmentConfigError(
+            f"models.{model_id}.requirements_lock_sha256 does not match file content"
+        )
     return ModelEnvironmentDefinition(
         model_id=model_id,
         python_version=python_version,
         requirements_input=requirements_input,
+        requirements_input_sha256=requirements_input_sha256,
         requirements_lock=requirements_lock,
+        requirements_lock_sha256=requirements_lock_sha256,
         indexes=indexes,
         torch_backend=torch_backend,
         cuda_policy=cuda_policy,
