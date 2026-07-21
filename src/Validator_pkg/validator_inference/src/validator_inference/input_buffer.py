@@ -10,23 +10,12 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass, field
-import os
-import sys
 from threading import RLock
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
-try:
-    from tf.transformations import quaternion_slerp
-except ModuleNotFoundError as error:
-    if error.name != "tf":
-        raise
-    ros_python_path = "/opt/ros/{}/lib/python3/dist-packages".format(
-        os.environ.get("ROS_DISTRO", "noetic")
-    )
-    sys.path.append(ros_python_path)
-    from tf.transformations import quaternion_slerp
+from validator_inference.quaternion_math import quaternion_slerp
 
 
 @dataclass(frozen=True)
