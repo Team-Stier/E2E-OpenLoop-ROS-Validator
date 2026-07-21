@@ -198,7 +198,7 @@ A tracked `model_environments.json` is the source of truth for:
 - exact CPython patch version and target platform;
 - required `uv` version (`0.11.14`) and lock format;
 - input and compiled lock file paths;
-- ordered Python package indexes and exact PyTorch CUDA wheel tag;
+- the PyPI default index, audited official PyTorch index, and exact `torch_backend` CUDA wheel tag;
 - CUDA policy (`required`, `recommended`, or `extension_required`);
 - required imports and model-specific setup actions;
 - runtime asset and calibration preflight policy.
@@ -207,9 +207,14 @@ The target is Ubuntu 20.04-compatible Linux x86_64, represented to `uv` as
 `x86_64-manylinux_2_31` so resolved wheels cannot require a newer glibc. Lock files are produced by
 the pinned `uv` with hashes enabled and synchronized with hash verification and
 no dependency re-resolution. The manifest records the compile and sync
-arguments so lock regeneration is reviewable. PyTorch indexes are fixed to
+arguments so lock regeneration is reviewable. PyPI remains the default
+`first-index` source for ordinary dependencies, while `uv --torch-backend`
+routes the PyTorch family only to
 `https://download.pytorch.org/whl/cu121`, `cu124`, or `cu118` as shown in the
-model table; PyPI is the secondary runtime dependency index. SparseDrive also
+model table. The same backend is passed to compile and sync. A globally
+CUDA-first index is intentionally excluded because that mirror contains names
+such as `networkx` and can shadow an exact PyPI version under `first-index`.
+SparseDrive also
 declares CUDA Toolkit 11.8, `CUDA_HOME`, the accepted `nvcc` 11.8 release, host
 compiler compatibility, its single `navsim/agents/sparsedrive/ops` build
 directory and command, and import checks for both built extension modules.

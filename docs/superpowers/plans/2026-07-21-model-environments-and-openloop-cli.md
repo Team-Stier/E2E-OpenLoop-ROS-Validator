@@ -135,7 +135,7 @@ def test_manifest_defines_exact_supported_models(manifest):
         assert torchvision in requirement_text
 ```
 
-Also test unknown model rejection, unknown keys, invalid SHA values, invalid CUDA policy, absolute/escaping paths, exact `uv_version == "0.11.14"`, platform `x86_64-manylinux_2_31`, ordered official PyTorch/PyPI indexes, and lock/input existence.
+Also test unknown model rejection, unknown keys, invalid SHA values, invalid CUDA policy, absolute/escaping paths, exact `uv_version == "0.11.14"`, platform `x86_64-manylinux_2_31`, PyPI default index, official PyTorch audit index and matching `torch_backend`, and lock/input existence.
 
 - [ ] **Step 2: Verify red state**
 
@@ -151,11 +151,11 @@ Expected: import fails because `model_environment.py` and its manifest do not ex
 
 Define immutable `EnvironmentManifest`, `ModelEnvironmentDefinition`, `EnvironmentPaths`, `AssetFingerprint`, `EnvironmentState`, and `ActiveEnvironmentCheck` dataclasses. Expose `load_environment_manifest(path: Path) -> EnvironmentManifest`, `select_model_environment(manifest, model_id) -> ModelEnvironmentDefinition`, `environment_paths(project_root, model_id) -> EnvironmentPaths`, `sha256_file(path) -> str`, `build_uv_venv_argv(uv, definition, candidate) -> tuple[str, ...]`, and `build_uv_sync_argv(uv, definition, candidate) -> tuple[str, ...]`. Raise `EnvironmentConfigError` for invalid tracked definitions and `EnvironmentStateError` for malformed local state.
 
-Construct argv arrays, never shell strings. Venv creation is `uv venv --no-project --managed-python --python <exact-patch> <candidate>`. Sync is `uv pip sync --python <candidate>/bin/python --require-hashes --strict --no-python-downloads <lock>`; a compiled lock already contains the full dependency resolution, and pinned `uv 0.11.14` does not expose `--no-deps` on `pip sync`.
+Construct argv arrays, never shell strings. Venv creation is `uv venv --no-project --managed-python --python <exact-patch> <candidate>`. Sync is `uv pip sync --python <candidate>/bin/python --require-hashes --strict --no-python-downloads --default-index https://pypi.org/simple --index-strategy first-index --torch-backend <cu-tag> <lock>`; a compiled lock already contains the full dependency resolution, and pinned `uv 0.11.14` does not expose `--no-deps` on `pip sync`.
 
 - [ ] **Step 4: Add all four inputs and generated locks**
 
-Every `.in` includes exact torch/torchvision pins and target-Python builds of `PyYAML`, `rospkg`, `catkin_pkg`, `netifaces`, and `python-dateutil`. TFv6 also pins torchaudio 2.5.0+cu124, NumPy 1.26, timm 1.0.19, transformers 4.46.3, and torchmetrics 0.11; DiffusionDrive pins protobuf 4.25.3, diffusers, and einops; SparseDrive pins protobuf 3.20.* and its upstream direct dependencies. DiffusionDrive and SparseDrive replace the unhashable upstream Git reference with `nuplan-devkit @ https://github.com/motional/nuplan-devkit/archive/ce3c323af01c0d7ec5672f7832ef53f9c679aab0.tar.gz`; `uv pip compile --generate-hashes` must record archive SHA256 `5ab521c1af439902fd8e3df2619da75a03ade5814b35cd37c4c920fd45455e62`. Generate each lock with the manifest-recorded `uv 0.11.14`, Python patch, `--python-platform x86_64-manylinux_2_31`, official CUDA wheel index, PyPI secondary index, `--generate-hashes`, and fixed `--exclude-newer` timestamp. Check the generated lock contains hashes for every installable line.
+Every `.in` includes exact torch/torchvision pins and target-Python builds of `PyYAML`, `rospkg`, `catkin_pkg`, `netifaces`, and `python-dateutil`. TFv6 also pins torchaudio 2.5.0+cu124, NumPy 1.26, timm 1.0.19, transformers 4.46.3, and torchmetrics 0.11; DiffusionDrive pins protobuf 4.25.3, diffusers, and einops; SparseDrive pins protobuf 3.20.* and its upstream direct dependencies. DiffusionDrive and SparseDrive replace the unhashable upstream Git reference with `nuplan-devkit @ https://github.com/motional/nuplan-devkit/archive/ce3c323af01c0d7ec5672f7832ef53f9c679aab0.tar.gz`; `uv pip compile --generate-hashes` must record archive SHA256 `5ab521c1af439902fd8e3df2619da75a03ade5814b35cd37c4c920fd45455e62`. Generate each lock with the manifest-recorded `uv 0.11.14`, Python patch, `--python-platform x86_64-manylinux_2_31`, PyPI default `first-index`, the model's `--torch-backend`, `--generate-hashes`, and fixed `--exclude-newer` timestamp. Check the generated lock contains hashes for every installable line.
 
 - [ ] **Step 5: Pass manifest and lock tests**
 
