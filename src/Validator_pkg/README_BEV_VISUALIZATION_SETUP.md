@@ -3,6 +3,8 @@
 이 문서는 `E2E-OpenLoop-ROS-Validator` 프로젝트에서 Camera BEV, LiDAR BEV, TFv6 waypoint를 하나의 화면으로 합성하고 RViz에서 확인하기 위해 추가된 파일 구조, ROS 의존성, 빌드 및 실행 방법을 설명한다.
 
 ---
+현재 파일의 위치에 맞게 수정해두긴 했다. 혹시나 이상이 있으면 김지한에게 알려주세요
+---
 
 ## 1. 목적
 
