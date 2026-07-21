@@ -2937,11 +2937,11 @@ def _is_sparse_extension_filename(module: str, filename: str) -> bool:
 
 @dataclass(frozen=True)
 class _SparseGeneratedBaseline:
-    """인증된 기존 Sparse extension identity와 rebuild 필요 여부를 보관한다."""
+    """active state로 인증된 기존 Sparse extension fingerprint와 identity다."""
 
     paths: tuple[Path, ...]
+    fingerprints: tuple[AssetFingerprint, ...]
     identities: tuple[tuple[int, int, int], ...]
-    require_rebuild: bool
 
 
 def _existing_sparse_generated_paths(
@@ -3017,12 +3017,11 @@ def _authenticate_existing_sparse_generated_paths(
     checkout: Path,
     paths: Sequence[Path],
     active_state: Optional[EnvironmentState],
-    manifest_sha256: str,
 ) -> _SparseGeneratedBaseline:
-    """기존 Sparse .so pair를 active state SHA로 인증하고 rebuild 정책을 정한다."""
+    """기존 Sparse .so pair를 active state의 exact 저장 fingerprint로 인증한다."""
     selected = tuple(Path(path) for path in paths)
     if not selected:
-        return _SparseGeneratedBaseline((), (), False)
+        return _SparseGeneratedBaseline((), (), ())
     selected = _validate_sparse_generated_paths(
         preflight, checkout, selected, "source_verification"
     )
@@ -3061,24 +3060,12 @@ def _authenticate_existing_sparse_generated_paths(
             "source_verification",
             "pre-existing SparseDrive extension SHA does not match the active state",
         )
-    current_contract = (
-        active_state.schema == ENVIRONMENT_STATE_SCHEMA
-        and active_state.model_id == preflight.definition.model_id
-        and active_state.python_version == preflight.definition.python_version
-        and active_state.python_platform == EXPECTED_PYTHON_PLATFORM
-        and active_state.uv_version == EXPECTED_UV_VERSION
-        and active_state.manifest_sha256 == manifest_sha256
-        and active_state.lock_sha256
-        == preflight.definition.requirements_lock_sha256
-        and active_state.source_commit == preflight.definition.source_commit
-        and active_state.preflight_ids == _SETUP_PREFLIGHT_IDS
-    )
     return _SparseGeneratedBaseline(
         selected,
+        saved,
         _sparse_generated_identities(
             preflight, selected, "source_verification"
         ),
-        not current_contract,
     )
 
 
@@ -3202,6 +3189,755 @@ def _fingerprint_environment_inputs(
         ),
     )
     return runtime + generated
+
+
+@dataclass(frozen=True)
+class _OwnedSparseExtension:
+    """한 transaction이 새로 생성했다고 등록한 extension artifact다."""
+
+    module: str
+    path: Path
+    name: str
+    fingerprint: AssetFingerprint
+    identity: tuple[int, int, int]
+
+
+@contextmanager
+def _open_sparse_regular_entry(
+    parent_descriptor: int,
+    name: str,
+    relative_path: Path,
+    action: str,
+) -> Iterator[tuple[int, os.stat_result, AssetFingerprint]]:
+    """dirfd 아래 exact regular entry를 같은 fd에서 hash하고 열린 채 반환한다."""
+    descriptor: Optional[int] = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOCTTY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            _raise(action, f"SparseDrive extension is not a regular file: {name}")
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(descriptor, _READ_BLOCK_SIZE)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(descriptor)
+        if not _same_open_file(before, after):
+            _raise(action, f"SparseDrive extension changed while hashing: {name}")
+        yield descriptor, after, AssetFingerprint(
+            path=relative_path,
+            sha256=digest.hexdigest(),
+            size=after.st_size,
+            mtime_ns=after.st_mtime_ns,
+        )
+    except EnvironmentSetupError:
+        raise
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, f"cannot securely inspect SparseDrive extension: {name}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _sparse_extension_matches(
+    metadata: os.stat_result,
+    fingerprint: AssetFingerprint,
+    identity: tuple[int, int, int],
+    expected_fingerprint: AssetFingerprint,
+    expected_identity: tuple[int, int, int],
+) -> bool:
+    """열린 extension의 stored fingerprint와 inode identity가 모두 같은지 비교한다."""
+    return (
+        fingerprint == expected_fingerprint
+        and identity == expected_identity
+        and metadata.st_size == expected_fingerprint.size
+        and metadata.st_mtime_ns == expected_fingerprint.mtime_ns
+    )
+
+
+def _sparse_extension_names(
+    descriptor: int, action: str
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """열린 ops root에서 module별 ABI extension filename 후보를 반환한다."""
+    try:
+        names = tuple(sorted(os.listdir(descriptor)))
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, "cannot inspect SparseDrive extension output directory"
+        ) from exc
+    return tuple(
+        (
+            module,
+            tuple(
+                name
+                for name in names
+                if _is_sparse_extension_filename(module, name)
+            ),
+        )
+        for module in _SPARSE_EXTENSION_MODULES
+    )
+
+
+def _duplicate_secure_directory(path: Path, action: str, context: str) -> int:
+    """component no-follow로 연 directory fd를 transaction 수명용으로 복제한다."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    with _open_absolute_nofollow(path, flags, action, context) as descriptor:
+        try:
+            duplicate = os.dup(descriptor)
+            os.set_inheritable(duplicate, False)
+            return duplicate
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                action, f"cannot retain opened {context}: {path}"
+            ) from exc
+
+
+def _current_link_snapshot(paths: EnvironmentPaths) -> Optional[str]:
+    """transaction 시작 시 current symlink의 exact target을 보관한다."""
+    current = Path(paths.current)
+    if current.is_symlink():
+        try:
+            return os.readlink(str(current))
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions", "cannot read current before SparseDrive build"
+            ) from exc
+    if current.exists():
+        _raise(
+            "sparse_extensions",
+            "current must remain a symlink during SparseDrive build",
+        )
+    return None
+
+
+def _restore_current_link_snapshot(
+    paths: EnvironmentPaths,
+    candidate: Path,
+    snapshot: Optional[str],
+) -> None:
+    """activation failure가 current를 바꿨다면 transaction 이전 target을 복원한다."""
+    current = Path(paths.current)
+    if current.is_symlink():
+        try:
+            observed: Optional[str] = os.readlink(str(current))
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions", "cannot inspect current during rollback"
+            ) from exc
+    elif current.exists():
+        _raise(
+            "sparse_extensions",
+            "current was replaced during SparseDrive rollback; preserving it",
+        )
+    else:
+        observed = None
+    if observed == snapshot:
+        return
+    candidate_target = (Path("builds") / candidate.name).as_posix()
+    if observed not in {None, candidate_target}:
+        _raise(
+            "sparse_extensions",
+            "current changed to an unrelated target during rollback; preserving it",
+        )
+    model_root = Path(paths.model_root)
+    try:
+        if snapshot is None:
+            if observed == candidate_target:
+                current.unlink()
+                _fsync_directory(
+                    model_root, "sparse_extensions", "model root directory"
+                )
+            return
+        temporary: Optional[Path] = None
+        for _attempt in range(32):
+            value = model_root / f".current.rollback.{secrets.token_hex(8)}"
+            try:
+                os.symlink(snapshot, str(value))
+                temporary = value
+                break
+            except FileExistsError:
+                continue
+        if temporary is None:
+            _raise("sparse_extensions", "cannot allocate rollback current symlink")
+        try:
+            os.replace(str(temporary), str(current))
+            temporary = None
+            _fsync_directory(
+                model_root, "sparse_extensions", "model root directory"
+            )
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+    except EnvironmentSetupError:
+        raise
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            "sparse_extensions", "cannot restore current after SparseDrive failure"
+        ) from exc
+
+
+@dataclass
+class _SparseExtensionTransaction:
+    """shared source extension pair의 backup/build/rollback ownership transaction이다."""
+
+    preflight: EnvironmentPreflight
+    checkout: Path
+    candidate: Path
+    baseline: _SparseGeneratedBaseline
+    ops_descriptor: int
+    candidate_descriptor: int
+    backup_descriptor: int
+    backup_name: str
+    backup_metadata: os.stat_result
+    current_snapshot: Optional[str]
+    backup_names: list[str] = field(default_factory=list)
+    owned: tuple[_OwnedSparseExtension, ...] = ()
+    build_started: bool = False
+    captured: bool = False
+    finished: bool = False
+    closed: bool = False
+
+    @property
+    def ops_relative(self) -> Path:
+        """project root 기준 Sparse ops 경로다."""
+        return (self.checkout / _SPARSE_OPS).relative_to(self.preflight.root)
+
+    def _backup_existing(self) -> None:
+        """attested old pair만 canonical ops name에서 private backup으로 이동한다."""
+        for path, expected_fingerprint, expected_identity in zip(
+            self.baseline.paths,
+            self.baseline.fingerprints,
+            self.baseline.identities,
+        ):
+            name = path.name
+            with _open_sparse_regular_entry(
+                self.ops_descriptor,
+                name,
+                path,
+                "sparse_extensions",
+            ) as (opened_descriptor, metadata, fingerprint):
+                identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                )
+                if not _sparse_extension_matches(
+                    metadata,
+                    fingerprint,
+                    identity,
+                    expected_fingerprint,
+                    expected_identity,
+                ):
+                    _raise(
+                        "sparse_extensions",
+                        f"authenticated SparseDrive extension changed before backup: {name}",
+                    )
+                try:
+                    os.rename(
+                        name,
+                        name,
+                        src_dir_fd=self.ops_descriptor,
+                        dst_dir_fd=self.backup_descriptor,
+                    )
+                    moved = os.stat(
+                        name,
+                        dir_fd=self.backup_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise EnvironmentSetupError(
+                        "sparse_extensions",
+                        f"cannot back up authenticated SparseDrive extension: {name}",
+                    ) from exc
+                opened = os.fstat(opened_descriptor)
+                if not _same_sparse_entry_identity(moved, opened):
+                    try:
+                        os.rename(
+                            name,
+                            name,
+                            src_dir_fd=self.backup_descriptor,
+                            dst_dir_fd=self.ops_descriptor,
+                        )
+                    except OSError:
+                        pass
+                    _raise(
+                        "sparse_extensions",
+                        f"SparseDrive extension was replaced during backup: {name}",
+                    )
+                self.backup_names.append(name)
+        try:
+            os.fsync(self.ops_descriptor)
+            os.fsync(self.backup_descriptor)
+            os.fsync(self.candidate_descriptor)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions", "cannot persist SparseDrive extension backup"
+            ) from exc
+
+    def begin_build(self) -> None:
+        """canonical old names가 모두 비었음을 확인하고 build ownership window를 연다."""
+        if self.build_started:
+            _raise("sparse_extensions", "SparseDrive build transaction started twice")
+        for _module, names in _sparse_extension_names(
+            self.ops_descriptor, "sparse_extensions"
+        ):
+            if names:
+                _raise(
+                    "sparse_extensions",
+                    "SparseDrive extension output names were not cleared before build",
+                )
+        self.build_started = True
+
+    def capture_outputs(self, *, require_complete: bool) -> None:
+        """controlled build window가 새로 만든 exact extension outputs를 등록한다."""
+        if self.captured:
+            _raise("sparse_extensions", "SparseDrive outputs were captured twice")
+        records: list[_OwnedSparseExtension] = []
+        invalid_modules: list[str] = []
+        for module, names in _sparse_extension_names(
+            self.ops_descriptor, "sparse_extensions"
+        ):
+            if len(names) != 1:
+                invalid_modules.append(module)
+            for name in names:
+                path = self.ops_relative / name
+                with _open_sparse_regular_entry(
+                    self.ops_descriptor,
+                    name,
+                    path,
+                    "sparse_extensions",
+                ) as (_, metadata, fingerprint):
+                    records.append(
+                        _OwnedSparseExtension(
+                            module=module,
+                            path=path,
+                            name=name,
+                            fingerprint=fingerprint,
+                            identity=(
+                                metadata.st_dev,
+                                metadata.st_ino,
+                                metadata.st_mtime_ns,
+                            ),
+                        )
+                    )
+        self.owned = tuple(records)
+        self.captured = True
+        if require_complete and invalid_modules:
+            _raise(
+                "sparse_extensions",
+                "fresh SparseDrive rebuild must create exactly one extension for: "
+                + ", ".join(invalid_modules),
+            )
+
+    def verified_outputs(
+        self, selected_paths: Sequence[Path]
+    ) -> tuple[AssetFingerprint, ...]:
+        """import origin pair가 transaction이 등록한 unchanged fresh outputs인지 확인한다."""
+        selected = _validate_sparse_generated_paths(
+            self.preflight,
+            self.checkout,
+            selected_paths,
+            "sparse_extensions",
+        )
+        if selected != tuple(record.path for record in self.owned):
+            _raise(
+                "sparse_extensions",
+                "imported SparseDrive extensions do not match fresh build outputs",
+            )
+        fingerprints: list[AssetFingerprint] = []
+        for record in self.owned:
+            with _open_sparse_regular_entry(
+                self.ops_descriptor,
+                record.name,
+                record.path,
+                "sparse_extensions",
+            ) as (_, metadata, fingerprint):
+                identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                )
+                if not _sparse_extension_matches(
+                    metadata,
+                    fingerprint,
+                    identity,
+                    record.fingerprint,
+                    record.identity,
+                ):
+                    _raise(
+                        "sparse_extensions",
+                        f"fresh SparseDrive extension changed after build: {record.name}",
+                    )
+                fingerprints.append(fingerprint)
+        return tuple(fingerprints)
+
+    def _preserve_current_entry(self, name: str) -> str:
+        """ownership이 불명확한 canonical entry를 별도 이름으로 이동해 보존한다."""
+        try:
+            expected = os.stat(
+                name, dir_fd=self.ops_descriptor, follow_symlinks=False
+            )
+            preserved = _unused_sparse_entry_name(
+                self.ops_descriptor, f"validator-preserved.{name}"
+            )
+            os.rename(
+                name,
+                preserved,
+                src_dir_fd=self.ops_descriptor,
+                dst_dir_fd=self.ops_descriptor,
+            )
+            observed = os.stat(
+                preserved, dir_fd=self.ops_descriptor, follow_symlinks=False
+            )
+            if not _same_sparse_entry_identity(expected, observed):
+                try:
+                    os.rename(
+                        preserved,
+                        name,
+                        src_dir_fd=self.ops_descriptor,
+                        dst_dir_fd=self.ops_descriptor,
+                    )
+                except OSError:
+                    pass
+                _raise(
+                    "sparse_extensions",
+                    f"SparseDrive extension changed while preserving it: {name}",
+                )
+            os.fsync(self.ops_descriptor)
+            return preserved
+        except EnvironmentSetupError:
+            raise
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions",
+                f"cannot preserve replaced SparseDrive extension: {name}",
+            ) from exc
+
+    def _remove_or_preserve_outputs(self) -> tuple[str, ...]:
+        """owned unchanged output만 삭제하고 replacement/unknown entry는 보존한다."""
+        expected_by_name = {record.name: record for record in self.owned}
+        preserved: list[str] = []
+        current_names = tuple(
+            name
+            for _module, names in _sparse_extension_names(
+                self.ops_descriptor, "sparse_extensions"
+            )
+            for name in names
+        )
+        for name in current_names:
+            record = expected_by_name.get(name)
+            matches = False
+            if record is not None:
+                try:
+                    with _open_sparse_regular_entry(
+                        self.ops_descriptor,
+                        name,
+                        record.path,
+                        "sparse_extensions",
+                    ) as (_, metadata, fingerprint):
+                        identity = (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mtime_ns,
+                        )
+                        matches = _sparse_extension_matches(
+                            metadata,
+                            fingerprint,
+                            identity,
+                            record.fingerprint,
+                            record.identity,
+                        )
+                        if matches:
+                            _remove_sparse_build_leaf(
+                                self.ops_descriptor, name, metadata
+                            )
+                except EnvironmentSetupError:
+                    matches = False
+            if not matches:
+                preserved.append(self._preserve_current_entry(name))
+        return tuple(preserved)
+
+    def _restore_baseline(self) -> None:
+        """backup의 authenticated old pair를 original inode 그대로 canonical name에 둔다."""
+        for path, expected_fingerprint, expected_identity in zip(
+            self.baseline.paths,
+            self.baseline.fingerprints,
+            self.baseline.identities,
+        ):
+            name = path.name
+            if name not in self.backup_names:
+                continue
+            try:
+                os.stat(name, dir_fd=self.ops_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    "sparse_extensions",
+                    f"cannot inspect SparseDrive restore target: {name}",
+                ) from exc
+            else:
+                self._preserve_current_entry(name)
+            with _open_sparse_regular_entry(
+                self.backup_descriptor,
+                name,
+                path,
+                "sparse_extensions",
+            ) as (opened_descriptor, metadata, fingerprint):
+                identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                )
+                if not _sparse_extension_matches(
+                    metadata,
+                    fingerprint,
+                    identity,
+                    expected_fingerprint,
+                    expected_identity,
+                ):
+                    _raise(
+                        "sparse_extensions",
+                        f"SparseDrive extension backup changed before restore: {name}",
+                    )
+                try:
+                    os.rename(
+                        name,
+                        name,
+                        src_dir_fd=self.backup_descriptor,
+                        dst_dir_fd=self.ops_descriptor,
+                    )
+                    restored = os.stat(
+                        name,
+                        dir_fd=self.ops_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise EnvironmentSetupError(
+                        "sparse_extensions",
+                        f"cannot restore authenticated SparseDrive extension: {name}",
+                    ) from exc
+                opened = os.fstat(opened_descriptor)
+                if not _same_sparse_entry_identity(restored, opened):
+                    _raise(
+                        "sparse_extensions",
+                        f"SparseDrive extension was replaced during restore: {name}",
+                    )
+            self.backup_names.remove(name)
+        try:
+            os.fsync(self.ops_descriptor)
+            os.fsync(self.backup_descriptor)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions", "cannot persist SparseDrive extension restore"
+            ) from exc
+
+    def _finish_backup_directory(self) -> None:
+        """empty private backup directory가 생성 당시 inode일 때만 제거한다."""
+        try:
+            if os.listdir(self.backup_descriptor):
+                _raise(
+                    "sparse_extensions",
+                    "SparseDrive extension backup is not empty; preserving it",
+                )
+            observed = os.stat(
+                self.backup_name,
+                dir_fd=self.candidate_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_sparse_entry_identity(observed, self.backup_metadata):
+                _raise(
+                    "sparse_extensions",
+                    "SparseDrive extension backup directory was replaced; preserving it",
+                )
+            os.rmdir(self.backup_name, dir_fd=self.candidate_descriptor)
+            os.fsync(self.candidate_descriptor)
+        except EnvironmentSetupError:
+            raise
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions", "cannot remove SparseDrive extension backup"
+            ) from exc
+
+    def rollback(self) -> None:
+        """새 outputs를 철회하고 old pair/current snapshot을 exact 복원한다."""
+        if self.finished:
+            return
+        preserved: tuple[str, ...] = ()
+        if self.build_started:
+            preserved = self._remove_or_preserve_outputs()
+        self._restore_baseline()
+        _restore_current_link_snapshot(
+            self.preflight.paths, self.candidate, self.current_snapshot
+        )
+        self._finish_backup_directory()
+        self.finished = True
+        if preserved:
+            _raise(
+                "sparse_extensions",
+                "replaced SparseDrive outputs were preserved during rollback: "
+                + ", ".join(preserved),
+            )
+
+    def commit(self) -> None:
+        """새 active output을 재검증하고 더 이상 필요한 old backup을 폐기한다."""
+        if self.finished:
+            _raise("sparse_extensions", "SparseDrive transaction already finished")
+        self.verified_outputs(tuple(record.path for record in self.owned))
+        for path, expected_fingerprint, expected_identity in zip(
+            self.baseline.paths,
+            self.baseline.fingerprints,
+            self.baseline.identities,
+        ):
+            name = path.name
+            if name not in self.backup_names:
+                continue
+            with _open_sparse_regular_entry(
+                self.backup_descriptor,
+                name,
+                path,
+                "sparse_extensions",
+            ) as (_, metadata, fingerprint):
+                identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                )
+                if not _sparse_extension_matches(
+                    metadata,
+                    fingerprint,
+                    identity,
+                    expected_fingerprint,
+                    expected_identity,
+                ):
+                    _raise(
+                        "sparse_extensions",
+                        f"SparseDrive extension backup changed before commit: {name}",
+                    )
+                _remove_sparse_build_leaf(
+                    self.backup_descriptor, name, metadata
+                )
+            self.backup_names.remove(name)
+        self._finish_backup_directory()
+        self.finished = True
+
+    def close(self) -> None:
+        """transaction이 보유한 directory descriptors를 idempotent하게 닫는다."""
+        if self.closed:
+            return
+        self.closed = True
+        for descriptor in (
+            self.backup_descriptor,
+            self.candidate_descriptor,
+            self.ops_descriptor,
+        ):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _begin_sparse_extension_transaction(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    candidate: Path,
+    baseline: Optional[_SparseGeneratedBaseline],
+) -> Optional[_SparseExtensionTransaction]:
+    """Sparse model이면 private backup dirfd를 만들고 attested old pair를 이동한다."""
+    if preflight.definition.model_id != "sparsedrive_v2":
+        return None
+    if baseline is None:
+        _raise("sparse_extensions", "SparseDrive transaction lost its baseline")
+    ops = checkout / _SPARSE_OPS
+    ops_descriptor: Optional[int] = None
+    candidate_descriptor: Optional[int] = None
+    backup_descriptor: Optional[int] = None
+    backup_name = f".sparse-extension-backup.{secrets.token_hex(16)}"
+    transaction: Optional[_SparseExtensionTransaction] = None
+    try:
+        ops_descriptor = _duplicate_secure_directory(
+            ops, "sparse_extensions", "SparseDrive ops"
+        )
+        candidate_descriptor = _duplicate_secure_directory(
+            candidate, "sparse_extensions", "candidate directory"
+        )
+        os.mkdir(backup_name, mode=0o700, dir_fd=candidate_descriptor)
+        backup_descriptor = os.open(
+            backup_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=candidate_descriptor,
+        )
+        backup_metadata = os.fstat(backup_descriptor)
+        if (
+            not stat.S_ISDIR(backup_metadata.st_mode)
+            or backup_metadata.st_dev != os.fstat(ops_descriptor).st_dev
+        ):
+            _raise(
+                "sparse_extensions",
+                "SparseDrive extension backup must share the source filesystem",
+            )
+        transaction = _SparseExtensionTransaction(
+            preflight=preflight,
+            checkout=checkout,
+            candidate=candidate,
+            baseline=baseline,
+            ops_descriptor=ops_descriptor,
+            candidate_descriptor=candidate_descriptor,
+            backup_descriptor=backup_descriptor,
+            backup_name=backup_name,
+            backup_metadata=backup_metadata,
+            current_snapshot=_current_link_snapshot(preflight.paths),
+        )
+        transaction._backup_existing()
+        return transaction
+    except BaseException as error:
+        if transaction is not None:
+            try:
+                transaction.rollback()
+            except BaseException as rollback_error:
+                raise rollback_error from error
+            finally:
+                transaction.close()
+        else:
+            if backup_descriptor is not None:
+                try:
+                    os.close(backup_descriptor)
+                except OSError:
+                    pass
+            if candidate_descriptor is not None:
+                try:
+                    os.rmdir(backup_name, dir_fd=candidate_descriptor)
+                except OSError:
+                    pass
+                try:
+                    os.close(candidate_descriptor)
+                except OSError:
+                    pass
+            if ops_descriptor is not None:
+                try:
+                    os.close(ops_descriptor)
+                except OSError:
+                    pass
+        raise
 
 
 def _candidate_install_environment(candidate: Path) -> dict[str, str]:
@@ -3367,6 +4103,97 @@ def _require_sparse_build_identity(
         )
 
 
+def _same_sparse_entry_identity(
+    left: os.stat_result, right: os.stat_result
+) -> bool:
+    """두 no-follow entry metadata가 같은 inode와 file type을 가리키는지 확인한다."""
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+    )
+
+
+def _unused_sparse_entry_name(descriptor: int, prefix: str) -> str:
+    """열린 directory 안에서 추측하기 어려운 부재 quarantine 이름을 예약한다."""
+    for _attempt in range(32):
+        name = f".{prefix}.{secrets.token_hex(16)}"
+        try:
+            os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return name
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions", "cannot inspect SparseDrive quarantine name"
+            ) from exc
+    _raise("sparse_extensions", "cannot allocate SparseDrive quarantine name")
+
+
+def _remove_sparse_build_leaf(
+    descriptor: int, name: str, expected: os.stat_result
+) -> None:
+    """leaf를 random quarantine으로 옮겨 opened identity 확인 후에만 삭제한다."""
+    path_flag = getattr(os, "O_PATH", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not path_flag or not no_follow:
+        _raise(
+            "sparse_extensions",
+            "platform lacks secure SparseDrive leaf cleanup support",
+        )
+    opened_descriptor: Optional[int] = None
+    quarantine = _unused_sparse_entry_name(descriptor, "validator-remove")
+    try:
+        opened_descriptor = os.open(
+            name,
+            path_flag | no_follow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=descriptor,
+        )
+        opened = os.fstat(opened_descriptor)
+        if not _same_sparse_entry_identity(opened, expected):
+            _raise(
+                "sparse_extensions",
+                "generated SparseDrive build leaf changed before cleanup",
+            )
+        os.rename(
+            name,
+            quarantine,
+            src_dir_fd=descriptor,
+            dst_dir_fd=descriptor,
+        )
+        quarantined = os.stat(
+            quarantine, dir_fd=descriptor, follow_symlinks=False
+        )
+        if not _same_sparse_entry_identity(quarantined, opened):
+            try:
+                os.rename(
+                    quarantine,
+                    name,
+                    src_dir_fd=descriptor,
+                    dst_dir_fd=descriptor,
+                )
+            except OSError:
+                pass
+            _raise(
+                "sparse_extensions",
+                "generated SparseDrive build leaf was replaced; preserving it",
+            )
+        os.unlink(quarantine, dir_fd=descriptor)
+        os.fsync(descriptor)
+    except EnvironmentSetupError:
+        raise
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            "sparse_extensions",
+            "cannot quarantine generated SparseDrive build leaf",
+        ) from exc
+    finally:
+        if opened_descriptor is not None:
+            try:
+                os.close(opened_descriptor)
+            except OSError:
+                pass
+
+
 def _clear_sparse_build_tree_fd(descriptor: int) -> None:
     """열린 build dir 아래 entry를 dir_fd 상대 연산으로만 재귀 삭제한다."""
     try:
@@ -3432,13 +4259,7 @@ def _clear_sparse_build_tree_fd(descriptor: int) -> None:
                     except OSError:
                         pass
             continue
-        try:
-            os.unlink(name, dir_fd=descriptor)
-        except OSError as exc:
-            raise EnvironmentSetupError(
-                "sparse_extensions",
-                "cannot remove generated SparseDrive build contents",
-            ) from exc
+        _remove_sparse_build_leaf(descriptor, name, metadata)
 
 
 def _remove_created_sparse_build_tree(
@@ -3484,7 +4305,7 @@ def _run_sparse_setup_action(
     dependencies: EnvironmentSetupDependencies,
     runner: Callable[..., Any],
     *,
-    baseline: Optional[_SparseGeneratedBaseline] = None,
+    transaction: Optional[_SparseExtensionTransaction] = None,
 ) -> tuple[AssetFingerprint, ...]:
     """SparseDrive의 유일한 declared CUDA extension action을 exact 환경에서 실행한다."""
     actions = preflight.definition.setup_actions
@@ -3495,6 +4316,8 @@ def _run_sparse_setup_action(
         or actions != ("build_sparsedrive_cuda_extensions",)
     ):
         _raise("sparse_extensions", "unsupported setup action contract")
+    if transaction is None:
+        _raise("sparse_extensions", "SparseDrive build requires an output transaction")
     checkout = preflight.root / "models" / "sources" / "sparsedrive_v2"
     ops = checkout / _SPARSE_OPS
     _require_real_directory(ops, "sparse_extensions", "SparseDrive ops")
@@ -3509,16 +4332,23 @@ def _run_sparse_setup_action(
             "CXX": str(dependencies.preflight_dependencies.gxx_path),
         }
     )
+    transaction.begin_build()
     build_descriptor = _reserve_sparse_build_tree(build_directory)
     try:
-        _run_setup_command(
-            runner,
-            (str(candidate_python), "setup.py", "build_ext", "--inplace"),
-            "sparse_extensions",
-            cwd=ops,
-            env=build_environment,
-            timeout=_MODEL_LOAD_TIMEOUT_SECONDS,
-        )
+        try:
+            _run_setup_command(
+                runner,
+                (str(candidate_python), "setup.py", "build_ext", "--inplace"),
+                "sparse_extensions",
+                cwd=ops,
+                env=build_environment,
+                timeout=_MODEL_LOAD_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            transaction.capture_outputs(require_complete=False)
+            raise
+        else:
+            transaction.capture_outputs(require_complete=True)
     finally:
         _remove_created_sparse_build_tree(build_directory, build_descriptor)
     import_code = (
@@ -3570,30 +4400,7 @@ def _run_sparse_setup_action(
     selected_paths = _validate_sparse_generated_paths(
         preflight, checkout, project_paths, "sparse_extensions"
     )
-    if baseline is not None and baseline.require_rebuild:
-        current_identities = _sparse_generated_identities(
-            preflight, selected_paths, "sparse_extensions"
-        )
-        unchanged = tuple(
-            module
-            for module, old_path, old_identity, new_path, new_identity in zip(
-                _SPARSE_EXTENSION_MODULES,
-                baseline.paths,
-                baseline.identities,
-                selected_paths,
-                current_identities,
-            )
-            if old_path == new_path and old_identity == new_identity
-        )
-        if unchanged:
-            _raise(
-                "sparse_extensions",
-                "stale active state requires rebuilt SparseDrive extensions; "
-                "unchanged modules: " + ", ".join(unchanged),
-            )
-    return _fingerprint_generated_artifacts(
-        preflight, checkout, sparse_paths=selected_paths
-    )
+    return transaction.verified_outputs(selected_paths)
 
 
 def _build_candidate_child_environment(
@@ -3992,7 +4799,6 @@ def setup_environment(
                 checkout,
                 initial_generated_paths,
                 active.state,
-                manifest_sha256,
             )
         else:
             initial_generated_paths = ()
@@ -4036,77 +4842,53 @@ def setup_environment(
             candidate / "bin" / "python", "candidate Python"
         )
         _validate_candidate_python_version(preflight, candidate_python, runner)
-        sparse_generated_fingerprints = _run_sparse_setup_action(
-            preflight,
-            candidate_python,
-            selected_dependencies,
-            runner,
-            baseline=sparse_baseline,
+        sparse_transaction = _begin_sparse_extension_transaction(
+            preflight, checkout, candidate, sparse_baseline
         )
-        overlay = candidate / ".ros-overlay"
-        build_ros_overlay(
-            selected_dependencies.preflight_dependencies.ros_python_root,
-            overlay,
-        )
-        overlay_sha256 = verify_ros_overlay(
-            overlay, candidate / ROS_OVERLAY_MANIFEST_FILENAME
-        )
-        child_environment = _build_candidate_child_environment(
-            preflight, candidate, catkin_python
-        )
-        _run_ros_smoke(
-            preflight,
-            candidate_python,
-            child_environment,
-            selected_dependencies,
-            runner,
-        )
-        runtime_warning = _run_candidate_runtime_checks(
-            preflight, candidate, child_environment, runner
-        )
-        installed_packages_sha256 = _installed_packages_sha256(
-            preflight, candidate, child_environment, runner
-        )
-        expected_fingerprints = (
-            runtime_fingerprints
-            + initial_generated_fingerprints
-            + sparse_generated_fingerprints
-        )
-        generated_paths = tuple(
-            fingerprint.path
-            for fingerprint in (
-                initial_generated_fingerprints + sparse_generated_fingerprints
+        try:
+            sparse_generated_fingerprints = _run_sparse_setup_action(
+                preflight,
+                candidate_python,
+                selected_dependencies,
+                runner,
+                transaction=sparse_transaction,
             )
-        )
-        final_fingerprints = _revalidate_setup_inputs(
-            preflight,
-            selected_dependencies,
-            runner,
-            checkout,
-            generated_paths,
-            expected_fingerprints,
-        )
-        try:
-            completed_at = selected_dependencies.utc_now()
-        except (RuntimeError, ValueError, TypeError) as exc:
-            raise EnvironmentSetupError("state_write", "UTC timestamp failed") from exc
-        state = _create_environment_state(
-            preflight,
-            overlay_sha256,
-            installed_packages_sha256,
-            final_fingerprints,
-            completed_at,
-        )
-        state_path = candidate / ENVIRONMENT_STATE_FILENAME
-        try:
-            write_environment_state(state_path, state)
-            observed_state = read_environment_state(candidate)
-        except (EnvironmentStateError, OSError) as exc:
-            raise EnvironmentSetupError("state_write", str(exc)) from exc
-        if observed_state != state:
-            _raise("state_write", "environment state readback mismatch")
-        try:
-            _revalidate_setup_inputs(
+            overlay = candidate / ".ros-overlay"
+            build_ros_overlay(
+                selected_dependencies.preflight_dependencies.ros_python_root,
+                overlay,
+            )
+            overlay_sha256 = verify_ros_overlay(
+                overlay, candidate / ROS_OVERLAY_MANIFEST_FILENAME
+            )
+            child_environment = _build_candidate_child_environment(
+                preflight, candidate, catkin_python
+            )
+            _run_ros_smoke(
+                preflight,
+                candidate_python,
+                child_environment,
+                selected_dependencies,
+                runner,
+            )
+            runtime_warning = _run_candidate_runtime_checks(
+                preflight, candidate, child_environment, runner
+            )
+            installed_packages_sha256 = _installed_packages_sha256(
+                preflight, candidate, child_environment, runner
+            )
+            expected_fingerprints = (
+                runtime_fingerprints
+                + initial_generated_fingerprints
+                + sparse_generated_fingerprints
+            )
+            generated_paths = tuple(
+                fingerprint.path
+                for fingerprint in (
+                    initial_generated_fingerprints + sparse_generated_fingerprints
+                )
+            )
+            final_fingerprints = _revalidate_setup_inputs(
                 preflight,
                 selected_dependencies,
                 runner,
@@ -4114,18 +4896,63 @@ def setup_environment(
                 generated_paths,
                 expected_fingerprints,
             )
-        except BaseException:
             try:
-                state_path.unlink()
-                _fsync_directory(candidate, "state_write", "candidate directory")
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
+                completed_at = selected_dependencies.utc_now()
+            except (RuntimeError, ValueError, TypeError) as exc:
                 raise EnvironmentSetupError(
-                    "state_write", "cannot remove failed candidate state"
+                    "state_write", "UTC timestamp failed"
                 ) from exc
+            state = _create_environment_state(
+                preflight,
+                overlay_sha256,
+                installed_packages_sha256,
+                final_fingerprints,
+                completed_at,
+            )
+            state_path = candidate / ENVIRONMENT_STATE_FILENAME
+            try:
+                write_environment_state(state_path, state)
+                observed_state = read_environment_state(candidate)
+            except (EnvironmentStateError, OSError) as exc:
+                raise EnvironmentSetupError("state_write", str(exc)) from exc
+            if observed_state != state:
+                _raise("state_write", "environment state readback mismatch")
+            try:
+                _revalidate_setup_inputs(
+                    preflight,
+                    selected_dependencies,
+                    runner,
+                    checkout,
+                    generated_paths,
+                    expected_fingerprints,
+                )
+            except BaseException:
+                try:
+                    state_path.unlink()
+                    _fsync_directory(
+                        candidate, "state_write", "candidate directory"
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise EnvironmentSetupError(
+                        "state_write", "cannot remove failed candidate state"
+                    ) from exc
+                raise
+            activate_candidate(preflight.paths, candidate)
+        except BaseException as error:
+            if sparse_transaction is not None:
+                try:
+                    sparse_transaction.rollback()
+                except BaseException as rollback_error:
+                    raise rollback_error from error
             raise
-        activate_candidate(preflight.paths, candidate)
+        else:
+            if sparse_transaction is not None:
+                sparse_transaction.commit()
+        finally:
+            if sparse_transaction is not None:
+                sparse_transaction.close()
         return EnvironmentOperationResult(
             environment_dir=candidate,
             state=state,

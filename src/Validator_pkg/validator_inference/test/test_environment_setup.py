@@ -3748,6 +3748,61 @@ def test_setup_sparse_stale_state_requires_extension_rebuild(tmp_path: Path):
     )
 
 
+def test_setup_sparse_stale_state_rejects_metadata_only_extension_replacement(
+    tmp_path: Path,
+):
+    """기존 .so bytes를 그대로 inode만 바꾼 build는 fresh rebuild 증명이 아니다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    stale_state = dataclasses.replace(first.state, lock_sha256="0" * 64)
+    environment_setup.write_environment_state(
+        first.environment_dir / ENVIRONMENT_STATE_FILENAME, stale_state
+    )
+    recreate_runner = _SetupRunner(
+        root, "sparsedrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = extension_status
+    recreate_runner.post_sparse_git_status_output = extension_status
+    recreate_runner.write_sparse_extensions = False
+
+    def replace_metadata_only(
+        _command: tuple[str, ...], _kwargs: dict[str, Any]
+    ) -> None:
+        for path in _SPARSE_EXTENSION_PATHS:
+            absolute = root / path
+            if not absolute.exists():
+                continue
+            replacement = absolute.with_name(absolute.name + ".metadata-only")
+            replacement.write_bytes(absolute.read_bytes())
+            os.replace(replacement, absolute)
+
+    recreate_runner.phase_hooks["sparse_build"] = replace_metadata_only
+
+    with pytest.raises(EnvironmentSetupError, match="fresh|create|rebuild"):
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=dependencies,
+        )
+
+
 def test_setup_sparse_stale_state_accepts_rebuilt_extensions(tmp_path: Path):
     """stale state라도 build가 두 .so identity를 교체하면 새 state로 복구한다."""
     root, dependencies, runner, _ = _setup_fixture(
@@ -3801,6 +3856,104 @@ def test_setup_sparse_stale_state_accepts_rebuilt_extensions(tmp_path: Path):
     assert environment_paths(root, "sparsedrive_v2").current.resolve() == (
         recreated.environment_dir
     )
+
+
+def test_setup_sparse_recreate_failure_restores_active_extension_fingerprints(
+    tmp_path: Path,
+):
+    """changed .so 뒤 model load 실패는 old pair를 exact metadata/SHA로 복구한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    expected = first.state.assets[-len(_SPARSE_EXTENSION_PATHS) :]
+    recreate_runner = _SetupRunner(
+        root, "sparsedrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = extension_status
+    recreate_runner.post_sparse_git_status_output = extension_status
+    recreate_runner.fail_phase = "model_load"
+
+    def change_extensions(
+        _command: tuple[str, ...], _kwargs: dict[str, Any]
+    ) -> None:
+        for path in _SPARSE_EXTENSION_PATHS:
+            absolute = root / path
+            absolute.write_bytes(absolute.read_bytes() + b":new-build")
+
+    recreate_runner.phase_hooks["sparse_build"] = change_extensions
+
+    with pytest.raises(EnvironmentSetupError, match="model_load"):
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=dependencies,
+        )
+
+    observed = tuple(
+        AssetFingerprint(
+            path=fingerprint.path,
+            sha256=sha256_file(root / fingerprint.path),
+            size=(root / fingerprint.path).stat().st_size,
+            mtime_ns=(root / fingerprint.path).stat().st_mtime_ns,
+        )
+        for fingerprint in expected
+    )
+    paths = environment_paths(root, "sparsedrive_v2")
+    inspection_preflight = preflight_environment(
+        root,
+        "sparsedrive_v2",
+        runner=_SetupRunner(root, "sparsedrive_v2", first.state.python_version),
+        dependencies=dependencies.preflight_dependencies,
+    )
+    inspection = environment_setup.inspect_active_environment(
+        paths,
+        inspection_preflight.definition,
+        sha256_file(inspection_preflight.manifest.manifest_path),
+    )
+    assert observed == expected
+    assert paths.current.resolve() == first.environment_dir
+    assert inspection.valid is True
+
+
+def test_setup_sparse_fresh_failure_removes_generated_extensions(tmp_path: Path):
+    """active state가 없는 build의 later failure는 새 exact .so를 남기지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    runner.post_sparse_git_status_output = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.fail_phase = "model_load"
+
+    with pytest.raises(EnvironmentSetupError, match="model_load"):
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert all(not (root / path).exists() for path in _SPARSE_EXTENSION_PATHS)
+    assert not environment_paths(root, "sparsedrive_v2").current.exists()
 
 
 def test_setup_revalidates_runtime_asset_immediately_before_state_and_activation(
@@ -4054,6 +4207,70 @@ def test_setup_sparse_cleanup_does_not_follow_replacement_after_identity_check(
     assert marker.read_text(encoding="utf-8") == "preserve\n"
     assert moved.is_dir()
     assert not environment_paths(root, "sparsedrive_v2").current.exists()
+
+
+def test_setup_sparse_cleanup_preserves_leaf_replaced_before_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """lstat 뒤 교체된 nested regular file은 cleanup이 삭제하지 않고 실패한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    build = (
+        root
+        / "models"
+        / "sources"
+        / "sparsedrive_v2"
+        / "navsim"
+        / "agents"
+        / "sparsedrive"
+        / "ops"
+        / "build"
+    )
+    generated = build / "temp.linux-x86_64-cpython-39" / "generated.o"
+    moved = generated.with_name("owned-generated.o")
+    marker = b"concurrent-user-file"
+    real_rename = os.rename
+    replaced = False
+
+    def replace_before_quarantine(
+        source: str | bytes,
+        destination: str | bytes,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replaced
+        if source == "generated.o" and src_dir_fd is not None and not replaced:
+            replaced = True
+            real_rename(generated, moved)
+            generated.write_bytes(marker)
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(environment_setup.os, "rename", replace_before_quarantine)
+
+    with pytest.raises(EnvironmentSetupError, match="changed|replaced") as caught:
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    preserved = tuple(
+        path
+        for path in build.rglob("*")
+        if path.is_file() and path.read_bytes() == marker
+    )
+    assert caught.value.action == "sparse_extensions"
+    assert preserved
 
 
 def test_setup_reuse_revalidates_assets_after_runtime_checks(tmp_path: Path):
