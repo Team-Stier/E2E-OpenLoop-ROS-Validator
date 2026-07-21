@@ -392,7 +392,7 @@ def read_environment_state(environment_dir: Path) -> EnvironmentState:
         )
     except EnvironmentStateError:
         raise
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise EnvironmentStateError(f"cannot read environment state: {state_path}") from exc
     return _parse_environment_state(payload)
 

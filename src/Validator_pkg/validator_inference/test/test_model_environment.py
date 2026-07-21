@@ -495,6 +495,35 @@ def test_environment_state_rejects_duplicate_json_keys(tmp_path: Path):
         read_environment_state(environment_dir)
 
 
+def test_environment_state_normalizes_invalid_utf8(tmp_path: Path):
+    """UTF-8로 decode할 수 없는 state도 EnvironmentStateError로 정규화한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    (environment_dir / ".validator-environment.json").write_bytes(b"{\xff}\n")
+
+    with pytest.raises(EnvironmentStateError, match="cannot read environment state"):
+        read_environment_state(environment_dir)
+
+
+def test_inspect_active_environment_reports_invalid_utf8_state(
+    tmp_path: Path, manifest: EnvironmentManifest
+):
+    """active 검사가 잘못된 UTF-8 state를 예외 없이 사용 불가로 보고한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, _ = _active_environment_fixture(tmp_path, definition)
+    (environment_dir / ".validator-environment.json").write_bytes(b"{\xff}\n")
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+
+    assert check == ActiveEnvironmentCheck(
+        False,
+        f"invalid environment state: cannot read environment state: "
+        f"{environment_dir / '.validator-environment.json'}",
+        environment_dir,
+        None,
+    )
+
+
 def test_inspect_active_environment_accepts_matching_state_without_hashing_assets(
     tmp_path: Path,
     manifest: EnvironmentManifest,
