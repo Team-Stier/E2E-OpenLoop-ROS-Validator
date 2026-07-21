@@ -1,0 +1,25 @@
+camera_bev_topic: "/image/BEV"
+lidar_bev_topic: "/lidar3D/BEV"
+waypoints_topic: "/waypoints"
+
+overlay_topic: "/visualization/bev_overlay"
+triptych_topic: "/visualization/bev_triptych"
+
+# LiDAR mono8 값이 이 값 이상이면 표시
+lidar_threshold: 1
+
+# LiDAR 색상의 합성 비율
+lidar_alpha: 0.70
+
+# Camera와 LiDAR 허용 시간차 [s]
+sync_slop: 0.05
+sync_queue_size: 20
+
+# Camera BEV 위에 표시할 LiDAR 색상, BGR 순서
+lidar_color_b: 0
+lidar_color_g: 255
+lidar_color_r: 0
+
+draw_waypoints: true
+waypoint_radius: 3
+waypoint_line_thickness: 2
