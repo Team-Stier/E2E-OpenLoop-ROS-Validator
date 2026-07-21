@@ -2,11 +2,14 @@
 
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
 import tempfile
+import time
 import warnings
+import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,6 +30,8 @@ from validator_inference.ros_compatibility import (
     _build_message_fixtures,
     _extract_message_fields,
     _policy_from_environment,
+    _process_group_alive,
+    _reserve_local_port,
     _set_ros_parameter,
     _validate_peer_report,
     _wait_for_ros_master,
@@ -35,9 +40,23 @@ from validator_inference.ros_compatibility import (
     run_ros_compatibility_smoke,
     validate_loaded_module_origins,
 )
+from validator_inference.environment_setup import PURE_ROS_PACKAGES, build_ros_overlay
+from validator_inference.model_environment import (
+    ENVIRONMENT_STATE_FILENAME,
+    EXPECTED_PYTHON_PLATFORM,
+    EXPECTED_UV_VERSION,
+    ROS_OVERLAY_MANIFEST_FILENAME,
+    EnvironmentState,
+    load_environment_manifest,
+    select_model_environment,
+    sha256_file,
+    write_environment_state,
+)
 
 
 _POLICY_DIRECTORY = tempfile.TemporaryDirectory(prefix="validator-ros-policy-")
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+_VALIDATOR_PACKAGE_ROOT = _PACKAGE_ROOT.parent
 
 
 def _path_policy() -> RuntimePathPolicy:
@@ -745,6 +764,336 @@ def test_peer_cli_reports_runtime_failure_without_traceback(tmp_path, capsys):
         peer_runner=peer_runner,
     ) == 1
     assert capsys.readouterr().err.strip() == "ros compatibility error: forced peer mismatch"
+
+
+def _build_catkin_install_prefix(tmp_path):
+    """필요한 두 package만 가진 격리 Catkin workspace를 실제 install한다."""
+    workspace = tmp_path / "catkin install workspace"
+    validator_root = workspace / "src/Validator_pkg"
+    validator_root.mkdir(parents=True)
+    ignore = shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc")
+    shutil.copytree(
+        _VALIDATOR_PACKAGE_ROOT / "validator_inference",
+        validator_root / "validator_inference",
+        ignore=ignore,
+    )
+    shutil.copytree(
+        _VALIDATOR_PACKAGE_ROOT / "validator_msgs",
+        validator_root / "validator_msgs",
+        ignore=ignore,
+    )
+    shutil.copytree(
+        _VALIDATOR_PACKAGE_ROOT / "config",
+        validator_root / "config",
+        ignore=ignore,
+    )
+    install_prefix = (tmp_path / "isolated install prefix").resolve()
+    result = subprocess.run(
+        [
+            "catkin_make",
+            "install",
+            f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+        ],
+        cwd=workspace,
+        env=dict(os.environ),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    return install_prefix
+
+
+def _minimal_ros_source(root):
+    """wrapper deep verification에 필요한 exact pure-Python overlay source를 만든다."""
+    source = root / "minimal ros source"
+    for package in PURE_ROS_PACKAGES:
+        package_root = source / package
+        package_root.mkdir(parents=True)
+        (package_root / "__init__.py").write_text(
+            f"PACKAGE = {package!r}\n", encoding="utf-8"
+        )
+    return source
+
+
+def _write_signal_stub(path):
+    """argv/environment/signal/exit 상태를 JSON으로 남기는 target Python stub을 쓴다."""
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "#!/usr/bin/python3\n"
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import signal\n"
+        "import sys\n"
+        "import time\n"
+        "capture = Path(os.environ['ROSLAUNCH_CAPTURE_PATH'])\n"
+        "payload = {\n"
+        "    'argv': sys.argv,\n"
+        "    'pid': os.getpid(),\n"
+        "    'pgid': os.getpgrp(),\n"
+        "    'pythonpath': os.environ.get('PYTHONPATH'),\n"
+        "    'virtual_env': os.environ.get('VIRTUAL_ENV'),\n"
+        "    'signal': None,\n"
+        "    'exit_status': None,\n"
+        "}\n"
+        "def write():\n"
+        "    temporary = capture.with_suffix('.tmp')\n"
+        "    temporary.write_text(json.dumps(payload, sort_keys=True), encoding='utf-8')\n"
+        "    os.replace(str(temporary), str(capture))\n"
+        "def finish(signum, status):\n"
+        "    payload['signal'] = signum\n"
+        "    payload['exit_status'] = status\n"
+        "    write()\n"
+        "    raise SystemExit(status)\n"
+        "signal.signal(signal.SIGINT, lambda signum, _frame: finish(signum, 23))\n"
+        "signal.signal(signal.SIGTERM, lambda signum, _frame: finish(signum, 24))\n"
+        "write()\n"
+        "if os.environ.get('ROSLAUNCH_STUB_MODE') == 'required-exit':\n"
+        "    time.sleep(0.25)\n"
+        "    finish(0, 23)\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _prepare_installed_model_environment(tmp_path, install_prefix):
+    """installed wrapper가 검증할 active state, overlay와 signal stub을 구성한다."""
+    project_root = (tmp_path / "installed runtime project").resolve()
+    project_root.mkdir()
+    package_root = install_prefix / "share/validator_inference"
+    manifest_path = package_root / "config/model_environments.json"
+    manifest = load_environment_manifest(manifest_path)
+    definition = select_model_environment(manifest, "interfuser")
+    environment_dir = (
+        project_root / ".venvs/interfuser/builds/install-signal-test"
+    )
+    environment_dir.mkdir(parents=True)
+    target_python = environment_dir / "bin/python"
+    _write_signal_stub(target_python)
+    overlay = environment_dir / ".ros-overlay"
+    build_ros_overlay(_minimal_ros_source(tmp_path), overlay)
+    overlay_manifest = environment_dir / ROS_OVERLAY_MANIFEST_FILENAME
+    state = EnvironmentState(
+        schema=1,
+        model_id="interfuser",
+        python_version=definition.python_version,
+        python_platform=EXPECTED_PYTHON_PLATFORM,
+        uv_version=EXPECTED_UV_VERSION,
+        manifest_sha256=sha256_file(manifest_path),
+        lock_sha256=definition.requirements_lock_sha256,
+        ros_overlay_sha256=sha256_file(overlay_manifest),
+        source_commit=definition.source_commit,
+        installed_packages_sha256="a" * 64,
+        python_executable=Path("bin/python"),
+        assets=(),
+        completed_at="2026-07-22T00:00:00Z",
+        preflight_ids=(),
+    )
+    write_environment_state(environment_dir / ENVIRONMENT_STATE_FILENAME, state)
+    current = project_root / ".venvs/interfuser/current"
+    current.parent.mkdir(parents=True, exist_ok=True)
+    current.symlink_to(Path("builds") / environment_dir.name)
+    return project_root, environment_dir, overlay
+
+
+def _installed_environment(install_prefix, ros_home, port):
+    """install prefix setup.bash를 source한 ROS tool environment를 읽는다."""
+    completed = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            'source "$1/setup.bash" && env -0',
+            "validator-install-environment",
+            str(install_prefix),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    environment = {}
+    for entry in completed.stdout.split(b"\0"):
+        if not entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        environment[key.decode()] = value.decode()
+    ros_home.mkdir(parents=True, exist_ok=True)
+    environment.update(
+        {
+            "ROS_HOME": str(ros_home),
+            "ROS_LOG_DIR": str(ros_home / "log"),
+            "ROS_MASTER_URI": f"http://127.0.0.1:{port}/",
+        }
+    )
+    return environment
+
+
+def _write_installed_launch(
+    path, install_prefix, project_root, capture_path, mode
+):
+    """installed wrapper prefix와 required stub 하나만 포함한 launch XML을 쓴다."""
+    launch = ET.Element("launch")
+    node = ET.SubElement(
+        launch,
+        "node",
+        {
+            "pkg": "validator_inference",
+            "type": "inference_engine_node.py",
+            "name": "installed_signal_stub",
+            "required": "true",
+            "output": "screen",
+            "args": "literal_argument",
+            "launch-prefix": '"{}"'.format(
+                install_prefix / "share/validator_inference/scripts/model_env_exec"
+            ),
+        },
+    )
+    values = {
+        "OPENLOOP_MODEL_ENV_ROOT": project_root / ".venvs",
+        "OPENLOOP_MODEL_ID": "interfuser",
+        "OPENLOOP_PROJECT_ROOT": project_root,
+        "ROSLAUNCH_CAPTURE_PATH": capture_path,
+        "ROSLAUNCH_STUB_MODE": mode,
+    }
+    for name, value in values.items():
+        ET.SubElement(node, "env", {"name": name, "value": str(value)})
+    ET.SubElement(
+        node,
+        "remap",
+        {"from": "camera/image", "to": "/recorded_camera/image_raw"},
+    )
+    ET.ElementTree(launch).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def _wait_for_path(path, process, timeout_seconds=30.0):
+    """process 조기 종료를 감시하며 capture file을 bounded wait한다."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return
+        if process.poll() is not None:
+            output, _unused = process.communicate()
+            pytest.fail(f"roslaunch exited before capture ({process.returncode}):\n{output}")
+        time.sleep(0.02)
+    pytest.fail(f"timed out waiting for roslaunch capture: {path}")
+
+
+def _pid_exists(pid):
+    """signal 0으로 한 process ID가 아직 존재하는지 확인한다."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _run_installed_launch(launch_path, environment, capture_path, send_sigint):
+    """real roslaunch를 독립 group으로 실행하고 signal/required 종료를 수집한다."""
+    process = subprocess.Popen(
+        ["roslaunch", str(launch_path)],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    output = ""
+    try:
+        _wait_for_path(capture_path, process)
+        initial = json.loads(capture_path.read_text(encoding="utf-8"))
+        if send_sigint:
+            process.send_signal(signal.SIGINT)
+        output, _unused = process.communicate(timeout=30)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+    final = json.loads(capture_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5.0
+    while _pid_exists(initial["pid"]) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not _pid_exists(initial["pid"])
+    assert not _process_group_alive(process.pid)
+    return process.returncode, output, initial, final
+
+
+@pytest.mark.ros_compatibility
+def test_real_install_prefix_and_roslaunch_signal_contract(tmp_path):
+    """실제 install wrapper의 경로 파생, SIGINT, required shutdown과 정리를 검증한다."""
+    if os.environ.get("VALIDATOR_RUN_ROS_COMPAT") != "1":
+        pytest.skip("set VALIDATOR_RUN_ROS_COMPAT=1 for install/roslaunch integration")
+
+    install_prefix = _build_catkin_install_prefix(tmp_path)
+    wrapper = install_prefix / "share/validator_inference/scripts/model_env_exec"
+    relay = install_prefix / "lib/validator_inference/inference_engine_node.py"
+    catkin_python = install_prefix / "lib/python3/dist-packages"
+    assert wrapper.read_bytes().splitlines()[0] == b"#!/usr/bin/python3"
+    assert relay.is_file()
+    assert (catkin_python / "validator_inference/__init__.py").is_file()
+    assert (catkin_python / "validator_msgs/msg/__init__.py").is_file()
+
+    project_root, environment_dir, overlay = _prepare_installed_model_environment(
+        tmp_path, install_prefix
+    )
+    ros_home = tmp_path / "ros home"
+    signal_capture = tmp_path / "signal capture.json"
+    signal_launch = tmp_path / "signal.launch"
+    _write_installed_launch(
+        signal_launch,
+        install_prefix,
+        project_root,
+        signal_capture,
+        "wait-for-signal",
+    )
+    signal_environment = _installed_environment(
+        install_prefix, ros_home, _reserve_local_port()
+    )
+    _returncode, signal_output, initial, signaled = _run_installed_launch(
+        signal_launch, signal_environment, signal_capture, True
+    )
+    assert initial["pythonpath"] == os.pathsep.join((str(overlay), str(catkin_python)))
+    assert initial["virtual_env"] == str(environment_dir)
+    assert initial["argv"][0] == str(environment_dir / "bin/python")
+    assert initial["argv"][1] == str(relay)
+    assert "literal_argument" in initial["argv"]
+    assert "camera/image:=/recorded_camera/image_raw" in initial["argv"]
+    assert signaled["signal"] == signal.SIGINT
+    assert signaled["exit_status"] == 23
+    started_pid = re.search(
+        r"process\[installed_signal_stub-\d+\]: started with pid \[(\d+)\]",
+        signal_output,
+    )
+    assert started_pid is not None, signal_output
+    assert int(started_pid.group(1)) == initial["pid"]
+
+    required_capture = tmp_path / "required capture.json"
+    required_launch = tmp_path / "required.launch"
+    _write_installed_launch(
+        required_launch,
+        install_prefix,
+        project_root,
+        required_capture,
+        "required-exit",
+    )
+    required_environment = _installed_environment(
+        install_prefix, ros_home, _reserve_local_port()
+    )
+    _returncode, required_output, _initial, required = _run_installed_launch(
+        required_launch, required_environment, required_capture, False
+    )
+    assert required["signal"] == 0
+    assert required["exit_status"] == 23
+    assert "REQUIRED process [installed_signal_stub-" in required_output
+    assert "Initiating shutdown!" in required_output
 
 
 @pytest.mark.ros_compatibility
