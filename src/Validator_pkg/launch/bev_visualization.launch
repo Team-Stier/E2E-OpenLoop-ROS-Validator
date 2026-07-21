@@ -1,0 +1,37 @@
+<launch>
+    <arg name="show_rviz" default="true"/>
+    <arg name="draw_waypoints" default="true"/>
+
+    <!--
+      Camera BEV, LiDAR BEV, visualizer가 공유하는
+      공통 geometry 설정을 전역 namespace에 로드한다.
+    -->
+    <rosparam
+        command="load"
+        file="$(find Validator_pkg)/config/bev_geometry.yaml"
+        ns="/bev_geometry"/>
+
+    <node
+        pkg="Validator_pkg"
+        type="bev_visualizer.py"
+        name="bev_visualizer"
+        output="screen"
+        required="true">
+
+        <rosparam
+            command="load"
+            file="$(find Validator_pkg)/config/bev_visualizer.yaml"/>
+
+        <param
+            name="draw_waypoints"
+            value="$(arg draw_waypoints)"/>
+    </node>
+
+    <node
+        if="$(arg show_rviz)"
+        pkg="rviz"
+        type="rviz"
+        name="e2e_validator_rviz"
+        args="-d $(find Validator_pkg)/rviz/e2e_validator.rviz"
+        output="screen"/>
+</launch>

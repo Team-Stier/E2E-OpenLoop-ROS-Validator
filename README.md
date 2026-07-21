@@ -18,7 +18,9 @@ inference engine의 인풋이 되는 데이터를 저장하는 버퍼 객체
 토픽을 callback으로 객체 내부에 저장.
 pub:
 sub: 
-    profile별 perception topic
+    /lidar/<model profile>/...
+    /image/<model profile>/...
+    /Ego_topic
     /driving_feature
     /route/target_point (필요한 profile만)
     /lidar3D (TFv6 10-sweep history인 경우만)
@@ -48,12 +50,14 @@ flowchart TD
     B1["/image_jpeg/left/compressed\n===========================\nsensor_msgs/CompressedImage"]
     B2["/image_jpeg/right/compressed\n===========================\nsensor_msgs/CompressedImage"]
     C["/Ego_topic\n===========================\nmorai_msgs/EgoVehicleStatus"]
+    T["/tf\n===========================\ntf2_msgs/TFMessage"]
 
     rosbag-->A
     rosbag-->B0
     rosbag-->B1
     rosbag-->B2
     rosbag-->C
+    rosbag-->T
 
 
     D(("lidar BEV processor"))
@@ -64,14 +68,12 @@ flowchart TD
     B0-->E
     B1-->E
     B2-->E
-    B0-->F
-    B1-->F
-    B2-->F
-
-    G["/lidar3D/BEV\n=================\nsensor_msgs/Image"]
-    H0["/image/main/processed\n=================\nsensor_msgs/Image"]
+    G["/lidar3D/BEV\n=================\nsensor_msgs/Image (mono8 visual)"]
+    GM["모델별 lidar input\n=================\n/lidar/tfv6/processed\n/lidar/interfuser/processed\n/lidar/diffusiondrive_v2/processed"]
+    H0["/image/front/processed\n=================\nsensor_msgs/Image"]
     H1["/image/left/processed\n=================\nsensor_msgs/Image"]
     H2["/image/right/processed\n=================\nsensor_msgs/Image"]
+    HM["모델별 image input\n=================\n/image/tfv6/...\n/image/interfuser/...\n/image/diffusiondrive_v2/...\n/image/sparsedrive_v2/..."]
     I["/image/BEV\n=================\nsensor_msgs/Image"]
 
     R((opt feeder))
@@ -79,9 +81,15 @@ flowchart TD
     TP["/route/target_point\n=========================\ngeometry_msgs/PointStamped"]
     
     D-->G
+    D-->GM
+    T-->D
     E-->H0
     E-->H1
     E-->H2
+    E-->HM
+    H0-->F
+    H1-->F
+    H2-->F
     F-->I
     C-->R
     R-->DF
@@ -89,11 +97,9 @@ flowchart TD
 
     J((inference engine))
 
-    G-->J
+    GM-->J
+    HM-->J
     A-->J
-    H0-->J
-    H1-->J
-    H2-->J
     DF-->J
     TP-->J
 
@@ -126,7 +132,118 @@ raw data를 가공하여 `inference engine`과 `visualizer`에 서빙하는 계�
 - 4개 모델에 대응 가능해야 함.
 
 `lidar BEV processor`, `image adaptor` 노드는 모델이 기대하는 입력 포멧에 맞춰 임의로 토픽 추가, 변경.
-`/image_jpeg/front/compressed`, `/image_jpeg/left/compressed`, `/image_jpeg/right/compressed`를 stitch하는 경우 `/image/main/processed`로 발행하고 `/image/left/processed`, `/image/right/processed`는 발행하지 않도록 함.
+카메라 rosbag 토픽은 `/image_jpeg/front/compressed`, `/image_jpeg/left/compressed`, `/image_jpeg/right/compressed`이다. `image adaptor`가 각각 `/image/front/processed`, `/image/left/processed`, `/image/right/processed`로 변환하고, `camera_bev_stitcher`가 세 영상을 공통 차량 좌표계에 투영해 `/image/BEV`로 발행한다.
+
+#### 2.1.1 Camera topic contract
+
+카메라 입력 토픽은 rosbag에 기록된 다음 토픽을 기준으로 한다.
+
+| Camera | Input topic | Type |
+| --- | --- | --- |
+| Front | `/image_jpeg/front/compressed` | `sensor_msgs/CompressedImage` |
+| Left | `/image_jpeg/left/compressed` | `sensor_msgs/CompressedImage` |
+| Right | `/image_jpeg/right/compressed` | `sensor_msgs/CompressedImage` |
+
+`image_adaptor`는 선택한 모델과 무관하게 다음 legacy 토픽을 항상 발행한다. 이 토픽들은 원본 해상도와 header를 유지하는 `bgr8` 영상이며 `camera_bev_stitcher`의 입력으로 사용한다.
+
+| Camera | Legacy output topic | Encoding |
+| --- | --- | --- |
+| Front | `/image/front/processed` | `bgr8` |
+| Left | `/image/left/processed` | `bgr8` |
+| Right | `/image/right/processed` | `bgr8` |
+
+추론용 영상은 모델마다 크기와 인코딩이 다르므로 `/image/main/processed` 하나를 공유하지 않고 모델별 namespace로 분리한다.
+
+| Model profile | Model input topic | Size (W x H) | Encoding / value |
+| --- | --- | --- | --- |
+| TFv6 | `/image/tfv6/processed` | 1152 x 384 | `rgb8`, left-front-right |
+| InterFuser | `/image/interfuser/front` | 224 x 224 | `32FC3`, ImageNet-normalized RGB |
+| InterFuser | `/image/interfuser/left` | 128 x 128 | `32FC3`, ImageNet-normalized RGB |
+| InterFuser | `/image/interfuser/right` | 128 x 128 | `32FC3`, ImageNet-normalized RGB |
+| InterFuser | `/image/interfuser/center` | 128 x 128 | `32FC3`, ImageNet-normalized RGB |
+| DiffusionDrive v2 | `/image/diffusiondrive_v2/processed` | 1024 x 256 | `32FC3`, RGB `[0, 1]` |
+| SparseDrive v2 | `/image/sparsedrive_v2/front` | 512 x 256 | `32FC3`, ImageNet-normalized RGB |
+| SparseDrive v2 | `/image/sparsedrive_v2/left` | 512 x 256 | `32FC3`, ImageNet-normalized RGB |
+| SparseDrive v2 | `/image/sparsedrive_v2/right` | 512 x 256 | `32FC3`, ImageNet-normalized RGB |
+
+`~model_profiles` 파라미터로 필요한 모델 출력을 선택한다. 기본값 `raw`는 legacy 토픽만 발행하며, `all`은 네 모델 출력을 모두 활성화한다.
+
+```bash
+rosrun Validator_pkg image_adaptor.py _model_profiles:=tfv6
+rosrun Validator_pkg image_adaptor.py _model_profiles:=interfuser
+rosrun Validator_pkg image_adaptor.py _model_profiles:=diffusiondrive_v2
+rosrun Validator_pkg image_adaptor.py _model_profiles:=sparsedrive_v2
+rosrun Validator_pkg image_adaptor.py _model_profiles:=all
+```
+
+`camera_bev_stitcher`는 legacy 카메라 토픽 세 개를 동기화하고 `/image/BEV`로 발행한다. 출력은 전방 25 m, 좌우 총 30 m를 0.05 m/pixel로 표현한 600 x 500 `bgr8` 영상이다. 따라서 모델이 stitched image를 사용하더라도 legacy left/right 토픽은 BEV 시각화를 위해 계속 발행한다.
+
+#### 2.1.2 LiDAR topic contract
+
+`lidar_bev_processor`는 rosbag의 `/lidar3D`를 입력으로 받고, TFv6의 여러 프레임을 차량 움직임에 맞춰 정렬할 때만 `/tf`도 사용한다.
+
+| Input topic | Type | Purpose |
+| --- | --- | --- |
+| `/lidar3D` | `sensor_msgs/PointCloud2` | 현재 LiDAR point cloud |
+| `/tf` | `tf2_msgs/TFMessage` | TFv6 5-sweep motion compensation (`map` → `base_link`) |
+
+시각화용 `/lidar3D/BEV`는 선택한 모델과 무관하게 항상 발행한다. 카메라 BEV와 동일하게 전방 25 m, 좌우 총 30 m를 0.05 m/pixel로 표현하며, 크기는 600 x 500이고 encoding은 `mono8`이다. 이 토픽은 visualizer용이며 모델 추론 입력으로 사용하지 않는다.
+
+모델 추론용 LiDAR는 모델별 tensor 모양과 값 범위가 달라 별도의 namespace로 발행한다.
+
+| Model profile | Model input topic | Size (W x H) | Encoding / value | Processing |
+| --- | --- | --- | --- | --- |
+| TFv6 | `/lidar/tfv6/processed` | 384 x 320 | `32FC1`, density `[0, 1]` | 5-sweep motion compensation, ground removal |
+| InterFuser | `/lidar/interfuser/processed` | 224 x 224 | `32FC3`; below/above `[0, 1]`, total `[0, 2]` | height-separated histogram |
+| DiffusionDrive v2 | `/lidar/diffusiondrive_v2/processed` | 256 x 256 | `32FC1`, above-ground density `[0, 1]` | ground-relative histogram |
+| SparseDrive v2 | 발행하지 않음 | - | - | camera-only profile |
+
+좌표 변환에는 `config/0716demo.json`의 LiDAR 장착 위치 `(x=2.0, y=0.0, z=1.5)`를 사용한다. TFv6 profile에서는 `/tf`의 `map` → `base_link` 변환으로 과거 sweep을 현재 차량 좌표계에 정렬한다.
+
+카메라와 LiDAR의 `~model_profiles`는 launch 인자 하나로 함께 선택한다. 기본값 `raw`는 legacy 카메라 토픽과 시각화용 LiDAR BEV만 발행하고, `all`은 지원하는 모든 모델별 전처리 토픽을 활성화한다.
+
+```bash
+# 전체 preprocessing layer 실행
+roslaunch Validator_pkg camera_bev_pipeline.launch model_profiles:=all show_gui:=false
+
+# 모델 하나만 선택하는 예시
+roslaunch Validator_pkg camera_bev_pipeline.launch model_profiles:=tfv6 show_gui:=false
+```
+
+SparseDrive v2를 선택해도 `/lidar3D/BEV`는 시각화를 위해 발행하지만, SparseDrive 추론용 LiDAR 토픽은 만들지 않는다.
+
+#### 2.1.3 Camera/LiDAR BEV overlay validation
+
+`bev_overlay_viewer`는 `/image/BEV`와 `/lidar3D/BEV`를 header stamp 기준으로 동기화하고, LiDAR를 컬러로 변환해 카메라 위에 겹친 `/image/BEV_overlay`를 발행한다. 이 노드는 검증 전용이며 전처리 또는 모델 입력 토픽을 변경하지 않는다.
+
+| Output topic | Type | Purpose |
+| --- | --- | --- |
+| `/image/BEV_overlay` | `sensor_msgs/Image` (`bgr8`, 600 x 500) | synchronized camera/LiDAR overlay |
+| `/bev_overlay/header_delay_ms` | `std_msgs/Float32` | camera stamp - LiDAR stamp |
+| `/bev_overlay/arrival_delay_ms` | `std_msgs/Float32` | camera ROS arrival - LiDAR ROS arrival |
+
+음수 지연은 카메라가 LiDAR보다 먼저 기록되거나 도착했다는 뜻이고, 양수는 카메라가 나중이라는 뜻이다. arrival delay는 rosbag 재생 속도와 현재 컴퓨터의 처리 부하에도 영향을 받는다.
+
+전체 파이프라인과 오버레이 노드를 함께 실행한다.
+
+```bash
+roslaunch Validator_pkg camera_bev_pipeline.launch \
+  model_profiles:=all \
+  show_gui:=false \
+  enable_bev_overlay:=true
+```
+
+rosbag을 재생한 뒤 `rqt_image_view`에서 `/image/BEV_overlay`를 선택한다.
+
+```bash
+rqt_image_view
+```
+
+파이프라인을 별도로 실행한 상태에서는 오버레이 노드만 직접 실행할 수도 있다.
+
+```bash
+rosrun Validator_pkg bev_overlay_viewer.py
+```
 
 ### 2.2 inference layer
 `opt feeder`, `inference engine`, `recoder`로 구성됨.
