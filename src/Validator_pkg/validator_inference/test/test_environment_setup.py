@@ -1129,6 +1129,53 @@ def test_activate_candidate_cleans_temp_when_directory_fsync_fails(
     assert not list(paths.model_root.glob(".current.*"))
 
 
+def test_restore_current_snapshot_preserves_unrelated_link_raced_before_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """rollback isolation 직전 교체된 unrelated current를 덮어쓰지 않는다."""
+    project = tmp_path / "project"
+    project.mkdir()
+    paths = environment_paths(project, "tfv6")
+    old = create_candidate(paths, "old-build")
+    candidate = create_candidate(paths, "candidate-build")
+    unrelated = create_candidate(paths, "unrelated-build")
+    activate_candidate(paths, candidate)
+    real_rename = os.rename
+    raced = False
+
+    def replace_before_isolation(
+        source: str | bytes,
+        destination: str | bytes,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if source == "current" and src_dir_fd is not None and not raced:
+            raced = True
+            paths.current.unlink()
+            paths.current.symlink_to(Path("builds") / unrelated.name)
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(environment_setup.os, "rename", replace_before_isolation)
+
+    with pytest.raises(EnvironmentSetupError, match="changed|unrelated"):
+        environment_setup._restore_current_link_snapshot(
+            paths,
+            candidate,
+            (Path("builds") / old.name).as_posix(),
+        )
+
+    assert os.readlink(paths.current) == (
+        Path("builds") / unrelated.name
+    ).as_posix()
+
+
 def test_model_operation_lock_is_reentrant_across_lifecycle_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -3676,6 +3723,61 @@ def test_setup_diffusion_recreate_failure_restores_active_derivative_fingerprint
     assert inspection.valid is True
 
 
+def test_setup_diffusion_equal_recreate_inplace_mutation_restores_active_derivative(
+    tmp_path: Path,
+):
+    """equal recreate의 새 derivative가 in-place 변조돼도 old inode를 복구한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    derivative_status = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.git_status_output = derivative_status
+    first = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    derivative = root / _DIFFUSION_GENERATED_PATH
+    expected = first.state.assets[-1]
+    expected_inode = derivative.stat().st_ino
+    recreate_runner = _SetupRunner(
+        root, "diffusiondrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = derivative_status
+    recreate_runner.phase_hooks["model_load"] = lambda _command, _kwargs: (
+        derivative.write_bytes(derivative.read_bytes() + b"# concurrent mutation\n")
+    )
+    recreate_runner.fail_phase = "freeze"
+
+    with pytest.raises(EnvironmentSetupError, match="freeze"):
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=dependencies,
+        )
+
+    metadata = derivative.stat()
+    assert AssetFingerprint(
+        path=_DIFFUSION_GENERATED_PATH,
+        sha256=sha256_file(derivative),
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+    ) == expected
+    assert metadata.st_ino == expected_inode
+    assert environment_paths(root, "diffusiondrive_v2").current.resolve() == (
+        first.environment_dir
+    )
+
+
 def test_setup_diffusion_post_activation_verification_failure_rolls_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -3830,6 +3932,120 @@ def test_setup_diffusion_backup_cleanup_failure_keeps_successful_activation(
     ).is_file()
 
 
+def test_setup_finalize_runtime_error_is_success_warning_after_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """activation 뒤 ordinary finalize 오류는 성공 결과의 warning으로 반환한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    derivative_status = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.git_status_output = derivative_status
+    first = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+
+    def fail_finalize(
+        _transaction: environment_setup._DiffusionDerivativeTransaction,
+    ) -> None:
+        raise RuntimeError("forced ordinary finalize failure")
+
+    monkeypatch.setattr(
+        environment_setup._DiffusionDerivativeTransaction,
+        "finalize_commit",
+        fail_finalize,
+    )
+    recreate_runner = _SetupRunner(
+        root, "diffusiondrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = derivative_status
+
+    result = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        recreate=True,
+        runner=recreate_runner,
+        dependencies=dependencies,
+    )
+
+    assert result.changed is True
+    assert environment_paths(root, "diffusiondrive_v2").current.resolve() == (
+        result.environment_dir
+    )
+    assert any(
+        "generated artifact backup cleanup deferred" in warning
+        and "forced ordinary finalize failure" in warning
+        for warning in result.warnings
+    )
+
+
+@pytest.mark.parametrize(
+    "control_error",
+    (KeyboardInterrupt(), SystemExit(9)),
+    ids=("keyboard-interrupt", "system-exit"),
+)
+def test_setup_finalize_control_exception_propagates_after_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_error: BaseException,
+):
+    """activation 뒤 process control 예외는 cleanup warning으로 삼키지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    derivative_status = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.git_status_output = derivative_status
+    first = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+
+    def abort_finalize(
+        _transaction: environment_setup._DiffusionDerivativeTransaction,
+    ) -> None:
+        raise control_error
+
+    monkeypatch.setattr(
+        environment_setup._DiffusionDerivativeTransaction,
+        "finalize_commit",
+        abort_finalize,
+    )
+    recreate_runner = _SetupRunner(
+        root, "diffusiondrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = derivative_status
+
+    with pytest.raises(type(control_error)):
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=dependencies,
+        )
+
+    assert environment_paths(root, "diffusiondrive_v2").current.resolve() == (
+        environment_paths(root, "diffusiondrive_v2").builds / "build-002"
+    )
+
+
 def test_setup_diffusion_fresh_failure_removes_generated_derivative(tmp_path: Path):
     """active derivative가 없는 fresh setup failure는 생성 파일을 철회한다."""
     root, dependencies, runner, _ = _setup_fixture(
@@ -3853,6 +4069,52 @@ def test_setup_diffusion_fresh_failure_removes_generated_derivative(tmp_path: Pa
 
     assert not (root / _DIFFUSION_GENERATED_PATH).exists()
     assert not environment_paths(root, "diffusiondrive_v2").current.exists()
+
+
+def test_setup_diffusion_fresh_cleanup_fsync_failure_finishes_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """fresh derivative 삭제 fsync 실패도 canonical과 backup을 정리한 뒤 보고한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    runner.git_status_output = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    armed = False
+    failed = False
+    real_fsync = os.fsync
+
+    def arm_cleanup(_command: tuple[str, ...], _kwargs: dict[str, Any]) -> None:
+        nonlocal armed
+        armed = True
+
+    def fail_first_cleanup_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if armed and not failed:
+            failed = True
+            raise OSError("forced generated cleanup fsync failure")
+        real_fsync(descriptor)
+
+    runner.phase_hooks["model_load"] = arm_cleanup
+    runner.fail_phase = "freeze"
+    monkeypatch.setattr(environment_setup.os, "fsync", fail_first_cleanup_fsync)
+
+    with pytest.raises(EnvironmentSetupError, match="quarantine"):
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    paths = environment_paths(root, "diffusiondrive_v2")
+    assert not (root / _DIFFUSION_GENERATED_PATH).exists()
+    assert not paths.current.exists()
+    assert not tuple(paths.model_root.glob(".diffusion-derivative-backup.*"))
 
 
 def test_setup_sparse_state_fingerprints_exact_built_extensions(tmp_path: Path):
@@ -4273,6 +4535,84 @@ def test_setup_sparse_recreate_failure_restores_active_extension_fingerprints(
     assert observed == expected
     assert paths.current.resolve() == first.environment_dir
     assert inspection.valid is True
+
+
+def test_setup_sparse_cleanup_unlink_failure_restores_active_extensions_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """new output quarantine cleanup 실패 뒤에도 old pair와 current를 복구한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="sparsedrive_v2",
+        strip_asset_hashes=True,
+    )
+    extension_status = "".join(
+        f"?? {path.relative_to('models/sources/sparsedrive_v2').as_posix()}\n"
+        for path in _SPARSE_EXTENSION_PATHS
+    )
+    runner.post_sparse_git_status_output = extension_status
+    first = setup_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    expected = first.state.assets[-len(_SPARSE_EXTENSION_PATHS) :]
+    recreate_runner = _SetupRunner(
+        root, "sparsedrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = extension_status
+    recreate_runner.post_sparse_git_status_output = extension_status
+    armed = False
+    real_unlink = os.unlink
+
+    def arm_cleanup(_command: tuple[str, ...], _kwargs: dict[str, Any]) -> None:
+        nonlocal armed
+        armed = True
+
+    def fail_first_quarantine_unlink(
+        path: str | bytes,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal armed
+        if (
+            armed
+            and isinstance(path, str)
+            and path.startswith(".validator-remove.")
+            and kwargs.get("dir_fd") is not None
+        ):
+            armed = False
+            raise OSError("forced quarantine unlink failure")
+        real_unlink(path, *args, **kwargs)
+
+    recreate_runner.phase_hooks["model_load"] = arm_cleanup
+    recreate_runner.fail_phase = "freeze"
+    monkeypatch.setattr(environment_setup.os, "unlink", fail_first_quarantine_unlink)
+
+    with pytest.raises(EnvironmentSetupError, match="quarantine"):
+        setup_environment(
+            root,
+            "sparsedrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=dependencies,
+        )
+
+    observed = tuple(
+        AssetFingerprint(
+            path=fingerprint.path,
+            sha256=sha256_file(root / fingerprint.path),
+            size=(root / fingerprint.path).stat().st_size,
+            mtime_ns=(root / fingerprint.path).stat().st_mtime_ns,
+        )
+        for fingerprint in expected
+    )
+    assert observed == expected
+    assert environment_paths(root, "sparsedrive_v2").current.resolve() == (
+        first.environment_dir
+    )
 
 
 def test_setup_sparse_fresh_failure_removes_generated_extensions(tmp_path: Path):

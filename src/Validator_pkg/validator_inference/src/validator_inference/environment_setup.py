@@ -3390,73 +3390,188 @@ def _current_link_snapshot(paths: EnvironmentPaths) -> Optional[str]:
     return None
 
 
+def _opened_current_link(
+    model_descriptor: int, action: str
+) -> Optional[tuple[str, os.stat_result]]:
+    """model root dirfd의 current symlink target과 no-follow identity를 읽는다."""
+    try:
+        metadata = os.stat(
+            "current", dir_fd=model_descriptor, follow_symlinks=False
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, "cannot inspect current during rollback"
+        ) from exc
+    if not stat.S_ISLNK(metadata.st_mode):
+        _raise(action, "current was replaced during rollback; preserving it")
+    try:
+        return os.readlink("current", dir_fd=model_descriptor), metadata
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, "cannot read current during rollback"
+        ) from exc
+
+
+def _restore_isolated_current_entry(
+    model_descriptor: int,
+    isolated_name: str,
+    expected: os.stat_result,
+    action: str,
+) -> None:
+    """격리된 concurrent current를 no-replace hardlink로 canonical 이름에 복원한다."""
+    try:
+        isolated = os.stat(
+            isolated_name,
+            dir_fd=model_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_sparse_entry_identity(isolated, expected):
+            _raise(action, "isolated current changed during rollback; preserving it")
+        os.link(
+            isolated_name,
+            "current",
+            src_dir_fd=model_descriptor,
+            dst_dir_fd=model_descriptor,
+            follow_symlinks=False,
+        )
+        restored = os.stat(
+            "current", dir_fd=model_descriptor, follow_symlinks=False
+        )
+        if not _same_sparse_entry_identity(restored, isolated):
+            _raise(action, "restored current changed during rollback; preserving it")
+        os.unlink(isolated_name, dir_fd=model_descriptor)
+        os.fsync(model_descriptor)
+    except EnvironmentSetupError:
+        raise
+    except FileExistsError as exc:
+        raise EnvironmentSetupError(
+            action,
+            "another current appeared during rollback; preserving both entries",
+        ) from exc
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, "cannot restore current changed during rollback"
+        ) from exc
+
+
 def _restore_current_link_snapshot(
     paths: EnvironmentPaths,
     candidate: Path,
     snapshot: Optional[str],
 ) -> None:
-    """activation failure가 current를 바꿨다면 transaction 이전 target을 복원한다."""
-    current = Path(paths.current)
-    if current.is_symlink():
+    """current를 격리·검증하고 unrelated replacement를 덮지 않으며 복원한다."""
+    action = "sparse_extensions"
+    candidate_target = (Path("builds") / candidate.name).as_posix()
+    model_root = Path(paths.model_root)
+    model_descriptor = _duplicate_secure_directory(
+        model_root, action, "model root directory"
+    )
+    try:
+        entry = _opened_current_link(model_descriptor, action)
+        observed = entry[0] if entry is not None else None
+        if observed == snapshot:
+            return
+        if observed not in {None, candidate_target}:
+            _raise(
+                action,
+                "current changed to an unrelated target during rollback; preserving it",
+            )
+        if entry is None:
+            if snapshot is None:
+                return
+            try:
+                os.symlink(snapshot, "current", dir_fd=model_descriptor)
+                os.fsync(model_descriptor)
+            except FileExistsError as exc:
+                raise EnvironmentSetupError(
+                    action,
+                    "another current appeared during rollback; preserving it",
+                ) from exc
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    action, "cannot restore missing current during rollback"
+                ) from exc
+            return
+
+        isolated_name = _unused_sparse_entry_name(
+            model_descriptor,
+            "current-rollback",
+            action=action,
+            context="current rollback",
+        )
         try:
-            observed: Optional[str] = os.readlink(str(current))
+            os.rename(
+                "current",
+                isolated_name,
+                src_dir_fd=model_descriptor,
+                dst_dir_fd=model_descriptor,
+            )
+            isolated = os.stat(
+                isolated_name,
+                dir_fd=model_descriptor,
+                follow_symlinks=False,
+            )
+            isolated_target = (
+                os.readlink(isolated_name, dir_fd=model_descriptor)
+                if stat.S_ISLNK(isolated.st_mode)
+                else None
+            )
         except OSError as exc:
             raise EnvironmentSetupError(
-                "sparse_extensions", "cannot inspect current during rollback"
+                action, "cannot isolate current during rollback"
             ) from exc
-    elif current.exists():
-        _raise(
-            "sparse_extensions",
-            "current was replaced during SparseDrive rollback; preserving it",
-        )
-    else:
-        observed = None
-    if observed == snapshot:
-        return
-    candidate_target = (Path("builds") / candidate.name).as_posix()
-    if observed not in {None, candidate_target}:
-        _raise(
-            "sparse_extensions",
-            "current changed to an unrelated target during rollback; preserving it",
-        )
-    model_root = Path(paths.model_root)
-    try:
-        if snapshot is None:
-            if observed == candidate_target:
-                current.unlink()
-                _fsync_directory(
-                    model_root, "sparse_extensions", "model root directory"
-                )
-            return
-        temporary: Optional[Path] = None
-        for _attempt in range(32):
-            value = model_root / f".current.rollback.{secrets.token_hex(8)}"
-            try:
-                os.symlink(snapshot, str(value))
-                temporary = value
-                break
-            except FileExistsError:
-                continue
-        if temporary is None:
-            _raise("sparse_extensions", "cannot allocate rollback current symlink")
-        try:
-            os.replace(str(temporary), str(current))
-            temporary = None
-            _fsync_directory(
-                model_root, "sparse_extensions", "model root directory"
+        if (
+            not _same_sparse_entry_identity(isolated, entry[1])
+            or isolated_target != candidate_target
+        ):
+            _restore_isolated_current_entry(
+                model_descriptor, isolated_name, isolated, action
             )
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
-    except EnvironmentSetupError:
-        raise
-    except OSError as exc:
-        raise EnvironmentSetupError(
-            "sparse_extensions", "cannot restore current after SparseDrive failure"
-        ) from exc
+            _raise(
+                action,
+                "current changed to an unrelated target during rollback; preserving it",
+            )
+
+        conflict: Optional[EnvironmentSetupError] = None
+        if snapshot is None:
+            if _opened_current_link(model_descriptor, action) is not None:
+                conflict = EnvironmentSetupError(
+                    action,
+                    "another current appeared during rollback; preserving it",
+                )
+        else:
+            try:
+                os.symlink(snapshot, "current", dir_fd=model_descriptor)
+            except FileExistsError:
+                conflict = EnvironmentSetupError(
+                    action,
+                    "another current appeared during rollback; preserving it",
+                )
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    action, "cannot restore current snapshot"
+                ) from exc
+        try:
+            _remove_generated_leaf(
+                model_descriptor,
+                isolated_name,
+                isolated,
+                action,
+                "isolated candidate current link",
+            )
+        except Exception as cleanup_error:
+            if conflict is not None:
+                raise conflict from cleanup_error
+            raise
+        if conflict is not None:
+            raise conflict
+    finally:
+        try:
+            os.close(model_descriptor)
+        except OSError:
+            pass
 
 
 @dataclass
@@ -3696,10 +3811,26 @@ class _SparseExtensionTransaction:
                 f"cannot preserve replaced SparseDrive extension: {name}",
             ) from exc
 
-    def _remove_or_preserve_outputs(self) -> tuple[str, ...]:
-        """owned unchanged output만 삭제하고 replacement/unknown entry는 보존한다."""
+    def _preserve_current_entry_if_present(self, name: str) -> Optional[str]:
+        """cleanup 뒤 canonical entry가 여전히 있을 때만 별도 이름으로 보존한다."""
+        try:
+            os.stat(name, dir_fd=self.ops_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "sparse_extensions",
+                f"cannot inspect SparseDrive extension after cleanup: {name}",
+            ) from exc
+        return self._preserve_current_entry(name)
+
+    def _remove_or_preserve_outputs(
+        self,
+    ) -> tuple[tuple[str, ...], tuple[Exception, ...]]:
+        """owned output cleanup 오류를 모으고 남은 canonical entry만 보존한다."""
         expected_by_name = {record.name: record for record in self.owned}
         preserved: list[str] = []
+        errors: list[Exception] = []
         current_names = tuple(
             name
             for _module, names in _sparse_extension_names(
@@ -3734,11 +3865,18 @@ class _SparseExtensionTransaction:
                             _remove_sparse_build_leaf(
                                 self.ops_descriptor, name, metadata
                             )
-                except EnvironmentSetupError:
-                    matches = False
-            if not matches:
-                preserved.append(self._preserve_current_entry(name))
-        return tuple(preserved)
+                except Exception as exc:
+                    errors.append(exc)
+            if matches and not errors:
+                continue
+            try:
+                selected = self._preserve_current_entry_if_present(name)
+            except Exception as exc:
+                errors.append(exc)
+            else:
+                if selected is not None:
+                    preserved.append(selected)
+        return tuple(preserved), tuple(errors)
 
     def _restore_baseline(self) -> None:
         """backup의 authenticated old pair를 original inode 그대로 canonical name에 둔다."""
@@ -3847,20 +3985,42 @@ class _SparseExtensionTransaction:
         if self.finished:
             return
         preserved: tuple[str, ...] = ()
+        cleanup_errors: list[Exception] = []
         if self.build_started:
-            preserved = self._remove_or_preserve_outputs()
-        self._restore_baseline()
-        _restore_current_link_snapshot(
-            self.preflight.paths, self.candidate, self.current_snapshot
-        )
-        self._finish_backup_directory()
-        self.finished = True
+            try:
+                preserved, errors = self._remove_or_preserve_outputs()
+                cleanup_errors.extend(errors)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        recovery_errors: list[Exception] = []
+        for operation in (
+            self._restore_baseline,
+            lambda: _restore_current_link_snapshot(
+                self.preflight.paths, self.candidate, self.current_snapshot
+            ),
+        ):
+            try:
+                operation()
+            except Exception as exc:
+                recovery_errors.append(exc)
+        try:
+            self._finish_backup_directory()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        if not recovery_errors:
+            self.finished = True
+        if recovery_errors:
+            raise recovery_errors[0]
         if preserved:
-            _raise(
-                "sparse_extensions",
-                "replaced SparseDrive outputs were preserved during rollback: "
-                + ", ".join(preserved),
+            cleanup_errors.append(
+                EnvironmentSetupError(
+                    "sparse_extensions",
+                    "replaced SparseDrive outputs were preserved during rollback: "
+                    + ", ".join(preserved),
+                )
             )
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     def _verified_backup_metadata(
         self,
@@ -4036,7 +4196,7 @@ def _begin_sparse_extension_transaction(
 
 @dataclass
 class _DiffusionDerivativeTransaction:
-    """generated derivative의 pre-fetch hardlink backup과 activation rollback을 관리한다."""
+    """generated derivative의 pre-fetch move backup과 activation rollback을 관리한다."""
 
     preflight: EnvironmentPreflight
     derivative_path: Path
@@ -4100,7 +4260,7 @@ class _DiffusionDerivativeTransaction:
         )
 
     def backup_existing(self, active_state: Optional[EnvironmentState]) -> None:
-        """기존 derivative를 검증하고 같은 inode hardlink를 private backup에 둔다."""
+        """기존 derivative를 검증하고 original inode를 private backup으로 옮긴다."""
         try:
             path_metadata = self.derivative_path.lstat()
         except FileNotFoundError:
@@ -4137,14 +4297,16 @@ class _DiffusionDerivativeTransaction:
                         "diffusion_derivative",
                         "existing DiffusionDrive derivative does not match active state SHA",
                     )
+            self.baseline_fingerprint = fingerprint
+            self.baseline_identity = identity
             try:
-                os.link(
+                os.rename(
                     self.derivative_path.name,
                     self.derivative_path.name,
                     src_dir_fd=parent_descriptor,
                     dst_dir_fd=self.backup_descriptor,
-                    follow_symlinks=False,
                 )
+                self.backup_present = True
                 backup_metadata = os.stat(
                     self.derivative_path.name,
                     dir_fd=self.backup_descriptor,
@@ -4153,16 +4315,13 @@ class _DiffusionDerivativeTransaction:
             except OSError as exc:
                 raise EnvironmentSetupError(
                     "diffusion_derivative",
-                    "cannot create DiffusionDrive derivative rollback link",
+                    "cannot move DiffusionDrive derivative to rollback backup",
                 ) from exc
             if not _same_sparse_entry_identity(metadata, backup_metadata):
                 _raise(
                     "diffusion_derivative",
-                    "DiffusionDrive derivative changed while creating rollback link",
+                    "DiffusionDrive derivative changed while creating rollback backup",
                 )
-            self.baseline_fingerprint = fingerprint
-            self.baseline_identity = identity
-            self.backup_present = True
         try:
             os.fsync(parent_descriptor)
             os.fsync(self.backup_descriptor)
@@ -4173,7 +4332,7 @@ class _DiffusionDerivativeTransaction:
             ) from exc
 
     def _verify_backup(self) -> tuple[os.stat_result, AssetFingerprint]:
-        """private hardlink가 original baseline bytes/metadata를 유지하는지 확인한다."""
+        """private backup이 original baseline bytes/metadata를 유지하는지 확인한다."""
         if (
             not self.backup_present
             or self.baseline_fingerprint is None
@@ -4264,6 +4423,24 @@ class _DiffusionDerivativeTransaction:
                 "diffusion_derivative", "cannot preserve replaced derivative"
             ) from exc
 
+    def _preserve_current_if_present(self) -> Optional[str]:
+        """cleanup 뒤 canonical derivative가 남아 있을 때만 별도 이름으로 보존한다."""
+        parent_descriptor = self._ensure_parent_descriptor()
+        try:
+            os.stat(
+                self.derivative_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative",
+                "cannot inspect derivative after cleanup",
+            ) from exc
+        return self._preserve_current()
+
     def _current_snapshot(
         self,
     ) -> Optional[tuple[os.stat_result, AssetFingerprint]]:
@@ -4280,7 +4457,7 @@ class _DiffusionDerivativeTransaction:
             return metadata, fingerprint
 
     def _remove_backup_link(self) -> None:
-        """verified old hardlink만 quarantine identity check 뒤 제거한다."""
+        """verified old backup만 quarantine identity check 뒤 제거한다."""
         metadata, _ = self._verify_backup()
         _remove_generated_leaf(
             self.backup_descriptor,
@@ -4292,7 +4469,7 @@ class _DiffusionDerivativeTransaction:
         self.backup_present = False
 
     def _restore_baseline(self) -> None:
-        """backup hardlink를 canonical name으로 rename해 original inode를 복원한다."""
+        """backup을 canonical name으로 rename해 original inode를 복원한다."""
         self._verify_backup()
         parent_descriptor = self._ensure_parent_descriptor()
         try:
@@ -4364,8 +4541,14 @@ class _DiffusionDerivativeTransaction:
         """failed setup output을 철회하고 old derivative/current target을 복원한다."""
         if self.finished:
             return
-        self.capture_if_present()
-        current = self._current_snapshot()
+        cleanup_errors: list[Exception] = []
+        recovery_errors: list[Exception] = []
+        try:
+            self.capture_if_present()
+            current = self._current_snapshot()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+            current = None
         baseline_is_current = False
         owned_is_current = False
         if current is not None:
@@ -4392,34 +4575,65 @@ class _DiffusionDerivativeTransaction:
                 )
             if not baseline_is_current:
                 if owned_is_current:
-                    _remove_generated_leaf(
-                        self._ensure_parent_descriptor(),
-                        self.derivative_path.name,
-                        metadata,
-                        "diffusion_derivative",
-                        "generated DiffusionDrive derivative",
-                    )
+                    try:
+                        _remove_generated_leaf(
+                            self._ensure_parent_descriptor(),
+                            self.derivative_path.name,
+                            metadata,
+                            "diffusion_derivative",
+                            "generated DiffusionDrive derivative",
+                        )
+                    except Exception as exc:
+                        cleanup_errors.append(exc)
+                        try:
+                            self._preserve_current_if_present()
+                        except Exception as preserve_error:
+                            cleanup_errors.append(preserve_error)
                 else:
-                    self._preserve_current()
+                    try:
+                        self._preserve_current()
+                    except Exception as exc:
+                        cleanup_errors.append(exc)
         if self.backup_present:
             if baseline_is_current:
-                self._remove_backup_link()
+                try:
+                    self._remove_backup_link()
+                except Exception as exc:
+                    cleanup_errors.append(exc)
             else:
-                self._restore_baseline()
-        if self.candidate is None:
-            current = Path(self.preflight.paths.current)
-            observed = os.readlink(str(current)) if current.is_symlink() else None
-            if observed != self.current_snapshot:
-                _raise(
-                    "diffusion_derivative",
-                    "current changed before derivative candidate was created",
+                try:
+                    self._restore_baseline()
+                except Exception as exc:
+                    recovery_errors.append(exc)
+        try:
+            if self.candidate is None:
+                current_link = Path(self.preflight.paths.current)
+                observed = (
+                    os.readlink(str(current_link))
+                    if current_link.is_symlink()
+                    else None
                 )
-        else:
-            _restore_current_link_snapshot(
-                self.preflight.paths, self.candidate, self.current_snapshot
-            )
-        self._finish_backup_directory()
-        self.finished = True
+                if observed != self.current_snapshot:
+                    _raise(
+                        "diffusion_derivative",
+                        "current changed before derivative candidate was created",
+                    )
+            else:
+                _restore_current_link_snapshot(
+                    self.preflight.paths, self.candidate, self.current_snapshot
+                )
+        except Exception as exc:
+            recovery_errors.append(exc)
+        try:
+            self._finish_backup_directory()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        if not recovery_errors:
+            self.finished = True
+        if recovery_errors:
+            raise recovery_errors[0]
+        if cleanup_errors:
+            raise cleanup_errors[0]
 
     def prepare_commit(self) -> None:
         """captured derivative와 rollback link를 폐기 전 재검증한다."""
@@ -4445,7 +4659,7 @@ class _DiffusionDerivativeTransaction:
             self._verify_backup()
 
     def finalize_commit(self) -> None:
-        """logical activation 성공 뒤 old derivative hardlink만 폐기한다."""
+        """logical activation 성공 뒤 old derivative backup만 폐기한다."""
         if self.finished:
             _raise("diffusion_derivative", "derivative transaction already finished")
         if self.backup_present:
@@ -5858,7 +6072,7 @@ def setup_environment(
                 if transaction is not None:
                     try:
                         transaction.finalize_commit()
-                    except EnvironmentSetupError as exc:
+                    except Exception as exc:
                         cleanup_warnings.append(
                             "generated artifact backup cleanup deferred: " + str(exc)
                         )
