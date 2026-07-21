@@ -2940,7 +2940,11 @@ def _setup_fixture(
                 / "diffusiondrivev2_model_sel_inference.py"
             )
             derivative.parent.mkdir(parents=True, exist_ok=True)
-            derivative.write_text("DERIVATIVE = True\n", encoding="utf-8")
+            payload = b"DERIVATIVE = True\n"
+            if not derivative.exists() or derivative.read_bytes() != payload:
+                replacement = derivative.with_name(derivative.name + ".generated")
+                replacement.write_bytes(payload)
+                os.replace(replacement, derivative)
         return project_root / "models" / model_id / "asset-manifest.json"
 
     def asset_verifier(
@@ -3509,6 +3513,263 @@ def test_setup_diffusion_state_fingerprints_derivative_and_reuse_rejects_tamper(
     assert environment_paths(root, "diffusiondrive_v2").current.resolve() == (
         first.environment_dir
     )
+
+
+def test_setup_diffusion_recreate_failure_restores_active_derivative_fingerprint(
+    tmp_path: Path,
+):
+    """changed derivative 뒤 model failure는 old inode/mtime/content를 복구한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    derivative_status = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.git_status_output = derivative_status
+    first = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    expected = first.state.assets[-1]
+    derivative = root / _DIFFUSION_GENERATED_PATH
+    expected_inode = derivative.stat().st_ino
+
+    def publish_changed_derivative(
+        profile: dict[str, Any], *, model_id: str, project_root: Path
+    ) -> Path:
+        assert model_id == "diffusiondrive_v2"
+        replacement = derivative.with_name(derivative.name + ".changed")
+        replacement.write_text("DERIVATIVE = 'changed'\n", encoding="utf-8")
+        os.replace(replacement, derivative)
+        return project_root / "models" / profile["id"] / "asset-manifest.json"
+
+    changed_dependencies = dataclasses.replace(
+        dependencies, asset_fetcher=publish_changed_derivative
+    )
+    recreate_runner = _SetupRunner(
+        root, "diffusiondrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = derivative_status
+    recreate_runner.fail_phase = "model_load"
+
+    with pytest.raises(EnvironmentSetupError, match="model_load"):
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=changed_dependencies,
+        )
+
+    metadata = derivative.stat()
+    observed = AssetFingerprint(
+        path=_DIFFUSION_GENERATED_PATH,
+        sha256=sha256_file(derivative),
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+    )
+    inspection_preflight = preflight_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=_SetupRunner(
+            root, "diffusiondrive_v2", first.state.python_version
+        ),
+        dependencies=dependencies.preflight_dependencies,
+    )
+    inspection = environment_setup.inspect_active_environment(
+        inspection_preflight.paths,
+        inspection_preflight.definition,
+        sha256_file(inspection_preflight.manifest.manifest_path),
+    )
+    assert observed == expected
+    assert derivative.stat().st_ino == expected_inode
+    assert inspection_preflight.paths.current.resolve() == first.environment_dir
+    assert inspection.valid is True
+
+
+def test_setup_diffusion_post_activation_verification_failure_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """activation 뒤 derivative 변조도 old derivative/current로 rollback한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    derivative_status = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.git_status_output = derivative_status
+    first = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    derivative = root / _DIFFUSION_GENERATED_PATH
+    expected = first.state.assets[-1]
+    expected_inode = derivative.stat().st_ino
+
+    def publish_changed_derivative(
+        profile: dict[str, Any], *, model_id: str, project_root: Path
+    ) -> Path:
+        assert model_id == "diffusiondrive_v2"
+        replacement = derivative.with_name(derivative.name + ".changed")
+        replacement.write_text("DERIVATIVE = 'changed'\n", encoding="utf-8")
+        os.replace(replacement, derivative)
+        return project_root / "models" / profile["id"] / "asset-manifest.json"
+
+    real_activate = environment_setup.activate_candidate
+
+    def activate_then_mutate(paths: EnvironmentPaths, candidate: Path) -> None:
+        real_activate(paths, candidate)
+        derivative.write_bytes(derivative.read_bytes() + b"# post activation\n")
+
+    monkeypatch.setattr(
+        environment_setup, "activate_candidate", activate_then_mutate
+    )
+    changed_dependencies = dataclasses.replace(
+        dependencies, asset_fetcher=publish_changed_derivative
+    )
+    recreate_runner = _SetupRunner(
+        root, "diffusiondrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = derivative_status
+
+    with pytest.raises(EnvironmentSetupError, match="changed before transaction commit"):
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            recreate=True,
+            runner=recreate_runner,
+            dependencies=changed_dependencies,
+        )
+
+    metadata = derivative.stat()
+    observed = AssetFingerprint(
+        path=_DIFFUSION_GENERATED_PATH,
+        sha256=sha256_file(derivative),
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+    )
+    inspection_preflight = preflight_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=_SetupRunner(
+            root, "diffusiondrive_v2", first.state.python_version
+        ),
+        dependencies=dependencies.preflight_dependencies,
+    )
+    inspection = environment_setup.inspect_active_environment(
+        inspection_preflight.paths,
+        inspection_preflight.definition,
+        sha256_file(inspection_preflight.manifest.manifest_path),
+    )
+    assert observed == expected
+    assert derivative.stat().st_ino == expected_inode
+    assert inspection_preflight.paths.current.resolve() == first.environment_dir
+    assert inspection.valid is True
+
+
+def test_setup_diffusion_backup_cleanup_failure_keeps_successful_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """logical activation 뒤 backup cleanup 실패는 warning과 backup을 남긴다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    derivative_status = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.git_status_output = derivative_status
+    first = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+
+    def fail_backup_cleanup(
+        transaction: environment_setup._DiffusionDerivativeTransaction,
+    ) -> None:
+        raise EnvironmentSetupError(
+            "diffusion_derivative", "forced backup cleanup failure"
+        )
+
+    monkeypatch.setattr(
+        environment_setup._DiffusionDerivativeTransaction,
+        "_remove_backup_link",
+        fail_backup_cleanup,
+    )
+    recreate_runner = _SetupRunner(
+        root, "diffusiondrive_v2", first.state.python_version
+    )
+    recreate_runner.source_commit = first.state.source_commit
+    recreate_runner.git_status_output = derivative_status
+
+    result = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        recreate=True,
+        runner=recreate_runner,
+        dependencies=dependencies,
+    )
+
+    backup_directories = tuple(
+        environment_paths(root, "diffusiondrive_v2").model_root.glob(
+            ".diffusion-derivative-backup.*"
+        )
+    )
+    assert result.changed is True
+    assert environment_paths(root, "diffusiondrive_v2").current.resolve() == (
+        result.environment_dir
+    )
+    assert any(
+        "generated artifact backup cleanup deferred" in warning
+        and "forced backup cleanup failure" in warning
+        for warning in result.warnings
+    )
+    assert len(backup_directories) == 1
+    assert (
+        backup_directories[0]
+        / "diffusiondrivev2_model_sel_inference.py"
+    ).is_file()
+
+
+def test_setup_diffusion_fresh_failure_removes_generated_derivative(tmp_path: Path):
+    """active derivative가 없는 fresh setup failure는 생성 파일을 철회한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    runner.git_status_output = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+    runner.fail_phase = "model_load"
+
+    with pytest.raises(EnvironmentSetupError, match="model_load"):
+        setup_environment(
+            root,
+            "diffusiondrive_v2",
+            runner=runner,
+            dependencies=dependencies,
+        )
+
+    assert not (root / _DIFFUSION_GENERATED_PATH).exists()
+    assert not environment_paths(root, "diffusiondrive_v2").current.exists()
 
 
 def test_setup_sparse_state_fingerprints_exact_built_extensions(tmp_path: Path):

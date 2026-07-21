@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from validator_inference import assets
 from validator_inference.assets import (
     AssetError,
     fetch_runtime_assets,
@@ -34,6 +35,46 @@ MODEL_TYPES = {
 }
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = PACKAGE_ROOT.parent / "config" / "profile.json"
+
+
+def test_generated_asset_publication_preserves_equal_file_identity(tmp_path):
+    destination = tmp_path / "generated.py"
+    payload = b"VALUE = 1\n"
+    destination.write_bytes(payload)
+    before = destination.stat()
+
+    assets._publish_generated_bytes(destination, payload)
+
+    after = destination.stat()
+    assert destination.read_bytes() == payload
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+def test_generated_asset_publication_atomically_replaces_changed_bytes(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "generated.py"
+    destination.write_bytes(b"VALUE = 1\n")
+    real_replace = os.replace
+    replacements = []
+
+    def record_replace(source, target):
+        replacements.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    monkeypatch.setattr(assets.os, "replace", record_replace)
+
+    assets._publish_generated_bytes(destination, b"VALUE = 2\n")
+
+    assert destination.read_bytes() == b"VALUE = 2\n"
+    assert len(replacements) == 1
+    assert replacements[0][1] == destination
+    assert replacements[0][0].parent == destination.parent
 
 
 def _selected(model_id, data=None):

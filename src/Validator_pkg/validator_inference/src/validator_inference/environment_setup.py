@@ -3795,8 +3795,40 @@ class _SparseExtensionTransaction:
                 + ", ".join(preserved),
             )
 
-    def commit(self) -> None:
-        """새 active output을 재검증하고 더 이상 필요한 old backup을 폐기한다."""
+    def _verified_backup_metadata(
+        self,
+        path: Path,
+        expected_fingerprint: AssetFingerprint,
+        expected_identity: tuple[int, int, int],
+    ) -> os.stat_result:
+        """private backup entry가 authenticated baseline인지 확인한다."""
+        name = path.name
+        with _open_sparse_regular_entry(
+            self.backup_descriptor,
+            name,
+            path,
+            "sparse_extensions",
+        ) as (_, metadata, fingerprint):
+            identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mtime_ns,
+            )
+            if not _sparse_extension_matches(
+                metadata,
+                fingerprint,
+                identity,
+                expected_fingerprint,
+                expected_identity,
+            ):
+                _raise(
+                    "sparse_extensions",
+                    f"SparseDrive extension backup changed before commit: {name}",
+                )
+            return metadata
+
+    def prepare_commit(self) -> None:
+        """새 output과 rollback backup을 폐기 전 재검증한다."""
         if self.finished:
             _raise("sparse_extensions", "SparseDrive transaction already finished")
         self.verified_outputs(tuple(record.path for record in self.owned))
@@ -3808,31 +3840,26 @@ class _SparseExtensionTransaction:
             name = path.name
             if name not in self.backup_names:
                 continue
-            with _open_sparse_regular_entry(
-                self.backup_descriptor,
-                name,
-                path,
-                "sparse_extensions",
-            ) as (_, metadata, fingerprint):
-                identity = (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                    metadata.st_mtime_ns,
-                )
-                if not _sparse_extension_matches(
-                    metadata,
-                    fingerprint,
-                    identity,
-                    expected_fingerprint,
-                    expected_identity,
-                ):
-                    _raise(
-                        "sparse_extensions",
-                        f"SparseDrive extension backup changed before commit: {name}",
-                    )
-                _remove_sparse_build_leaf(
-                    self.backup_descriptor, name, metadata
-                )
+            self._verified_backup_metadata(
+                path, expected_fingerprint, expected_identity
+            )
+
+    def finalize_commit(self) -> None:
+        """logical activation 성공 뒤 authenticated old backup만 폐기한다."""
+        if self.finished:
+            _raise("sparse_extensions", "SparseDrive transaction already finished")
+        for path, expected_fingerprint, expected_identity in zip(
+            self.baseline.paths,
+            self.baseline.fingerprints,
+            self.baseline.identities,
+        ):
+            name = path.name
+            if name not in self.backup_names:
+                continue
+            metadata = self._verified_backup_metadata(
+                path, expected_fingerprint, expected_identity
+            )
+            _remove_sparse_build_leaf(self.backup_descriptor, name, metadata)
             self.backup_names.remove(name)
         self._finish_backup_directory()
         self.finished = True
@@ -3935,6 +3962,508 @@ def _begin_sparse_extension_transaction(
             if ops_descriptor is not None:
                 try:
                     os.close(ops_descriptor)
+                except OSError:
+                    pass
+        raise
+
+
+@dataclass
+class _DiffusionDerivativeTransaction:
+    """generated derivative의 pre-fetch hardlink backup과 activation rollback을 관리한다."""
+
+    preflight: EnvironmentPreflight
+    derivative_path: Path
+    derivative_relative: Path
+    model_descriptor: int
+    backup_descriptor: int
+    backup_name: str
+    backup_metadata: os.stat_result
+    current_snapshot: Optional[str]
+    parent_descriptor: Optional[int] = None
+    baseline_fingerprint: Optional[AssetFingerprint] = None
+    baseline_identity: Optional[tuple[int, int, int]] = None
+    backup_present: bool = False
+    captured_fingerprint: Optional[AssetFingerprint] = None
+    captured_identity: Optional[tuple[int, int, int]] = None
+    captured: bool = False
+    candidate: Optional[Path] = None
+    finished: bool = False
+    closed: bool = False
+
+    def _ensure_parent_descriptor(self) -> int:
+        """derivative parent를 component no-follow로 한 번 열어 transaction 동안 유지한다."""
+        if self.parent_descriptor is None:
+            self.parent_descriptor = _duplicate_secure_directory(
+                self.derivative_path.parent,
+                "diffusion_derivative",
+                "DiffusionDrive derivative parent",
+            )
+        return self.parent_descriptor
+
+    def _open_current(
+        self,
+    ) -> Iterator[tuple[int, os.stat_result, AssetFingerprint]]:
+        """현재 derivative를 hash한 opened entry context로 반환한다."""
+        return _open_sparse_regular_entry(
+            self._ensure_parent_descriptor(),
+            self.derivative_path.name,
+            self.derivative_relative,
+            "diffusion_derivative",
+        )
+
+    @staticmethod
+    def _identity(metadata: os.stat_result) -> tuple[int, int, int]:
+        """state fingerprint에 없는 device/inode를 mtime과 함께 보관한다."""
+        return metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns
+
+    def _matches(
+        self,
+        metadata: os.stat_result,
+        fingerprint: AssetFingerprint,
+        expected_fingerprint: AssetFingerprint,
+        expected_identity: tuple[int, int, int],
+    ) -> bool:
+        """derivative의 opened fingerprint와 inode가 expected snapshot인지 확인한다."""
+        return _sparse_extension_matches(
+            metadata,
+            fingerprint,
+            self._identity(metadata),
+            expected_fingerprint,
+            expected_identity,
+        )
+
+    def backup_existing(self, active_state: Optional[EnvironmentState]) -> None:
+        """기존 derivative를 검증하고 같은 inode hardlink를 private backup에 둔다."""
+        try:
+            path_metadata = self.derivative_path.lstat()
+        except FileNotFoundError:
+            if active_state is not None:
+                _raise(
+                    "diffusion_derivative",
+                    "active state derivative is missing before recreate",
+                )
+            return
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot inspect existing derivative"
+            ) from exc
+        if not stat.S_ISREG(path_metadata.st_mode):
+            _raise(
+                "diffusion_derivative",
+                "existing DiffusionDrive derivative is not a regular file",
+            )
+        parent_descriptor = self._ensure_parent_descriptor()
+        with self._open_current() as (_, metadata, fingerprint):
+            identity = self._identity(metadata)
+            if active_state is not None:
+                if (
+                    active_state.model_id != "diffusiondrive_v2"
+                    or not active_state.assets
+                    or active_state.assets[-1].path != self.derivative_relative
+                ):
+                    _raise(
+                        "diffusion_derivative",
+                        "active state cannot authenticate the DiffusionDrive derivative",
+                    )
+                if fingerprint != active_state.assets[-1]:
+                    _raise(
+                        "diffusion_derivative",
+                        "existing DiffusionDrive derivative does not match active state SHA",
+                    )
+            try:
+                os.link(
+                    self.derivative_path.name,
+                    self.derivative_path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=self.backup_descriptor,
+                    follow_symlinks=False,
+                )
+                backup_metadata = os.stat(
+                    self.derivative_path.name,
+                    dir_fd=self.backup_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    "diffusion_derivative",
+                    "cannot create DiffusionDrive derivative rollback link",
+                ) from exc
+            if not _same_sparse_entry_identity(metadata, backup_metadata):
+                _raise(
+                    "diffusion_derivative",
+                    "DiffusionDrive derivative changed while creating rollback link",
+                )
+            self.baseline_fingerprint = fingerprint
+            self.baseline_identity = identity
+            self.backup_present = True
+        try:
+            os.fsync(parent_descriptor)
+            os.fsync(self.backup_descriptor)
+            os.fsync(self.model_descriptor)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot persist derivative rollback link"
+            ) from exc
+
+    def _verify_backup(self) -> tuple[os.stat_result, AssetFingerprint]:
+        """private hardlink가 original baseline bytes/metadata를 유지하는지 확인한다."""
+        if (
+            not self.backup_present
+            or self.baseline_fingerprint is None
+            or self.baseline_identity is None
+        ):
+            _raise("diffusion_derivative", "derivative rollback link is unavailable")
+        with _open_sparse_regular_entry(
+            self.backup_descriptor,
+            self.derivative_path.name,
+            self.derivative_relative,
+            "diffusion_derivative",
+        ) as (_, metadata, fingerprint):
+            if not self._matches(
+                metadata,
+                fingerprint,
+                self.baseline_fingerprint,
+                self.baseline_identity,
+            ):
+                _raise(
+                    "diffusion_derivative",
+                    "DiffusionDrive derivative rollback link was modified",
+                )
+            return metadata, fingerprint
+
+    def capture_output(self) -> None:
+        """asset fetcher가 publish한 derivative identity/SHA를 ownership snapshot으로 잡는다."""
+        if self.captured:
+            _raise("diffusion_derivative", "derivative output was captured twice")
+        with self._open_current() as (_, metadata, fingerprint):
+            self.captured_fingerprint = fingerprint
+            self.captured_identity = self._identity(metadata)
+        self.captured = True
+        if self.backup_present:
+            self._verify_backup()
+
+    def capture_if_present(self) -> None:
+        """fetcher 예외가 파일을 남겼다면 rollback ownership을 best-effort로 등록한다."""
+        if self.captured:
+            return
+        try:
+            self.derivative_path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot inspect failed derivative output"
+            ) from exc
+        self.capture_output()
+
+    def bind_candidate(self, candidate: Path) -> None:
+        """activation rollback이 허용할 이번 candidate target을 기록한다."""
+        if self.candidate is not None:
+            _raise("diffusion_derivative", "derivative candidate was bound twice")
+        self.candidate = Path(candidate)
+
+    def _preserve_current(self) -> str:
+        """transaction-owned snapshot과 다른 derivative를 hidden sibling으로 보존한다."""
+        parent_descriptor = self._ensure_parent_descriptor()
+        name = self.derivative_path.name
+        try:
+            expected = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            preserved = _unused_sparse_entry_name(
+                parent_descriptor,
+                f"validator-preserved.{name}",
+                action="diffusion_derivative",
+                context="DiffusionDrive derivative",
+            )
+            os.rename(
+                name,
+                preserved,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            observed = os.stat(
+                preserved, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+            if not _same_sparse_entry_identity(expected, observed):
+                _raise(
+                    "diffusion_derivative",
+                    "derivative changed while preserving replacement",
+                )
+            os.fsync(parent_descriptor)
+            return preserved
+        except EnvironmentSetupError:
+            raise
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot preserve replaced derivative"
+            ) from exc
+
+    def _current_snapshot(
+        self,
+    ) -> Optional[tuple[os.stat_result, AssetFingerprint]]:
+        """현재 canonical derivative가 없으면 None, 있으면 opened snapshot을 반환한다."""
+        try:
+            self.derivative_path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot inspect derivative during rollback"
+            ) from exc
+        with self._open_current() as (_, metadata, fingerprint):
+            return metadata, fingerprint
+
+    def _remove_backup_link(self) -> None:
+        """verified old hardlink만 quarantine identity check 뒤 제거한다."""
+        metadata, _ = self._verify_backup()
+        _remove_generated_leaf(
+            self.backup_descriptor,
+            self.derivative_path.name,
+            metadata,
+            "diffusion_derivative",
+            "DiffusionDrive derivative rollback link",
+        )
+        self.backup_present = False
+
+    def _restore_baseline(self) -> None:
+        """backup hardlink를 canonical name으로 rename해 original inode를 복원한다."""
+        self._verify_backup()
+        parent_descriptor = self._ensure_parent_descriptor()
+        try:
+            os.rename(
+                self.derivative_path.name,
+                self.derivative_path.name,
+                src_dir_fd=self.backup_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            restored = os.stat(
+                self.derivative_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot restore active derivative"
+            ) from exc
+        if (
+            self.baseline_identity is None
+            or (
+                restored.st_dev,
+                restored.st_ino,
+                restored.st_mtime_ns,
+            )
+            != self.baseline_identity
+        ):
+            _raise(
+                "diffusion_derivative",
+                "active derivative was replaced during restore",
+            )
+        self.backup_present = False
+        try:
+            os.fsync(parent_descriptor)
+            os.fsync(self.backup_descriptor)
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot persist derivative restore"
+            ) from exc
+
+    def _finish_backup_directory(self) -> None:
+        """empty private derivative backup directory를 original inode일 때만 제거한다."""
+        try:
+            if os.listdir(self.backup_descriptor):
+                _raise(
+                    "diffusion_derivative",
+                    "derivative rollback directory is not empty; preserving it",
+                )
+            observed = os.stat(
+                self.backup_name,
+                dir_fd=self.model_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_sparse_entry_identity(observed, self.backup_metadata):
+                _raise(
+                    "diffusion_derivative",
+                    "derivative rollback directory was replaced; preserving it",
+                )
+            os.rmdir(self.backup_name, dir_fd=self.model_descriptor)
+            os.fsync(self.model_descriptor)
+        except EnvironmentSetupError:
+            raise
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                "diffusion_derivative", "cannot remove derivative rollback directory"
+            ) from exc
+
+    def rollback(self) -> None:
+        """failed setup output을 철회하고 old derivative/current target을 복원한다."""
+        if self.finished:
+            return
+        self.capture_if_present()
+        current = self._current_snapshot()
+        baseline_is_current = False
+        owned_is_current = False
+        if current is not None:
+            metadata, fingerprint = current
+            if (
+                self.baseline_fingerprint is not None
+                and self.baseline_identity is not None
+            ):
+                baseline_is_current = self._matches(
+                    metadata,
+                    fingerprint,
+                    self.baseline_fingerprint,
+                    self.baseline_identity,
+                )
+            if (
+                self.captured_fingerprint is not None
+                and self.captured_identity is not None
+            ):
+                owned_is_current = self._matches(
+                    metadata,
+                    fingerprint,
+                    self.captured_fingerprint,
+                    self.captured_identity,
+                )
+            if not baseline_is_current:
+                if owned_is_current:
+                    _remove_generated_leaf(
+                        self._ensure_parent_descriptor(),
+                        self.derivative_path.name,
+                        metadata,
+                        "diffusion_derivative",
+                        "generated DiffusionDrive derivative",
+                    )
+                else:
+                    self._preserve_current()
+        if self.backup_present:
+            if baseline_is_current:
+                self._remove_backup_link()
+            else:
+                self._restore_baseline()
+        if self.candidate is None:
+            current = Path(self.preflight.paths.current)
+            observed = os.readlink(str(current)) if current.is_symlink() else None
+            if observed != self.current_snapshot:
+                _raise(
+                    "diffusion_derivative",
+                    "current changed before derivative candidate was created",
+                )
+        else:
+            _restore_current_link_snapshot(
+                self.preflight.paths, self.candidate, self.current_snapshot
+            )
+        self._finish_backup_directory()
+        self.finished = True
+
+    def prepare_commit(self) -> None:
+        """captured derivative와 rollback link를 폐기 전 재검증한다."""
+        if self.finished:
+            _raise("diffusion_derivative", "derivative transaction already finished")
+        current = self._current_snapshot()
+        if (
+            current is None
+            or self.captured_fingerprint is None
+            or self.captured_identity is None
+            or not self._matches(
+                current[0],
+                current[1],
+                self.captured_fingerprint,
+                self.captured_identity,
+            )
+        ):
+            _raise(
+                "diffusion_derivative",
+                "active derivative changed before transaction commit",
+            )
+        if self.backup_present:
+            self._verify_backup()
+
+    def finalize_commit(self) -> None:
+        """logical activation 성공 뒤 old derivative hardlink만 폐기한다."""
+        if self.finished:
+            _raise("diffusion_derivative", "derivative transaction already finished")
+        if self.backup_present:
+            self._remove_backup_link()
+        self._finish_backup_directory()
+        self.finished = True
+
+    def close(self) -> None:
+        """derivative transaction directory descriptors를 idempotent하게 닫는다."""
+        if self.closed:
+            return
+        self.closed = True
+        descriptors = [self.backup_descriptor, self.model_descriptor]
+        if self.parent_descriptor is not None:
+            descriptors.append(self.parent_descriptor)
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _begin_diffusion_derivative_transaction(
+    preflight: EnvironmentPreflight,
+    active_state: Optional[EnvironmentState],
+) -> Optional[_DiffusionDerivativeTransaction]:
+    """Diffusion model이면 pre-fetch hardlink rollback transaction을 시작한다."""
+    if preflight.definition.model_id != "diffusiondrive_v2":
+        return None
+    checkout = preflight.root / "models" / "sources" / "diffusiondrive_v2"
+    derivative_relative = checkout.relative_to(preflight.root) / _DIFFUSION_DERIVATIVE
+    derivative_path = preflight.root / derivative_relative
+    model_descriptor: Optional[int] = None
+    backup_descriptor: Optional[int] = None
+    transaction: Optional[_DiffusionDerivativeTransaction] = None
+    backup_name = f".diffusion-derivative-backup.{secrets.token_hex(16)}"
+    try:
+        model_descriptor = _duplicate_secure_directory(
+            preflight.paths.model_root,
+            "diffusion_derivative",
+            "DiffusionDrive model root",
+        )
+        os.mkdir(backup_name, mode=0o700, dir_fd=model_descriptor)
+        backup_descriptor = os.open(
+            backup_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=model_descriptor,
+        )
+        backup_metadata = os.fstat(backup_descriptor)
+        transaction = _DiffusionDerivativeTransaction(
+            preflight=preflight,
+            derivative_path=derivative_path,
+            derivative_relative=derivative_relative,
+            model_descriptor=model_descriptor,
+            backup_descriptor=backup_descriptor,
+            backup_name=backup_name,
+            backup_metadata=backup_metadata,
+            current_snapshot=_current_link_snapshot(preflight.paths),
+        )
+        transaction.backup_existing(active_state)
+        return transaction
+    except BaseException as error:
+        if transaction is not None:
+            try:
+                transaction.rollback()
+            except BaseException as rollback_error:
+                raise rollback_error from error
+            finally:
+                transaction.close()
+        else:
+            if backup_descriptor is not None:
+                try:
+                    os.close(backup_descriptor)
+                except OSError:
+                    pass
+            if model_descriptor is not None:
+                try:
+                    os.rmdir(backup_name, dir_fd=model_descriptor)
+                except OSError:
+                    pass
+                try:
+                    os.close(model_descriptor)
                 except OSError:
                     pass
         raise
@@ -4114,7 +4643,13 @@ def _same_sparse_entry_identity(
     )
 
 
-def _unused_sparse_entry_name(descriptor: int, prefix: str) -> str:
+def _unused_sparse_entry_name(
+    descriptor: int,
+    prefix: str,
+    *,
+    action: str = "sparse_extensions",
+    context: str = "SparseDrive",
+) -> str:
     """열린 directory 안에서 추측하기 어려운 부재 quarantine 이름을 예약한다."""
     for _attempt in range(32):
         name = f".{prefix}.{secrets.token_hex(16)}"
@@ -4124,24 +4659,33 @@ def _unused_sparse_entry_name(descriptor: int, prefix: str) -> str:
             return name
         except OSError as exc:
             raise EnvironmentSetupError(
-                "sparse_extensions", "cannot inspect SparseDrive quarantine name"
+                action, f"cannot inspect {context} quarantine name"
             ) from exc
-    _raise("sparse_extensions", "cannot allocate SparseDrive quarantine name")
+    _raise(action, f"cannot allocate {context} quarantine name")
 
 
-def _remove_sparse_build_leaf(
-    descriptor: int, name: str, expected: os.stat_result
+def _remove_generated_leaf(
+    descriptor: int,
+    name: str,
+    expected: os.stat_result,
+    action: str,
+    context: str,
 ) -> None:
     """leaf를 random quarantine으로 옮겨 opened identity 확인 후에만 삭제한다."""
     path_flag = getattr(os, "O_PATH", 0)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not path_flag or not no_follow:
         _raise(
-            "sparse_extensions",
-            "platform lacks secure SparseDrive leaf cleanup support",
+            action,
+            f"platform lacks secure {context} cleanup support",
         )
     opened_descriptor: Optional[int] = None
-    quarantine = _unused_sparse_entry_name(descriptor, "validator-remove")
+    quarantine = _unused_sparse_entry_name(
+        descriptor,
+        "validator-remove",
+        action=action,
+        context=context,
+    )
     try:
         opened_descriptor = os.open(
             name,
@@ -4151,8 +4695,8 @@ def _remove_sparse_build_leaf(
         opened = os.fstat(opened_descriptor)
         if not _same_sparse_entry_identity(opened, expected):
             _raise(
-                "sparse_extensions",
-                "generated SparseDrive build leaf changed before cleanup",
+                action,
+                f"{context} changed before cleanup",
             )
         os.rename(
             name,
@@ -4174,8 +4718,8 @@ def _remove_sparse_build_leaf(
             except OSError:
                 pass
             _raise(
-                "sparse_extensions",
-                "generated SparseDrive build leaf was replaced; preserving it",
+                action,
+                f"{context} was replaced; preserving it",
             )
         os.unlink(quarantine, dir_fd=descriptor)
         os.fsync(descriptor)
@@ -4183,8 +4727,8 @@ def _remove_sparse_build_leaf(
         raise
     except OSError as exc:
         raise EnvironmentSetupError(
-            "sparse_extensions",
-            "cannot quarantine generated SparseDrive build leaf",
+            action,
+            f"cannot quarantine {context}",
         ) from exc
     finally:
         if opened_descriptor is not None:
@@ -4192,6 +4736,19 @@ def _remove_sparse_build_leaf(
                 os.close(opened_descriptor)
             except OSError:
                 pass
+
+
+def _remove_sparse_build_leaf(
+    descriptor: int, name: str, expected: os.stat_result
+) -> None:
+    """Sparse build leaf를 identity-preserving quarantine으로 삭제한다."""
+    _remove_generated_leaf(
+        descriptor,
+        name,
+        expected,
+        "sparse_extensions",
+        "generated SparseDrive build leaf",
+    )
 
 
 def _clear_sparse_build_tree_fd(descriptor: int) -> None:
@@ -4781,71 +5338,96 @@ def setup_environment(
                     changed=False,
                 )
 
-        prepare_local_runtime_assets(preflight)
-        _call_asset_fetcher(preflight, selected_dependencies)
-        asset_metadata = _call_asset_verifier(preflight, selected_dependencies)
-        checkout = _source_checkout_from_metadata(preflight, asset_metadata)
-        sparse_baseline: Optional[_SparseGeneratedBaseline] = None
-        if preflight.definition.model_id == "diffusiondrive_v2":
-            initial_generated_paths = (
-                _diffusion_generated_path(preflight, checkout),
-            )
-        elif preflight.definition.model_id == "sparsedrive_v2":
-            initial_generated_paths = _existing_sparse_generated_paths(
-                preflight, checkout
-            )
-            sparse_baseline = _authenticate_existing_sparse_generated_paths(
+        diffusion_transaction = _begin_diffusion_derivative_transaction(
+            preflight, active.state
+        )
+        try:
+            prepare_local_runtime_assets(preflight)
+            _call_asset_fetcher(preflight, selected_dependencies)
+            if diffusion_transaction is not None:
+                diffusion_transaction.capture_output()
+            asset_metadata = _call_asset_verifier(preflight, selected_dependencies)
+            checkout = _source_checkout_from_metadata(preflight, asset_metadata)
+            sparse_baseline: Optional[_SparseGeneratedBaseline] = None
+            if preflight.definition.model_id == "diffusiondrive_v2":
+                initial_generated_paths = (
+                    _diffusion_generated_path(preflight, checkout),
+                )
+            elif preflight.definition.model_id == "sparsedrive_v2":
+                initial_generated_paths = _existing_sparse_generated_paths(
+                    preflight, checkout
+                )
+                sparse_baseline = _authenticate_existing_sparse_generated_paths(
+                    preflight,
+                    checkout,
+                    initial_generated_paths,
+                    active.state,
+                )
+            else:
+                initial_generated_paths = ()
+            initial_allowed_source_paths = _source_relative_generated_paths(
                 preflight,
                 checkout,
                 initial_generated_paths,
-                active.state,
+                "source_verification",
             )
-        else:
-            initial_generated_paths = ()
-        initial_allowed_source_paths = _source_relative_generated_paths(
-            preflight,
-            checkout,
-            initial_generated_paths,
-            "source_verification",
-        )
-        _validate_source_checkout(
-            preflight,
-            asset_metadata,
-            selected_dependencies,
-            runner,
-            allowed_generated_paths=initial_allowed_source_paths,
-        )
-        runtime_fingerprints = fingerprint_runtime_assets(preflight)
-        initial_generated_fingerprints = (
-            _fingerprint_generated_artifacts(preflight, checkout)
-            if preflight.definition.model_id == "diffusiondrive_v2"
-            else ()
-        )
+            _validate_source_checkout(
+                preflight,
+                asset_metadata,
+                selected_dependencies,
+                runner,
+                allowed_generated_paths=initial_allowed_source_paths,
+            )
+            runtime_fingerprints = fingerprint_runtime_assets(preflight)
+            initial_generated_fingerprints = (
+                _fingerprint_generated_artifacts(preflight, checkout)
+                if preflight.definition.model_id == "diffusiondrive_v2"
+                else ()
+            )
+            try:
+                build_id = selected_dependencies.build_id()
+            except (RuntimeError, ValueError, TypeError) as exc:
+                raise EnvironmentSetupError(
+                    "environment_create", "build ID failed"
+                ) from exc
+            candidate = create_candidate(preflight.paths, build_id)
+            if diffusion_transaction is not None:
+                diffusion_transaction.bind_candidate(candidate)
+            _run_setup_command(
+                runner,
+                build_uv_venv_argv(
+                    preflight.uv_path, preflight.definition, candidate
+                ),
+                "environment_create",
+                cwd=preflight.root,
+            )
+            _run_setup_command(
+                runner,
+                build_uv_sync_argv(
+                    preflight.uv_path, preflight.definition, candidate
+                ),
+                "environment_sync",
+                cwd=preflight.root,
+            )
+            candidate_python = _require_executable_file(
+                candidate / "bin" / "python", "candidate Python"
+            )
+            _validate_candidate_python_version(preflight, candidate_python, runner)
+        except BaseException as error:
+            if diffusion_transaction is not None:
+                try:
+                    diffusion_transaction.rollback()
+                except BaseException as rollback_error:
+                    raise rollback_error from error
+                finally:
+                    diffusion_transaction.close()
+            raise
+        sparse_transaction: Optional[_SparseExtensionTransaction] = None
+        cleanup_warnings: list[str] = []
         try:
-            build_id = selected_dependencies.build_id()
-        except (RuntimeError, ValueError, TypeError) as exc:
-            raise EnvironmentSetupError("environment_create", "build ID failed") from exc
-        candidate = create_candidate(preflight.paths, build_id)
-        _run_setup_command(
-            runner,
-            build_uv_venv_argv(preflight.uv_path, preflight.definition, candidate),
-            "environment_create",
-            cwd=preflight.root,
-        )
-        _run_setup_command(
-            runner,
-            build_uv_sync_argv(preflight.uv_path, preflight.definition, candidate),
-            "environment_sync",
-            cwd=preflight.root,
-        )
-        candidate_python = _require_executable_file(
-            candidate / "bin" / "python", "candidate Python"
-        )
-        _validate_candidate_python_version(preflight, candidate_python, runner)
-        sparse_transaction = _begin_sparse_extension_transaction(
-            preflight, checkout, candidate, sparse_baseline
-        )
-        try:
+            sparse_transaction = _begin_sparse_extension_transaction(
+                preflight, checkout, candidate, sparse_baseline
+            )
             sparse_generated_fingerprints = _run_sparse_setup_action(
                 preflight,
                 candidate_python,
@@ -4939,23 +5521,45 @@ def setup_environment(
                         "state_write", "cannot remove failed candidate state"
                     ) from exc
                 raise
+            for transaction in (sparse_transaction, diffusion_transaction):
+                if transaction is not None:
+                    transaction.prepare_commit()
             activate_candidate(preflight.paths, candidate)
+            for transaction in (sparse_transaction, diffusion_transaction):
+                if transaction is not None:
+                    transaction.prepare_commit()
         except BaseException as error:
-            if sparse_transaction is not None:
+            rollback_error: Optional[BaseException] = None
+            for transaction in (sparse_transaction, diffusion_transaction):
+                if transaction is None:
+                    continue
                 try:
-                    sparse_transaction.rollback()
-                except BaseException as rollback_error:
-                    raise rollback_error from error
+                    transaction.rollback()
+                except BaseException as exc:
+                    if rollback_error is None:
+                        rollback_error = exc
+            if rollback_error is not None:
+                raise rollback_error from error
             raise
         else:
-            if sparse_transaction is not None:
-                sparse_transaction.commit()
+            for transaction in (sparse_transaction, diffusion_transaction):
+                if transaction is not None:
+                    try:
+                        transaction.finalize_commit()
+                    except EnvironmentSetupError as exc:
+                        cleanup_warnings.append(
+                            "generated artifact backup cleanup deferred: " + str(exc)
+                        )
         finally:
-            if sparse_transaction is not None:
-                sparse_transaction.close()
+            for transaction in (sparse_transaction, diffusion_transaction):
+                if transaction is not None:
+                    transaction.close()
         return EnvironmentOperationResult(
             environment_dir=candidate,
             state=state,
-            warnings=_merge_setup_warnings(preflight.warnings, runtime_warning),
+            warnings=(
+                _merge_setup_warnings(preflight.warnings, runtime_warning)
+                + tuple(cleanup_warnings)
+            ),
             changed=True,
         )
