@@ -121,6 +121,9 @@ def test_public_api_and_exact_ros_allowlist_are_stable(tmp_path: Path):
             activate_candidate,
             prune_inactive_builds,
             environment_setup.model_operation_lock,
+            environment_setup.verify_environment,
+            environment_setup.prune_environment_builds,
+            environment_setup.preflight_run_environment,
         )
     )
 
@@ -1556,6 +1559,10 @@ def _preflight_project(tmp_path: Path, *, complete_sparse: bool = True) -> Path:
         / "requirements",
         package_root / "requirements",
     )
+    (package_root / "src" / "validator_inference").mkdir(parents=True)
+    (package_root / "src" / "validator_inference" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
     profile_root = root / "src" / "Validator_pkg" / "config"
     profile_root.mkdir()
     profile_path = profile_root / "profile.json"
@@ -2716,6 +2723,7 @@ class _SetupRunner:
         self.candidate_cuda_available = True
         self.post_sparse_git_status_output = ""
         self.write_sparse_extensions = True
+        self.required_import_origins_override: list[str] | None = None
         self.phase_hooks: dict[
             str, Callable[[tuple[str, ...], dict[str, Any]], None]
         ] = {}
@@ -2747,7 +2755,10 @@ class _SetupRunner:
             return "freeze"
         if command[1:] == ("setup.py", "build_ext", "--inplace"):
             return "sparse_build"
-        code = command[2] if len(command) > 2 and command[1] == "-c" else ""
+        try:
+            code = command[command.index("-c") + 1]
+        except (ValueError, IndexError):
+            code = ""
         if "platform.python_version" in code:
             return "python_version"
         if "deformable_aggregation_with_depth_ext" in code and "origins =" in code:
@@ -2757,7 +2768,7 @@ class _SetupRunner:
         if "build_selected_model" in code:
             return "model_load"
         if "validator_msgs.msg" in code and "rospy" in code:
-            return "ros_smoke"
+            return "target_ros_import"
         if "import_module" in code:
             return "required_imports"
         return "unexpected"
@@ -2802,6 +2813,67 @@ class _SetupRunner:
             stdout = ""
         elif phase == "python_version":
             stdout = self.python_version + "\n"
+        elif phase == "required_imports":
+            names = {
+                "interfuser": (
+                    "torch",
+                    "torchvision",
+                    "numpy",
+                    "cv2",
+                    "timm",
+                    "imgaug",
+                    "skimage",
+                ),
+                "tfv6": (
+                    "torch",
+                    "torchvision",
+                    "torchaudio",
+                    "numpy",
+                    "timm",
+                    "transformers",
+                    "torchmetrics",
+                ),
+                "diffusiondrive_v2": (
+                    "torch",
+                    "torchvision",
+                    "diffusers",
+                    "einops",
+                    "nuplan",
+                ),
+                "sparsedrive_v2": (
+                    "torch",
+                    "torchvision",
+                    "nuplan",
+                    "deformable_aggregation_ext",
+                    "deformable_aggregation_with_depth_ext",
+                ),
+            }[self.model_id]
+            candidate = Path(command[0]).parent.parent
+            origins: list[str] = []
+            for name in names:
+                if self.model_id == "interfuser" and name == "timm":
+                    origin = (
+                        self.root
+                        / "models/sources/interfuser/interfuser/timm/__init__.py"
+                    )
+                elif name in {
+                    "deformable_aggregation_ext",
+                    "deformable_aggregation_with_depth_ext",
+                }:
+                    origin = (
+                        self.root
+                        / "models/sources/sparsedrive_v2/navsim/agents/"
+                        "sparsedrive/ops"
+                        / f"{name}.cpython-39-x86_64-linux-gnu.so"
+                    )
+                else:
+                    origin = candidate / "lib/python/site-packages" / name / "__init__.py"
+                origins.append(str(origin))
+            stdout = json.dumps(
+                self.required_import_origins_override
+                if self.required_import_origins_override is not None
+                else origins
+            )
         elif phase == "cuda_runtime":
             stdout = "1\n" if self.candidate_cuda_available else "0\n"
         elif phase == "freeze":
@@ -3099,11 +3171,11 @@ def test_setup_public_result_and_success_phase_contract_are_exact(
     assert catkin_command == (str(dependencies.preflight_dependencies.which("catkin_make")),)
     assert catkin_kwargs["cwd"] == root
     message_command, message_kwargs, _ = _setup_call(runner, "catkin_messages")
-    assert message_command[:2] == ("/usr/bin/python3", "-c")
-    assert str(root / "devel" / "lib" / "python3" / "dist-packages") in message_command[2]
-    assert str(dependencies.preflight_dependencies.ros_python_root) in message_command[2]
+    assert message_command[:3] == ("/usr/bin/python3", "-B", "-c")
+    assert str(root / "devel" / "lib" / "python3" / "dist-packages") in message_command[3]
+    assert str(dependencies.preflight_dependencies.ros_python_root) in message_command[3]
     assert all(
-        name in message_command[2]
+        name in message_command[3]
         for name in ("CameraCalibration", "DrivingFeature", "InferenceMetric")
     )
     assert message_kwargs["cwd"] == root
@@ -3396,37 +3468,48 @@ def test_setup_postinstall_cuda_failure_never_writes_state_or_switches_current(
     assert not (candidate / ENVIRONMENT_STATE_FILENAME).exists()
 
 
-def test_setup_default_ros_smoke_is_bounded_and_uses_sanitized_child_environment(
-    tmp_path: Path,
+def test_setup_default_ros_smoke_uses_full_compatibility_and_base_stdlib_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """hook이 없으면 target Python으로 standard/custom ROS imports를 bounded 실행한다."""
+    """hook이 없으면 resolved target base stdlib 하나로 양방향 ROS smoke를 실행한다."""
     root, dependencies, runner, _ = _setup_fixture(
         tmp_path, ros_smoke_hook=False
+    )
+    base_python = _write_executable(
+        tmp_path / "managed-python" / "bin" / "python3.10"
+    )
+    base_stdlib = base_python.parent.parent / "lib" / "python3.10"
+    base_stdlib.mkdir(parents=True)
+    observed: list[Any] = []
+
+    def link_candidate_python(command: tuple[str, ...], _kwargs: dict[str, Any]) -> None:
+        candidate_python = Path(command[-1]) / "bin" / "python"
+        candidate_python.unlink()
+        candidate_python.symlink_to(base_python)
+
+    runner.phase_hooks["uv_venv"] = link_candidate_python
+    monkeypatch.setattr(
+        environment_setup,
+        "_run_ros_compatibility_smoke",
+        lambda policy: observed.append(policy),
+        raising=False,
     )
 
     result = setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
 
-    command, kwargs, _ = _setup_call(runner, "ros_smoke")
-    assert command[:2] == (str(result.environment_dir / "bin" / "python"), "-c")
-    assert all(
-        token in command[2]
-        for token in (
-            "rospy",
-            "std_msgs.msg",
-            "sensor_msgs.msg",
-            "geometry_msgs.msg",
-            "nav_msgs.msg",
-            "tf2_msgs.msg",
-            "actionlib_msgs.msg",
-            "validator_msgs.msg",
-        )
+    assert len(observed) == 1
+    policy = observed[0]
+    assert policy.target_python == result.environment_dir / "bin" / "python"
+    assert policy.target_environment == result.environment_dir
+    assert policy.ros_overlay == result.environment_dir / ".ros-overlay"
+    assert policy.catkin_python_path == (
+        root / "devel" / "lib" / "python3" / "dist-packages"
     )
-    assert kwargs["timeout"] > 0
-    assert kwargs["env"]["VIRTUAL_ENV"] == str(result.environment_dir)
-    assert kwargs["env"]["PYTHONPATH"].split(os.pathsep) == [
-        str(result.environment_dir / ".ros-overlay"),
-        str(root / "devel" / "lib" / "python3" / "dist-packages"),
-    ]
+    assert policy.target_stdlib_paths == (base_stdlib.resolve(),)
+    assert policy.project_source_paths == (
+        root / "src" / "Validator_pkg" / "validator_inference" / "src",
+    )
+    assert not any(phase == "target_ros_import" for _, _, phase in runner.calls)
 
 
 def test_setup_rejects_dirty_source_before_candidate_creation(tmp_path: Path):
@@ -4555,3 +4638,377 @@ def test_setup_reuse_revalidates_assets_after_runtime_checks(tmp_path: Path):
 
     assert caught.value.action == "reuse_verification"
     assert environment_paths(root, "tfv6").current.resolve() == first.environment_dir
+
+
+def _completed_setup_for_maintenance(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    EnvironmentSetupDependencies,
+    _SetupRunner,
+    EnvironmentOperationResult,
+]:
+    """verify/run 유지보수 테스트용 정상 active environment를 만든다."""
+    root, dependencies, setup_runner, _ = _setup_fixture(tmp_path)
+    completed = setup_environment(
+        root, "tfv6", runner=setup_runner, dependencies=dependencies
+    )
+    runner = _SetupRunner(root, "tfv6", completed.state.python_version)
+    runner.source_commit = completed.state.source_commit
+    return root, dependencies, runner, completed
+
+
+def test_verify_refreshes_only_asset_metadata_and_preserves_completion(
+    tmp_path: Path,
+):
+    """본문 SHA가 같으면 size/mtime state만 원자 갱신하고 완료 시각을 보존한다."""
+    root, dependencies, runner, completed = _completed_setup_for_maintenance(tmp_path)
+    asset = root / completed.state.assets[0].path
+    before = asset.stat()
+    changed_mtime = before.st_mtime_ns + 10_000_000
+    os.utime(asset, ns=(before.st_atime_ns, changed_mtime))
+
+    result = environment_setup.verify_environment(
+        root, "tfv6", runner=runner, dependencies=dependencies
+    )
+
+    assert result.changed is True
+    assert result.environment_dir == completed.environment_dir
+    assert result.state.completed_at == completed.state.completed_at
+    assert result.state.assets[0].sha256 == completed.state.assets[0].sha256
+    assert result.state.assets[0].mtime_ns == changed_mtime
+    assert read_environment_state(completed.environment_dir) == result.state
+    assert environment_paths(root, "tfv6").current.resolve() == completed.environment_dir
+    phases = [phase for _, _, phase in runner.calls]
+    assert "catkin_build" not in phases
+    assert "uv_venv" not in phases
+    assert "uv_sync" not in phases
+    assert "sparse_build" not in phases
+
+
+def test_verify_rejects_same_metadata_content_change_without_rewriting_state(
+    tmp_path: Path,
+):
+    """size/mtime를 보존한 본문 변조도 deep SHA로 거부하고 state를 보존한다."""
+    root, dependencies, runner, completed = _completed_setup_for_maintenance(tmp_path)
+    state_path = completed.environment_dir / ENVIRONMENT_STATE_FILENAME
+    before_state = state_path.read_bytes()
+    _mutate_file_preserving_size_and_mtime(root / completed.state.assets[0].path)
+
+    with pytest.raises(EnvironmentSetupError, match="fingerprint|SHA"):
+        environment_setup.verify_environment(
+            root, "tfv6", runner=runner, dependencies=dependencies
+        )
+
+    assert state_path.read_bytes() == before_state
+    assert environment_paths(root, "tfv6").current.resolve() == completed.environment_dir
+
+
+def test_verify_and_run_preflight_reject_truncated_asset_state(
+    tmp_path: Path,
+):
+    """fast inspector가 허용하는 빈 asset 배열도 profile exact 계약에서는 실패한다."""
+    root, dependencies, runner, completed = _completed_setup_for_maintenance(tmp_path)
+    truncated = dataclasses.replace(completed.state, assets=())
+    environment_setup.write_environment_state(
+        completed.environment_dir / ENVIRONMENT_STATE_FILENAME, truncated
+    )
+
+    for operation in (
+        environment_setup.verify_environment,
+        environment_setup.preflight_run_environment,
+    ):
+        with pytest.raises(EnvironmentSetupError, match="asset|runtime"):
+            operation(root, "tfv6", runner=runner, dependencies=dependencies)
+
+
+def test_verify_unchanged_environment_runs_full_checks_without_setup_mutators(
+    tmp_path: Path,
+):
+    """변경 없는 verify도 source/overlay/runtime/model/freeze를 검증하고 설치하지 않는다."""
+    root, dependencies, runner, completed = _completed_setup_for_maintenance(tmp_path)
+
+    result = environment_setup.verify_environment(
+        root, "tfv6", runner=runner, dependencies=dependencies
+    )
+
+    assert result.changed is False
+    assert result.state == completed.state
+    phases = [phase for _, _, phase in runner.calls]
+    for required in (
+        "source_head",
+        "source_status",
+        "python_version",
+        "required_imports",
+        "cuda_runtime",
+        "model_load",
+        "freeze",
+    ):
+        assert required in phases
+    for forbidden in ("catkin_build", "uv_venv", "uv_sync", "sparse_build"):
+        assert forbidden not in phases
+
+
+def test_prune_environment_builds_uses_only_validated_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """public prune은 profile/host/ROS/uv 없이 active를 보존하고 inactive만 지운다."""
+    root = tmp_path.resolve()
+    paths = environment_paths(root, "interfuser")
+    active = create_candidate(paths, "active")
+    inactive = create_candidate(paths, "inactive")
+    paths.current.symlink_to(Path("builds/active"))
+    monkeypatch.setattr(
+        environment_setup,
+        "preflight_environment",
+        lambda *_args, **_kwargs: pytest.fail("prune must not run host preflight"),
+    )
+
+    removed = environment_setup.prune_environment_builds(root, "interfuser")
+
+    assert removed == (inactive,)
+    assert active.is_dir()
+    assert paths.current.resolve() == active
+
+
+def test_run_preflight_is_read_only_and_executes_current_runtime_checks(
+    tmp_path: Path,
+):
+    """run 점검은 실제 source/Python/import/CUDA를 확인하되 deep/setup 단계를 생략한다."""
+    root, dependencies, runner, completed = _completed_setup_for_maintenance(tmp_path)
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("run preflight invoked a deep or mutating dependency")
+
+    run_dependencies = dataclasses.replace(
+        dependencies,
+        asset_fetcher=forbidden,
+        asset_verifier=forbidden,
+        build_id=forbidden,
+        utc_now=forbidden,
+        ros_smoke=forbidden,
+    )
+    original_fingerprint = environment_setup.fingerprint_runtime_assets
+    state_path = completed.environment_dir / ENVIRONMENT_STATE_FILENAME
+    state_before = state_path.read_bytes()
+    environment_setup.fingerprint_runtime_assets = forbidden
+    try:
+        result = environment_setup.preflight_run_environment(
+            root, "tfv6", runner=runner, dependencies=run_dependencies
+        )
+    finally:
+        environment_setup.fingerprint_runtime_assets = original_fingerprint
+
+    assert result == EnvironmentOperationResult(
+        environment_dir=completed.environment_dir,
+        state=completed.state,
+        warnings=(),
+        changed=False,
+    )
+    assert state_path.read_bytes() == state_before
+    phases = [phase for _, _, phase in runner.calls]
+    for required in (
+        "host_uv",
+        "catkin_messages",
+        "source_head",
+        "source_status",
+        "python_version",
+        "target_ros_import",
+        "required_imports",
+        "cuda_runtime",
+    ):
+        assert required in phases
+    for forbidden_phase in (
+        "catkin_build",
+        "uv_venv",
+        "uv_sync",
+        "sparse_build",
+        "model_load",
+        "freeze",
+    ):
+        assert forbidden_phase not in phases
+    for _command, kwargs, phase in runner.calls:
+        if phase in {"source_head", "source_status"}:
+            assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        if phase in {
+            "catkin_messages",
+            "python_version",
+            "target_ros_import",
+            "required_imports",
+            "cuda_runtime",
+        }:
+            assert "-B" in _command
+
+
+def test_run_preflight_missing_model_root_does_not_create_it(tmp_path: Path):
+    """run 점검은 누락 환경을 실패시키되 .venvs/model 또는 lock을 생성하지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    model_root = environment_paths(root, "tfv6").model_root
+
+    with pytest.raises(EnvironmentSetupError, match="model root") as caught:
+        environment_setup.preflight_run_environment(
+            root, "tfv6", runner=runner, dependencies=dependencies
+        )
+
+    assert caught.value.action == "runtime_preflight"
+    assert not model_root.exists()
+    assert not model_root.is_symlink()
+
+
+def test_run_preflight_holds_model_lock_against_current_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """inspect부터 runtime probe까지 current 교체가 같은 lifecycle lock에서 대기한다."""
+    root, dependencies, runner, completed = _completed_setup_for_maintenance(tmp_path)
+    paths = environment_paths(root, "tfv6")
+    replacement = create_candidate(paths, "replacement")
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    switch_finished = threading.Event()
+    errors: list[BaseException] = []
+    results: list[EnvironmentOperationResult] = []
+    real_probe = environment_setup._run_candidate_import_cuda_checks
+
+    def blocking_probe(*args: Any, **kwargs: Any) -> str | None:
+        probe_entered.set()
+        if not release_probe.wait(5.0):
+            raise RuntimeError("timed out waiting to release runtime preflight")
+        return real_probe(*args, **kwargs)
+
+    def run_preflight() -> None:
+        try:
+            results.append(
+                environment_setup.preflight_run_environment(
+                    root, "tfv6", runner=runner, dependencies=dependencies
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def switch_current() -> None:
+        try:
+            activate_candidate(paths, replacement)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            switch_finished.set()
+
+    monkeypatch.setattr(
+        environment_setup, "_run_candidate_import_cuda_checks", blocking_probe
+    )
+    preflight_thread = threading.Thread(target=run_preflight)
+    preflight_thread.start()
+    assert probe_entered.wait(5.0)
+    switch_thread = threading.Thread(target=switch_current)
+    switch_thread.start()
+    assert not switch_finished.wait(0.2)
+    assert paths.current.resolve() == completed.environment_dir
+    release_probe.set()
+    preflight_thread.join(5.0)
+    switch_thread.join(5.0)
+
+    assert not preflight_thread.is_alive()
+    assert not switch_thread.is_alive()
+    assert errors == []
+    assert results[0].environment_dir == completed.environment_dir
+    assert paths.current.resolve() == replacement
+
+
+def test_interfuser_runtime_probe_prepends_and_attests_vendored_timm(
+    tmp_path: Path,
+):
+    """InterFuser는 checkout/interfuser를 먼저 넣고 그 아래 timm origin만 허용한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, model_id="interfuser"
+    )
+    preflight = preflight_environment(
+        root,
+        "interfuser",
+        runner=runner,
+        dependencies=dependencies.preflight_dependencies,
+    )
+    checkout = root / "models" / "sources" / "interfuser"
+    (checkout / "interfuser" / "timm").mkdir(parents=True)
+    (checkout / "interfuser" / "timm" / "__init__.py").write_text(
+        "", encoding="utf-8"
+    )
+    candidate = create_candidate(preflight.paths, "probe")
+    _write_executable(candidate / "bin" / "python")
+    runner.calls.clear()
+
+    environment_setup._run_candidate_import_cuda_checks(
+        preflight, candidate, {}, runner
+    )
+
+    command, _, _ = _setup_call(runner, "required_imports")
+    assert command[:3] == (str(candidate / "bin" / "python"), "-B", "-c")
+    assert "timm" in command[3]
+    assert command[-1] == str(checkout / "interfuser")
+
+    names = preflight.definition.required_imports
+    runner.required_import_origins_override = [
+        str(candidate / "lib" / "python" / "site-packages" / name / "__init__.py")
+        for name in names
+    ]
+    with pytest.raises(EnvironmentSetupError, match="timm origin") as caught:
+        environment_setup._run_candidate_import_cuda_checks(
+            preflight, candidate, {}, runner
+        )
+    assert caught.value.action == "required_imports"
+
+    outside = tmp_path / "outside-timm.py"
+    outside.write_text("VALUE = 1\n", encoding="utf-8")
+    escaped = checkout / "interfuser" / "timm" / "escaped.py"
+    escaped.symlink_to(outside)
+    runner.required_import_origins_override = [
+        str(
+            escaped
+            if name == "timm"
+            else candidate
+            / "lib"
+            / "python"
+            / "site-packages"
+            / name
+            / "__init__.py"
+        )
+        for name in names
+    ]
+    with pytest.raises(EnvironmentSetupError, match="timm origin"):
+        environment_setup._run_candidate_import_cuda_checks(
+            preflight, candidate, {}, runner
+        )
+
+
+def test_sparsedrive_runtime_probe_rejects_foreign_extension_origin(tmp_path: Path):
+    """SparseDrive required import가 attested source pair 밖 native module이면 실패한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, model_id="sparsedrive_v2", strip_asset_hashes=True
+    )
+    preflight = preflight_environment(
+        root,
+        "sparsedrive_v2",
+        runner=runner,
+        dependencies=dependencies.preflight_dependencies,
+    )
+    checkout = root / "models" / "sources" / "sparsedrive_v2"
+    ops = checkout / "navsim" / "agents" / "sparsedrive" / "ops"
+    ops.mkdir(parents=True)
+    for module in (
+        "deformable_aggregation_ext",
+        "deformable_aggregation_with_depth_ext",
+    ):
+        (ops / f"{module}.cpython-39-x86_64-linux-gnu.so").write_bytes(b"native")
+    candidate = create_candidate(preflight.paths, "probe")
+    _write_executable(candidate / "bin" / "python")
+    names = preflight.definition.required_imports
+    runner.required_import_origins_override = [
+        str(candidate / "lib" / "python" / "site-packages" / name / "__init__.py")
+        for name in names
+    ]
+
+    with pytest.raises(EnvironmentSetupError, match="extension origin") as caught:
+        environment_setup._run_candidate_import_cuda_checks(
+            preflight, candidate, {}, runner
+        )
+
+    assert caught.value.action == "required_imports"

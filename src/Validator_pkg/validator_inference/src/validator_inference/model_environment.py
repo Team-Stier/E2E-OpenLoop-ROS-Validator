@@ -817,12 +817,14 @@ def _path_contains_symlink(root: Path, relative: Path) -> bool:
     return False
 
 
-def inspect_active_environment(
+def _inspect_active_environment(
     paths: EnvironmentPaths,
     definition: ModelEnvironmentDefinition,
     manifest_sha256: str,
+    *,
+    check_asset_metadata: bool,
 ) -> ActiveEnvironmentCheck:
-    """active build와 state를 변경 없이 빠른 fingerprint 방식으로 검사한다."""
+    """active build 계약을 검사하고 선택적으로 asset metadata까지 대조한다."""
     model_root = Path(paths.model_root)
     builds = Path(paths.builds)
     current = Path(paths.current)
@@ -978,20 +980,49 @@ def inspect_active_environment(
                 environment_dir,
                 state_value,
             )
-        if metadata.st_size != fingerprint.size:
-            return _invalid_active_environment(
-                f"asset size changed: {relative.as_posix()}",
-                environment_dir,
-                state_value,
-            )
-        if metadata.st_mtime_ns != fingerprint.mtime_ns:
-            return _invalid_active_environment(
-                f"asset mtime_ns changed: {relative.as_posix()}",
-                environment_dir,
-                state_value,
-            )
+        if check_asset_metadata:
+            if metadata.st_size != fingerprint.size:
+                return _invalid_active_environment(
+                    f"asset size changed: {relative.as_posix()}",
+                    environment_dir,
+                    state_value,
+                )
+            if metadata.st_mtime_ns != fingerprint.mtime_ns:
+                return _invalid_active_environment(
+                    f"asset mtime_ns changed: {relative.as_posix()}",
+                    environment_dir,
+                    state_value,
+                )
 
     return ActiveEnvironmentCheck(True, "ready", environment_dir, state_value)
+
+
+def inspect_active_environment(
+    paths: EnvironmentPaths,
+    definition: ModelEnvironmentDefinition,
+    manifest_sha256: str,
+) -> ActiveEnvironmentCheck:
+    """active build와 state를 변경 없이 빠른 fingerprint 방식으로 검사한다."""
+    return _inspect_active_environment(
+        paths,
+        definition,
+        manifest_sha256,
+        check_asset_metadata=True,
+    )
+
+
+def inspect_active_environment_for_verification(
+    paths: EnvironmentPaths,
+    definition: ModelEnvironmentDefinition,
+    manifest_sha256: str,
+) -> ActiveEnvironmentCheck:
+    """full SHA 검증 직전에 asset metadata drift만 유예해 active build를 해석한다."""
+    return _inspect_active_environment(
+        paths,
+        definition,
+        manifest_sha256,
+        check_asset_metadata=False,
+    )
 
 
 def _require_absolute_directory(path: Path, context: str) -> Path:

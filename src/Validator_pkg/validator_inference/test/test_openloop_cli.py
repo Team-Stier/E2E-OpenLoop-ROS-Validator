@@ -193,41 +193,20 @@ def test_setup_prints_phase_error_and_returns_nonzero(
     assert capsys.readouterr().err == "openloop: assets: checkpoint is missing\n"
 
 
-def test_run_uses_only_fast_read_only_inspection_before_exec(
+def test_run_delegates_to_read_only_runtime_preflight_before_exec(
     cli: ModuleType, monkeypatch, tmp_path: Path
 ):
-    calls: list[str] = []
-    manifest = SimpleNamespace(manifest_path=tmp_path / "manifest.json")
-    definition = object()
-    paths = object()
+    calls: list[Any] = []
+
+    def preflight(project_root: Path, model_id: str):
+        calls.append(("preflight", project_root, model_id))
+        return SimpleNamespace(warnings=("runtime warning",), changed=False)
 
     monkeypatch.setattr(
-        cli,
-        "load_environment_manifest",
-        lambda path: calls.append(f"load:{path}") or manifest,
-    )
-    monkeypatch.setattr(
-        cli,
-        "select_model_environment",
-        lambda observed, model: calls.append(f"select:{model}") or definition,
-    )
-    monkeypatch.setattr(
-        cli,
-        "environment_paths",
-        lambda root, model: calls.append(f"paths:{model}") or paths,
-    )
-    monkeypatch.setattr(
-        cli,
-        "sha256_file",
-        lambda path: calls.append(f"sha:{path}") or "a" * 64,
-    )
-    monkeypatch.setattr(
-        cli,
-        "inspect_active_environment",
-        lambda observed_paths, observed_definition, digest: (
-            calls.append("inspect")
-            or SimpleNamespace(valid=True, reason="ready")
-        ),
+        cli.environment_setup,
+        "preflight_run_environment",
+        preflight,
+        raising=False,
     )
     monkeypatch.setattr(
         cli.environment_setup,
@@ -239,7 +218,7 @@ def test_run_uses_only_fast_read_only_inspection_before_exec(
         pass
 
     def execvpe(program: str, argv: list[str], environment: dict[str, str]):
-        calls.append("exec")
+        calls.append(("exec", program))
         assert program == "roslaunch"
         assert isinstance(argv, list)
         assert argv == cli._launch_argv(tmp_path.resolve(), "interfuser", True)
@@ -251,28 +230,23 @@ def test_run_uses_only_fast_read_only_inspection_before_exec(
     with pytest.raises(ExecCalled):
         cli.main(["interfuser", "--rviz"], project_root=tmp_path)
 
-    assert [entry.split(":", 1)[0] for entry in calls] == [
-        "load",
-        "select",
-        "paths",
-        "sha",
-        "inspect",
-        "exec",
+    assert calls == [
+        ("preflight", tmp_path.resolve(), "interfuser"),
+        ("exec", "roslaunch"),
     ]
 
 
-def test_stale_run_prints_only_recovery_diagnostic_and_never_starts_ros(
+def test_runtime_preflight_failure_prints_only_recovery_and_never_starts_ros(
     cli: ModuleType, monkeypatch, tmp_path: Path, capsys
 ):
-    manifest = SimpleNamespace(manifest_path=tmp_path / "manifest.json")
-    monkeypatch.setattr(cli, "load_environment_manifest", lambda _path: manifest)
-    monkeypatch.setattr(cli, "select_model_environment", lambda *_args: object())
-    monkeypatch.setattr(cli, "environment_paths", lambda *_args: object())
-    monkeypatch.setattr(cli, "sha256_file", lambda _path: "a" * 64)
+    def fail(*_args, **_kwargs):
+        raise EnvironmentSetupError("runtime_preflight", "required import is missing")
+
     monkeypatch.setattr(
-        cli,
-        "inspect_active_environment",
-        lambda *_args: SimpleNamespace(valid=False, reason="missing"),
+        cli.environment_setup,
+        "preflight_run_environment",
+        fail,
+        raising=False,
     )
     monkeypatch.setattr(
         cli.os,

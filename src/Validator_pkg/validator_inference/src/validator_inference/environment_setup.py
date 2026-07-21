@@ -25,7 +25,7 @@ import stat
 import subprocess
 import tempfile
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -56,6 +56,7 @@ from validator_inference.model_environment import (
     build_uv_venv_argv,
     environment_paths,
     inspect_active_environment,
+    inspect_active_environment_for_verification,
     load_environment_manifest,
     read_environment_state,
     select_model_environment,
@@ -105,6 +106,7 @@ _NVCC_11_8_OUTPUT = re.compile(r"\brelease 11\.8(?:,|\s|\Z)")
 _COMPILER_VERSION_OUTPUT = re.compile(
     r"([0-9]+)(?:\.([0-9]+))?(?:\.([0-9]+))?\Z"
 )
+_VERSIONED_PYTHON_EXECUTABLE = re.compile(r"python([0-9]+)\.([0-9]+)\Z")
 _SPARSE_COMPILER_MIN_MAJOR = 6
 _SPARSE_COMPILER_MAX_MAJOR = 11
 _ASSETS_ACTION = "assets"
@@ -2706,21 +2708,12 @@ def _setup_stdout(result: Any, action: str, context: str) -> str:
     return stdout
 
 
-def _build_catkin_messages(
+def _validate_catkin_messages_read_only(
     preflight: EnvironmentPreflight,
     dependencies: EnvironmentSetupDependencies,
     runner: Callable[..., Any],
 ) -> Path:
-    """Catkin workspace와 generated validator_msgs system-Python import를 검증한다."""
-    catkin_make = _lookup_preflight_executable(
-        dependencies.preflight_dependencies, "catkin_make", "catkin_make"
-    )
-    _run_setup_command(
-        runner,
-        (str(catkin_make),),
-        "catkin_build",
-        cwd=preflight.root,
-    )
+    """기존 Catkin output과 generated validator_msgs를 변경 없이 검사한다."""
     catkin_python = (
         preflight.root / "devel" / "lib" / "python3" / "dist-packages"
     )
@@ -2743,11 +2736,30 @@ def _build_catkin_messages(
     )
     _run_setup_command(
         runner,
-        (str(system_python), "-c", import_code),
+        (str(system_python), "-B", "-c", import_code),
         "catkin_messages",
         cwd=preflight.root,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
     return catkin_python
+
+
+def _build_catkin_messages(
+    preflight: EnvironmentPreflight,
+    dependencies: EnvironmentSetupDependencies,
+    runner: Callable[..., Any],
+) -> Path:
+    """Catkin workspace를 build한 뒤 generated validator_msgs를 검증한다."""
+    catkin_make = _lookup_preflight_executable(
+        dependencies.preflight_dependencies, "catkin_make", "catkin_make"
+    )
+    _run_setup_command(
+        runner,
+        (str(catkin_make),),
+        "catkin_build",
+        cwd=preflight.root,
+    )
+    return _validate_catkin_messages_read_only(preflight, dependencies, runner)
 
 
 def _call_asset_fetcher(
@@ -2822,11 +2834,13 @@ def _validate_source_checkout(
     git = _lookup_preflight_executable(
         dependencies.preflight_dependencies, "git", "git"
     )
+    git_environment = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     head_result = _run_setup_command(
         runner,
         (str(git), "-C", str(checkout), "rev-parse", "HEAD"),
         "source_verification",
         cwd=preflight.root,
+        env=git_environment,
         capture_output=True,
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
     )
@@ -2853,6 +2867,7 @@ def _validate_source_checkout(
         ),
         "source_verification",
         cwd=preflight.root,
+        env=git_environment,
         capture_output=True,
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
     )
@@ -3151,6 +3166,8 @@ def _state_generated_paths(
     checkout: Path,
     state: EnvironmentState,
     runtime_count: int,
+    *,
+    action: str = "reuse_verification",
 ) -> tuple[Path, ...]:
     """state tail이 model별 exact generated artifact set인지 검증해 반환한다."""
     tail = tuple(item.path for item in state.assets[runtime_count:])
@@ -3159,17 +3176,67 @@ def _state_generated_paths(
         expected = (_diffusion_generated_path(preflight, checkout),)
         if tail != expected:
             _raise(
-                "reuse_verification",
+                action,
                 "state is missing the trusted DiffusionDrive derivative fingerprint",
             )
         return tail
     if model_id == "sparsedrive_v2":
         return _validate_sparse_generated_paths(
-            preflight, checkout, tail, "reuse_verification"
+            preflight, checkout, tail, action
         )
     if tail:
-        _raise("reuse_verification", "state contains unexpected generated artifacts")
+        _raise(action, "state contains unexpected generated artifacts")
     return ()
+
+
+def _validate_state_asset_contract(
+    preflight: EnvironmentPreflight,
+    checkout: Path,
+    state: EnvironmentState,
+    *,
+    action: str,
+) -> tuple[Path, ...]:
+    """state asset prefix/tail을 현재 profile과 model generated 계약에 맞춘다."""
+    declarations = _runtime_asset_declarations(preflight)
+    if preflight.definition.model_id == "interfuser":
+        _require_interfuser_asset_contract(preflight, declarations)
+    if len(state.assets) < len(declarations):
+        _raise(action, "environment state is missing declared runtime assets")
+    runtime_state = state.assets[: len(declarations)]
+    for declaration, fingerprint in zip(declarations, runtime_state):
+        if fingerprint.path != declaration.relative_path:
+            _raise(action, "environment state runtime asset paths are stale")
+        if (
+            declaration.expected_sha256 is not None
+            and fingerprint.sha256 != declaration.expected_sha256
+        ):
+            _raise(action, "environment state runtime asset SHA is stale")
+    return _state_generated_paths(
+        preflight,
+        checkout,
+        state,
+        len(declarations),
+        action=action,
+    )
+
+
+def _expected_source_checkout(preflight: EnvironmentPreflight, action: str) -> Path:
+    """선택 profile의 고정 source checkout을 deep asset verifier 없이 해석한다."""
+    try:
+        from validator_inference.assets import AssetError, source_checkout_path
+
+        checkout = source_checkout_path(
+            preflight.selected_profile.data, preflight.root
+        )
+    except (AssetError, KeyError, TypeError, ValueError) as exc:
+        raise EnvironmentSetupError(action, "cannot resolve model source checkout") from exc
+    checkout = _canonical_absolute_posix_path(checkout, "source checkout", action)
+    _require_real_directory(checkout, action, "source checkout")
+    try:
+        checkout.relative_to(preflight.root / "models" / "sources")
+    except ValueError:
+        _raise(action, "source checkout escapes models/sources")
+    return checkout
 
 
 def _fingerprint_environment_inputs(
@@ -4517,6 +4584,7 @@ def _validate_candidate_python_version(
         runner,
         (
             str(candidate_python),
+            "-B",
             "-c",
             "import platform; print(platform.python_version())",
         ),
@@ -5001,7 +5069,7 @@ def _run_ros_smoke(
     dependencies: EnvironmentSetupDependencies,
     runner: Callable[..., Any],
 ) -> None:
-    """injected hook 또는 bounded target-Python ROS/message import smoke를 실행한다."""
+    """injected hook 또는 system/target 양방향 ROS 호환성 smoke를 실행한다."""
     if dependencies.ros_smoke is not None:
         try:
             dependencies.ros_smoke(candidate_python, dict(child_environment))
@@ -5010,6 +5078,92 @@ def _run_ros_smoke(
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             raise EnvironmentSetupError("ros_smoke", f"ROS smoke failed: {exc}") from exc
         return
+    policy = _ros_runtime_path_policy(
+        preflight,
+        candidate_python,
+        preflight.root / "devel" / "lib" / "python3" / "dist-packages",
+    )
+    try:
+        _run_ros_compatibility_smoke(policy)
+    except EnvironmentSetupError:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        raise EnvironmentSetupError("ros_smoke", f"ROS smoke failed: {exc}") from exc
+
+
+def _ros_runtime_path_policy(
+    preflight: EnvironmentPreflight,
+    candidate_python: Path,
+    catkin_python: Path,
+) -> Any:
+    """resolved candidate interpreter의 base stdlib 하나로 ROS path policy를 만든다."""
+    action = "ros_smoke"
+    candidate = candidate_python.parent.parent
+    if candidate_python != candidate / "bin" / "python":
+        _raise(action, "target Python must be candidate/bin/python")
+    try:
+        resolved_python = candidate_python.resolve(strict=True)
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, "target Python cannot be resolved"
+        ) from exc
+    version = _VERSIONED_PYTHON_EXECUTABLE.fullmatch(resolved_python.name)
+    if version is None:
+        _raise(action, "resolved target Python must be named pythonX.Y")
+    stdlib = (
+        resolved_python.parent.parent
+        / "lib"
+        / f"python{version.group(1)}.{version.group(2)}"
+    )
+    try:
+        resolved_stdlib = stdlib.resolve(strict=True)
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, "resolved target Python base stdlib is missing"
+        ) from exc
+    if not resolved_stdlib.is_dir():
+        _raise(action, "resolved target Python base stdlib must be a directory")
+    source_root = _canonical_absolute_posix_path(
+        preflight.package_root / "src",
+        "validator_inference source root",
+        action,
+    )
+    _require_real_directory(
+        source_root, action, "validator_inference source root"
+    )
+    try:
+        from validator_inference.ros_compatibility import RuntimePathPolicy
+    except (ImportError, AttributeError) as exc:
+        raise EnvironmentSetupError(
+            action, "ROS compatibility runtime is unavailable"
+        ) from exc
+    return RuntimePathPolicy(
+        target_python=candidate_python,
+        target_environment=candidate,
+        ros_overlay=candidate / ".ros-overlay",
+        catkin_python_path=catkin_python,
+        target_stdlib_paths=(resolved_stdlib,),
+        project_source_paths=(source_root,),
+    )
+
+
+def _run_ros_compatibility_smoke(policy: Any) -> None:
+    """full ROS smoke implementation을 lazy import해 setup module cycle을 피한다."""
+    from validator_inference.ros_compatibility import run_ros_compatibility_smoke
+
+    run_ros_compatibility_smoke(
+        policy,
+        timeout_seconds=_SETUP_COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def _run_target_ros_import_smoke(
+    candidate_python: Path,
+    candidate: Path,
+    child_environment: Mapping[str, str],
+    runner: Callable[..., Any],
+) -> None:
+    """roslaunch 직전 target interpreter의 overlay와 generated message imports를 검사한다."""
     code = (
         "import rospy; import std_msgs.msg; import sensor_msgs.msg; "
         "import geometry_msgs.msg; import nav_msgs.msg; import tf2_msgs.msg; "
@@ -5018,43 +5172,150 @@ def _run_ros_smoke(
     )
     _run_setup_command(
         runner,
-        (str(candidate_python), "-c", code),
-        "ros_smoke",
-        cwd=preflight.root,
+        (str(candidate_python), "-B", "-c", code),
+        "target_ros_import",
+        cwd=candidate,
         env=child_environment,
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
     )
 
 
-def _run_candidate_runtime_checks(
+def _verify_import_origin_file(
+    origin: Path,
+    trusted_root: Path,
+    context: str,
+) -> Path:
+    """민감 module origin이 real trusted root 아래 regular file인지 확인한다."""
+    action = "required_imports"
+    _require_real_directory(trusted_root, action, f"{context} root")
+    try:
+        resolved_root = trusted_root.resolve(strict=True)
+        resolved_origin = origin.resolve(strict=True)
+        metadata = resolved_origin.stat()
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            action, f"{context} origin cannot be resolved: {origin}"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        _raise(action, f"{context} origin must be a regular file: {origin}")
+    try:
+        resolved_origin.relative_to(resolved_root)
+    except ValueError:
+        _raise(action, f"{context} origin escapes trusted root: {origin}")
+    return resolved_origin
+
+
+def _run_candidate_import_cuda_checks(
     preflight: EnvironmentPreflight,
     candidate: Path,
     child_environment: Mapping[str, str],
     runner: Callable[..., Any],
 ) -> Optional[str]:
-    """required imports, CUDA policy와 strict selected-model load를 순서대로 실행한다."""
+    """required imports의 origin과 CUDA policy를 model load 없이 검사한다."""
     python = candidate / "bin" / "python"
-    imports_code = (
-        "import importlib; names = "
-        f"{preflight.definition.required_imports!r}; "
-        "[importlib.import_module(name) for name in names]"
+    checkout = _expected_source_checkout(preflight, "required_imports")
+    source_import_root = (
+        checkout / "interfuser"
+        if preflight.definition.model_id == "interfuser"
+        else None
     )
-    _run_setup_command(
+    if source_import_root is not None:
+        _require_real_directory(
+            source_import_root, "required_imports", "InterFuser vendored package root"
+        )
+    imports_code = (
+        "import importlib, json, pathlib, sys; names = "
+        f"{preflight.definition.required_imports!r}; "
+        "source_root = pathlib.Path(sys.argv[1]) if sys.argv[1] else None; "
+        "sys.path.insert(0, str(source_root)) if source_root is not None else None; "
+        "modules = [importlib.import_module(name) for name in names]; "
+        "print(json.dumps([getattr(module, '__file__', None) for module in modules]))"
+    )
+    import_result = _run_setup_command(
         runner,
-        (str(python), "-c", imports_code),
+        (
+            str(python),
+            "-B",
+            "-c",
+            imports_code,
+            str(source_import_root) if source_import_root is not None else "",
+        ),
         "required_imports",
-        cwd=preflight.root,
+        cwd=candidate,
         env=child_environment,
+        capture_output=True,
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
     )
+    try:
+        origins = json.loads(
+            _setup_stdout(import_result, "required_imports", "required import origins")
+        )
+    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
+        raise EnvironmentSetupError(
+            "required_imports", "required imports returned invalid origin JSON"
+        ) from exc
+    if (
+        not isinstance(origins, list)
+        or len(origins) != len(preflight.definition.required_imports)
+        or any(not isinstance(origin, str) or not origin for origin in origins)
+    ):
+        _raise("required_imports", "required imports returned invalid origins")
+    origin_paths = tuple(
+        _canonical_absolute_posix_path(
+            origin, f"required import {name} origin", "required_imports"
+        )
+        for name, origin in zip(preflight.definition.required_imports, origins)
+    )
+    if preflight.definition.model_id == "interfuser":
+        if "timm" not in preflight.definition.required_imports:
+            _raise("required_imports", "InterFuser requires vendored timm import")
+        timm_index = preflight.definition.required_imports.index("timm")
+        try:
+            origin_paths[timm_index].relative_to(source_import_root / "timm")
+        except ValueError:
+            _raise("required_imports", "InterFuser timm origin escapes pinned checkout")
+        _verify_import_origin_file(
+            origin_paths[timm_index],
+            source_import_root / "timm",
+            "InterFuser timm",
+        )
+    if preflight.definition.model_id == "sparsedrive_v2":
+        sparse_origins = tuple(
+            origin_paths[preflight.definition.required_imports.index(module)]
+            for module in _SPARSE_EXTENSION_MODULES
+        )
+        sparse_ops = checkout / _SPARSE_OPS
+        for origin in sparse_origins:
+            try:
+                origin.relative_to(sparse_ops)
+            except ValueError:
+                _raise(
+                    "required_imports",
+                    "SparseDrive extension origin escapes attested ops directory",
+                )
+        try:
+            project_paths = tuple(
+                origin.relative_to(preflight.root) for origin in sparse_origins
+            )
+        except ValueError:
+            _raise("required_imports", "SparseDrive extension origin escapes project root")
+        selected = _validate_sparse_generated_paths(
+            preflight, checkout, project_paths, "required_imports"
+        )
+        for origin in sparse_origins:
+            _verify_import_origin_file(
+                origin, sparse_ops, "SparseDrive extension"
+            )
+        if selected != _existing_sparse_generated_paths(preflight, checkout):
+            _raise("required_imports", "SparseDrive extension origin is not the attested pair")
     cuda_code = (
         "import torch; print('1' if torch.cuda.is_available() else '0')"
     )
     cuda_result = _run_setup_command(
         runner,
-        (str(python), "-c", cuda_code),
+        (str(python), "-B", "-c", cuda_code),
         "cuda_runtime",
-        cwd=preflight.root,
+        cwd=candidate,
         env=child_environment,
         capture_output=True,
         timeout=_SETUP_COMMAND_TIMEOUT_SECONDS,
@@ -5075,6 +5336,17 @@ def _run_candidate_runtime_checks(
             "candidate torch CUDA is not available; continuing because "
             f"{preflight.definition.model_id} declares cuda_policy=recommended"
         )
+    return runtime_warning
+
+
+def _run_selected_model_load(
+    preflight: EnvironmentPreflight,
+    candidate: Path,
+    child_environment: Mapping[str, str],
+    runner: Callable[..., Any],
+) -> None:
+    """선택 profile의 실제 model wrapper load를 별도 strict 단계로 실행한다."""
+    python = candidate / "bin" / "python"
     profile_path = preflight.root / "src" / "Validator_pkg" / "config" / "profile.json"
     model_code = (
         "import pathlib, sys; "
@@ -5088,6 +5360,7 @@ def _run_candidate_runtime_checks(
         runner,
         (
             str(python),
+            "-B",
             "-c",
             model_code,
             str(preflight.root),
@@ -5099,6 +5372,19 @@ def _run_candidate_runtime_checks(
         env=child_environment,
         timeout=_MODEL_LOAD_TIMEOUT_SECONDS,
     )
+
+
+def _run_candidate_runtime_checks(
+    preflight: EnvironmentPreflight,
+    candidate: Path,
+    child_environment: Mapping[str, str],
+    runner: Callable[..., Any],
+) -> Optional[str]:
+    """required imports/CUDA를 확인한 뒤 strict selected-model load를 실행한다."""
+    runtime_warning = _run_candidate_import_cuda_checks(
+        preflight, candidate, child_environment, runner
+    )
+    _run_selected_model_load(preflight, candidate, child_environment, runner)
     return runtime_warning
 
 
@@ -5132,6 +5418,21 @@ def _installed_packages_sha256(
     return hashlib.sha256(normalized).hexdigest()
 
 
+@dataclass(frozen=True)
+class _DeepVerificationResult:
+    """deep verification의 runtime warning과 안정된 input fingerprint를 보관한다."""
+
+    runtime_warning: Optional[str]
+    fingerprints: tuple[AssetFingerprint, ...]
+
+
+def _fingerprint_content_identity(
+    fingerprints: Sequence[AssetFingerprint],
+) -> tuple[tuple[Path, str], ...]:
+    """metadata drift와 독립적인 ordered path/SHA identity를 반환한다."""
+    return tuple((fingerprint.path, fingerprint.sha256) for fingerprint in fingerprints)
+
+
 def _deep_verify_environment(
     preflight: EnvironmentPreflight,
     environment_dir: Path,
@@ -5139,7 +5440,7 @@ def _deep_verify_environment(
     catkin_python: Path,
     dependencies: EnvironmentSetupDependencies,
     runner: Callable[..., Any],
-) -> Optional[str]:
+) -> _DeepVerificationResult:
     """fast-valid current의 overlay/assets/interpreter/model/freeze를 deep 검증한다."""
     if state.preflight_ids != _SETUP_PREFLIGHT_IDS:
         _raise(
@@ -5148,9 +5449,11 @@ def _deep_verify_environment(
         )
     metadata = _call_asset_verifier(preflight, dependencies)
     checkout = _source_checkout_from_metadata(preflight, metadata)
-    runtime_count = len(_runtime_asset_declarations(preflight))
-    generated_paths = _state_generated_paths(
-        preflight, checkout, state, runtime_count
+    generated_paths = _validate_state_asset_contract(
+        preflight,
+        checkout,
+        state,
+        action="reuse_verification",
     )
     allowed_source_paths = _source_relative_generated_paths(
         preflight,
@@ -5168,7 +5471,9 @@ def _deep_verify_environment(
     fingerprints = _fingerprint_environment_inputs(
         preflight, checkout, generated_paths
     )
-    if fingerprints != state.assets:
+    if _fingerprint_content_identity(fingerprints) != _fingerprint_content_identity(
+        state.assets
+    ):
         _raise("reuse_verification", "runtime asset fingerprint or SHA changed")
     overlay_sha256 = verify_ros_overlay(
         environment_dir / ".ros-overlay",
@@ -5208,12 +5513,19 @@ def _deep_verify_environment(
     final_fingerprints = _fingerprint_environment_inputs(
         preflight, checkout, generated_paths
     )
-    if final_fingerprints != state.assets:
+    if _fingerprint_content_identity(
+        final_fingerprints
+    ) != _fingerprint_content_identity(state.assets):
         _raise(
             "reuse_verification",
             "runtime or generated artifact changed during verification",
         )
-    return runtime_warning
+    if final_fingerprints != fingerprints:
+        _raise(
+            "reuse_verification",
+            "runtime or generated artifact changed during verification",
+        )
+    return _DeepVerificationResult(runtime_warning, final_fingerprints)
 
 
 def _merge_setup_warnings(
@@ -5321,7 +5633,7 @@ def setup_environment(
             if active.valid:
                 if active.environment_dir is None or active.state is None:
                     _raise("reuse_verification", "active inspection lost environment state")
-                runtime_warning = _deep_verify_environment(
+                verification = _deep_verify_environment(
                     preflight,
                     active.environment_dir,
                     active.state,
@@ -5333,7 +5645,7 @@ def setup_environment(
                     environment_dir=active.environment_dir,
                     state=active.state,
                     warnings=_merge_setup_warnings(
-                        preflight.warnings, runtime_warning
+                        preflight.warnings, verification.runtime_warning
                     ),
                     changed=False,
                 )
@@ -5562,4 +5874,162 @@ def setup_environment(
                 + tuple(cleanup_warnings)
             ),
             changed=True,
+        )
+
+
+def verify_environment(
+    project_root: Path,
+    model_id: str,
+    runner: Callable[..., Any] = subprocess.run,
+    *,
+    dependencies: Optional[EnvironmentSetupDependencies] = None,
+) -> EnvironmentOperationResult:
+    """active environment를 full hash/load/freeze 검증하고 metadata drift만 갱신한다."""
+    selected_dependencies = dependencies or EnvironmentSetupDependencies()
+    if not isinstance(selected_dependencies, EnvironmentSetupDependencies):
+        _raise("verify_environment", "dependencies must be EnvironmentSetupDependencies")
+    preflight = preflight_environment(
+        project_root,
+        model_id,
+        runner=runner,
+        dependencies=selected_dependencies.preflight_dependencies,
+    )
+    with _model_operation_lock(
+        preflight.paths, "verify_environment", create_root=False
+    ):
+        manifest_sha256 = sha256_file(preflight.manifest.manifest_path)
+        active = inspect_active_environment_for_verification(
+            preflight.paths, preflight.definition, manifest_sha256
+        )
+        if not active.valid or active.environment_dir is None or active.state is None:
+            _raise("verify_environment", active.reason)
+        catkin_python = _validate_catkin_messages_read_only(
+            preflight, selected_dependencies, runner
+        )
+        verification = _deep_verify_environment(
+            preflight,
+            active.environment_dir,
+            active.state,
+            catkin_python,
+            selected_dependencies,
+            runner,
+        )
+        refreshed = replace(active.state, assets=verification.fingerprints)
+        changed = refreshed != active.state
+        if changed:
+            state_path = active.environment_dir / ENVIRONMENT_STATE_FILENAME
+            try:
+                write_environment_state(state_path, refreshed)
+                observed = read_environment_state(active.environment_dir)
+            except (EnvironmentStateError, OSError) as exc:
+                raise EnvironmentSetupError("verify_environment", str(exc)) from exc
+            if observed != refreshed:
+                _raise("verify_environment", "refreshed environment state readback mismatch")
+            final = inspect_active_environment(
+                preflight.paths, preflight.definition, manifest_sha256
+            )
+            if (
+                not final.valid
+                or final.environment_dir != active.environment_dir
+                or final.state != refreshed
+            ):
+                _raise("verify_environment", "environment changed during state refresh")
+        return EnvironmentOperationResult(
+            environment_dir=active.environment_dir,
+            state=refreshed,
+            warnings=_merge_setup_warnings(
+                preflight.warnings, verification.runtime_warning
+            ),
+            changed=changed,
+        )
+
+
+def prune_environment_builds(
+    project_root: Path, model_id: str
+) -> tuple[Path, ...]:
+    """host/profile probe 없이 검증된 model path의 inactive builds만 제거한다."""
+    if model_id not in SUPPORTED_MODEL_IDS:
+        _raise("prune_environment_builds", f"unsupported model_id: {model_id}")
+    root = _canonical_absolute_posix_path(
+        project_root, "project root", "prune_environment_builds"
+    )
+    _require_real_directory(root, "prune_environment_builds", "project root")
+    return prune_inactive_builds(environment_paths(root, model_id))
+
+
+def preflight_run_environment(
+    project_root: Path,
+    model_id: str,
+    runner: Callable[..., Any] = subprocess.run,
+    *,
+    dependencies: Optional[EnvironmentSetupDependencies] = None,
+) -> EnvironmentOperationResult:
+    """install/hash/model-load 없이 현재 environment의 실제 runtime readiness를 검사한다."""
+    selected_dependencies = dependencies or EnvironmentSetupDependencies()
+    if not isinstance(selected_dependencies, EnvironmentSetupDependencies):
+        _raise("runtime_preflight", "dependencies must be EnvironmentSetupDependencies")
+    preflight = preflight_environment(
+        project_root,
+        model_id,
+        runner=runner,
+        dependencies=selected_dependencies.preflight_dependencies,
+    )
+    with _model_operation_lock(
+        preflight.paths, "runtime_preflight", create_root=False
+    ):
+        manifest_sha256 = sha256_file(preflight.manifest.manifest_path)
+        active = inspect_active_environment(
+            preflight.paths, preflight.definition, manifest_sha256
+        )
+        if not active.valid or active.environment_dir is None or active.state is None:
+            _raise("runtime_preflight", active.reason)
+        if active.state.preflight_ids != _SETUP_PREFLIGHT_IDS:
+            _raise("runtime_preflight", "environment preflight identifiers are stale")
+        checkout = _expected_source_checkout(preflight, "runtime_preflight")
+        generated_paths = _validate_state_asset_contract(
+            preflight,
+            checkout,
+            active.state,
+            action="runtime_preflight",
+        )
+        allowed_source_paths = _source_relative_generated_paths(
+            preflight,
+            checkout,
+            generated_paths,
+            "runtime_preflight",
+        )
+        metadata = {
+            "source": {
+                "checkout": str(checkout),
+                "observed_commit": preflight.definition.source_commit,
+            }
+        }
+        _validate_source_checkout(
+            preflight,
+            metadata,
+            selected_dependencies,
+            runner,
+            allowed_generated_paths=allowed_source_paths,
+        )
+        catkin_python = _validate_catkin_messages_read_only(
+            preflight, selected_dependencies, runner
+        )
+        python = _require_executable_file(
+            active.environment_dir / "bin" / "python", "candidate Python"
+        )
+        _validate_candidate_python_version(preflight, python, runner)
+        child_environment = _build_candidate_child_environment(
+            preflight, active.environment_dir, catkin_python
+        )
+        _run_target_ros_import_smoke(
+            python, active.environment_dir, child_environment, runner
+        )
+        runtime_warning = _run_candidate_import_cuda_checks(
+            preflight, active.environment_dir, child_environment, runner
+        )
+        return EnvironmentOperationResult(
+            environment_dir=active.environment_dir,
+            state=active.state,
+            warnings=_merge_setup_warnings(preflight.warnings, runtime_warning),
+            changed=False,
         )

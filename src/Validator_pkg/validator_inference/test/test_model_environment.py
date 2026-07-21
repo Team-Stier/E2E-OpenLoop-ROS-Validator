@@ -27,6 +27,7 @@ from validator_inference.model_environment import (
     build_uv_venv_argv,
     environment_paths,
     inspect_active_environment,
+    inspect_active_environment_for_verification,
     load_environment_manifest,
     read_environment_state,
     select_model_environment,
@@ -846,6 +847,30 @@ def test_inspect_active_environment_rejects_stale_or_unsafe_assets(
 
     assert not check.valid
     assert reason in check.reason
+
+
+def test_verification_inspection_defers_only_asset_metadata_drift(
+    tmp_path: Path, manifest: EnvironmentManifest
+):
+    """deep verify 전용 검사는 asset metadata drift만 유예하고 state를 반환한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, state = _active_environment_fixture(tmp_path, definition)
+    asset = tmp_path / state.assets[0].path
+    changed = state.assets[0].mtime_ns + 1_000_000
+    os.utime(asset, ns=(changed, changed))
+
+    assert not inspect_active_environment(paths, definition, "a" * 64).valid
+    assert inspect_active_environment_for_verification(
+        paths, definition, "a" * 64
+    ) == ActiveEnvironmentCheck(True, "ready", environment_dir.resolve(), state)
+
+    paths.current.unlink()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    paths.current.symlink_to(outside)
+    assert not inspect_active_environment_for_verification(
+        paths, definition, "a" * 64
+    ).valid
 
 
 def test_inspect_active_environment_rejects_symlinked_asset_parent(

@@ -20,11 +20,6 @@ from validator_inference.model_environment import (
     SUPPORTED_MODEL_IDS,
     EnvironmentConfigError,
     EnvironmentStateError,
-    environment_paths,
-    inspect_active_environment,
-    load_environment_manifest,
-    select_model_environment,
-    sha256_file,
 )
 
 
@@ -166,16 +161,19 @@ def _emit_warnings(result: Any) -> None:
 
 
 def _run_model(project_root: Path, model_id: str, rviz: bool) -> int:
-    """빠른 read-only state 검사 후 통합 roslaunch로 process를 교체한다."""
-    manifest = load_environment_manifest(project_root / _MANIFEST_RELATIVE_PATH)
-    definition = select_model_environment(manifest, model_id)
-    paths = environment_paths(project_root, model_id)
-    manifest_sha256 = sha256_file(manifest.manifest_path)
-    active = inspect_active_environment(paths, definition, manifest_sha256)
-    if not active.valid:
+    """실제 read-only runtime 점검 후 통합 roslaunch로 process를 교체한다."""
+    try:
+        result = environment_setup.preflight_run_environment(project_root, model_id)
+    except (
+        environment_setup.EnvironmentSetupError,
+        EnvironmentConfigError,
+        EnvironmentStateError,
+        OSError,
+    ):
         print(f"{model_id} environment is missing or stale.", file=sys.stderr)
         print(f"Run: ./openloop setup {model_id}", file=sys.stderr)
         return 1
+    _emit_warnings(result)
 
     argv = _launch_argv(project_root, model_id, rviz)
     os.execvpe(argv[0], argv, dict(os.environ))
