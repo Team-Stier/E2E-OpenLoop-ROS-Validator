@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -17,7 +19,7 @@ import shutil
 import stat
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
 from validator_inference.model_environment import (
     ROS_OVERLAY_MANIFEST_FILENAME,
@@ -50,6 +52,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MANIFEST_KEYS = {"schema", "packages", "files"}
 _FILE_KEYS = {"source", "destination", "sha256"}
 _NATIVE_SUFFIXES = (".so", ".pyd", ".dylib", ".dll")
+_LIFECYCLE_LOCK_FILENAME = ".lifecycle.lock"
 
 
 class EnvironmentSetupError(RuntimeError):
@@ -105,6 +108,32 @@ def _validate_component(value: str, context: str, action: str) -> None:
         _raise(action, f"{context} must be a safe single component")
 
 
+def _canonical_absolute_posix_path(value: Any, context: str, action: str) -> Path:
+    """입력 문자열을 정규화하지 않고 canonical absolute POSIX path인지 검사한다."""
+    try:
+        raw = os.fspath(value)
+    except TypeError as exc:
+        raise EnvironmentSetupError(
+            action, f"{context} must be a canonical absolute POSIX path"
+        ) from exc
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or "\\" in raw
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        _raise(action, f"{context} must be a canonical absolute POSIX path")
+    pure = PurePosixPath(raw)
+    if (
+        not pure.is_absolute()
+        or raw.startswith("//")
+        or raw != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        _raise(action, f"{context} must be a canonical absolute POSIX path")
+    return Path(*pure.parts)
+
+
 def _reject_existing_symlink_chain(path: Path, action: str, context: str) -> None:
     """존재하는 path와 상위 component 중 symlink가 있으면 따라가기 전에 거부한다."""
     value = Path(path)
@@ -149,6 +178,79 @@ def _ensure_real_directory(path: Path, action: str, context: str) -> None:
     _require_real_directory(path, action, context)
 
 
+@contextmanager
+def _lifecycle_lock(paths: EnvironmentPaths, action: str) -> Iterator[None]:
+    """model root의 안전한 advisory lock으로 lifecycle 변경을 직렬화한다."""
+    _validate_environment_paths(paths, action)
+    model_root = Path(paths.model_root)
+    _require_real_directory(model_root, action, "model root")
+    lock_path = model_root / _LIFECYCLE_LOCK_FILENAME
+    _reject_existing_symlink_chain(lock_path, action, "lifecycle lock")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        _raise(action, "lifecycle lock requires O_NOFOLLOW support")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | no_follow
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(str(lock_path), flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            _raise(action, "lifecycle lock must be a regular unlinked file")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        path_metadata = lock_path.lstat()
+        descriptor_metadata = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(path_metadata.st_mode)
+            or path_metadata.st_dev != descriptor_metadata.st_dev
+            or path_metadata.st_ino != descriptor_metadata.st_ino
+        ):
+            _raise(action, "lifecycle lock path changed during acquisition")
+    except EnvironmentSetupError:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise EnvironmentSetupError(
+            action, f"cannot acquire lifecycle lock: {lock_path}"
+        ) from exc
+
+    body_failed = False
+    try:
+        yield
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        release_error: Optional[OSError] = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError as exc:
+            release_error = exc
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            if release_error is None:
+                release_error = exc
+        if release_error is not None and not body_failed:
+            raise EnvironmentSetupError(
+                action, f"cannot release lifecycle lock: {lock_path}"
+            ) from release_error
+
+
 def create_candidate(paths: EnvironmentPaths, build_id: str) -> Path:
     """고유 build ID의 candidate를 움직이지 않을 최종 builds 경로에 만든다."""
     action = "create_candidate"
@@ -171,7 +273,7 @@ def create_candidate(paths: EnvironmentPaths, build_id: str) -> Path:
 
 
 def _validate_packages(packages: Sequence[str], action: str) -> tuple[str, ...]:
-    """overlay package 목록이 비어 있지 않은 고유 안전 이름인지 검사한다."""
+    """overlay package 목록이 exact 고정 allowlist인지 검사한다."""
     if isinstance(packages, (str, bytes)):
         _raise(action, "packages must be a sequence of package names")
     selected = tuple(packages)
@@ -181,6 +283,8 @@ def _validate_packages(packages: Sequence[str], action: str) -> tuple[str, ...]:
         _validate_component(package, "package", action)
     if len(set(selected)) != len(selected):
         _raise(action, "packages must not contain duplicate names")
+    if selected != PURE_ROS_PACKAGES:
+        _raise(action, "packages must match the exact PURE_ROS_PACKAGES allowlist")
     return selected
 
 
@@ -205,6 +309,7 @@ def _scan_python_tree(
     for entry in ordered:
         source = directory / entry.name
         relative = relative_directory / entry.name
+        _canonical_absolute_posix_path(source, "ROS source entry", action)
         if entry.is_symlink():
             _raise(action, f"ROS package tree contains a symlink: {source}")
         try:
@@ -433,10 +538,8 @@ def build_ros_overlay(
 ) -> RosOverlayManifest:
     """허용 ROS package의 Python source만 새 candidate overlay로 복사한다."""
     action = "build_ros_overlay"
-    source = Path(source_root)
-    target = Path(destination)
-    if not source.is_absolute() or not target.is_absolute():
-        _raise(action, "source_root and destination must be absolute paths")
+    source = _canonical_absolute_posix_path(source_root, "source_root", action)
+    target = _canonical_absolute_posix_path(destination, "destination", action)
     _require_real_directory(source, action, "ROS source root")
     _reject_existing_symlink_chain(target.parent, action, "overlay parent")
     if target.is_symlink() or target.exists():
@@ -522,7 +625,12 @@ def _require_exact_keys(
 
 def _safe_destination(value: Any, packages: tuple[str, ...], action: str) -> Path:
     """manifest destination을 package 아래 canonical 상대 POSIX Python path로 검증한다."""
-    if not isinstance(value, str) or not value or "\\" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
         _raise(action, "file destination must be a safe relative POSIX path")
     pure = PurePosixPath(value)
     if (
@@ -539,11 +647,7 @@ def _safe_destination(value: Any, packages: tuple[str, ...], action: str) -> Pat
 
 def _safe_source(value: Any, destination: Path, action: str) -> Path:
     """manifest source를 destination suffix와 일치하는 절대 경로로 검증한다."""
-    if not isinstance(value, str) or not value or "\x00" in value:
-        _raise(action, "file source must be an absolute path")
-    source = Path(value)
-    if not source.is_absolute():
-        _raise(action, "file source must be an absolute path")
+    source = _canonical_absolute_posix_path(value, "file source", action)
     if len(source.parts) < len(destination.parts) or tuple(
         source.parts[-len(destination.parts) :]
     ) != destination.parts:
@@ -782,35 +886,40 @@ def _validate_candidate(
 def activate_candidate(paths: EnvironmentPaths, candidate: Path) -> None:
     """candidate를 임시 상대 symlink와 os.replace로 원자적으로 활성화한다."""
     action = "activate_candidate"
-    _, relative = _validate_candidate(paths, Path(candidate), action)
-    current = Path(paths.current)
-    model_root = Path(paths.model_root)
-    if not current.is_symlink() and current.exists():
-        _raise(action, f"current exists and is not a symlink: {current}")
-    temporary: Optional[Path] = None
-    try:
-        for _attempt in range(32):
-            candidate_temp = model_root / f".current.{os.getpid()}.{secrets.token_hex(8)}"
-            try:
-                os.symlink(relative.as_posix(), str(candidate_temp))
-                temporary = candidate_temp
-                break
-            except FileExistsError:
-                continue
-        if temporary is None:
-            _raise(action, "cannot allocate a temporary current symlink")
-        os.replace(str(temporary), str(current))
-        temporary = None
-    except EnvironmentSetupError:
-        raise
-    except OSError as exc:
-        raise EnvironmentSetupError(action, f"activate replace failed for {current}") from exc
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+    with _lifecycle_lock(paths, action):
+        _, relative = _validate_candidate(paths, Path(candidate), action)
+        current = Path(paths.current)
+        model_root = Path(paths.model_root)
+        if not current.is_symlink() and current.exists():
+            _raise(action, f"current exists and is not a symlink: {current}")
+        temporary: Optional[Path] = None
+        try:
+            for _attempt in range(32):
+                candidate_temp = (
+                    model_root / f".current.{os.getpid()}.{secrets.token_hex(8)}"
+                )
+                try:
+                    os.symlink(relative.as_posix(), str(candidate_temp))
+                    temporary = candidate_temp
+                    break
+                except FileExistsError:
+                    continue
+            if temporary is None:
+                _raise(action, "cannot allocate a temporary current symlink")
+            os.replace(str(temporary), str(current))
+            temporary = None
+        except EnvironmentSetupError:
+            raise
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                action, f"activate replace failed for {current}"
+            ) from exc
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 def _active_build(paths: EnvironmentPaths, action: str) -> Optional[Path]:
@@ -851,37 +960,41 @@ def prune_inactive_builds(paths: EnvironmentPaths) -> tuple[Path, ...]:
     builds = Path(paths.builds)
     if not model_root.exists() and not model_root.is_symlink():
         return ()
-    _require_real_directory(model_root, action, "model root")
-    active = _active_build(paths, action)
-    if not builds.exists() and not builds.is_symlink():
-        if active is not None:
-            _raise(action, "active build exists while builds directory is missing")
-        return ()
-    _require_real_directory(builds, action, "builds")
-    candidates: list[Path] = []
-    try:
-        with os.scandir(str(builds)) as entries:
-            ordered = sorted(entries, key=lambda entry: entry.name)
-    except OSError as exc:
-        raise EnvironmentSetupError(action, f"cannot scan builds: {builds}") from exc
-    for entry in ordered:
-        candidate = builds / entry.name
-        _validate_component(entry.name, "build_id", action)
-        if entry.is_symlink():
-            _raise(action, f"suspicious symlink in builds: {candidate}")
+    with _lifecycle_lock(paths, action):
+        active = _active_build(paths, action)
+        if not builds.exists() and not builds.is_symlink():
+            if active is not None:
+                _raise(action, "active build exists while builds directory is missing")
+            return ()
+        _require_real_directory(builds, action, "builds")
+        candidates: list[Path] = []
         try:
-            is_directory = entry.is_dir(follow_symlinks=False)
+            with os.scandir(str(builds)) as entries:
+                ordered = sorted(entries, key=lambda entry: entry.name)
         except OSError as exc:
-            raise EnvironmentSetupError(action, f"cannot inspect build: {candidate}") from exc
-        if not is_directory:
-            _raise(action, f"suspicious non-directory entry in builds: {candidate}")
-        candidates.append(candidate)
-    if active is not None and active not in candidates:
-        _raise(action, "active build is not an immediate builds entry")
-    inactive = tuple(candidate for candidate in candidates if candidate != active)
-    for candidate in inactive:
-        try:
-            shutil.rmtree(str(candidate))
-        except OSError as exc:
-            raise EnvironmentSetupError(action, f"cannot prune build: {candidate}") from exc
-    return inactive
+            raise EnvironmentSetupError(action, f"cannot scan builds: {builds}") from exc
+        for entry in ordered:
+            candidate = builds / entry.name
+            _validate_component(entry.name, "build_id", action)
+            if entry.is_symlink():
+                _raise(action, f"suspicious symlink in builds: {candidate}")
+            try:
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    action, f"cannot inspect build: {candidate}"
+                ) from exc
+            if not is_directory:
+                _raise(action, f"suspicious non-directory entry in builds: {candidate}")
+            candidates.append(candidate)
+        if active is not None and active not in candidates:
+            _raise(action, "active build is not an immediate builds entry")
+        inactive = tuple(candidate for candidate in candidates if candidate != active)
+        for candidate in inactive:
+            try:
+                shutil.rmtree(str(candidate))
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    action, f"cannot prune build: {candidate}"
+                ) from exc
+        return inactive

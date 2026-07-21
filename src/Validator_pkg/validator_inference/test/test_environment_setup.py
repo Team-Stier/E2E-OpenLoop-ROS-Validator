@@ -6,6 +6,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 import pytest
@@ -243,6 +244,82 @@ def test_build_ros_overlay_is_byte_deterministic(tmp_path: Path):
     assert (first.parent / ROS_OVERLAY_MANIFEST_FILENAME).read_bytes() == (
         second.parent / ROS_OVERLAY_MANIFEST_FILENAME
     ).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "packages",
+    (
+        EXPECTED_ROS_PACKAGES[:-1],
+        tuple(reversed(EXPECTED_ROS_PACKAGES)),
+        (*EXPECTED_ROS_PACKAGES[:-1], "evil"),
+    ),
+)
+def test_build_ros_overlay_requires_exact_allowlist(
+    tmp_path: Path, packages: tuple[str, ...]
+):
+    """subset, reorder, 미선언 package를 exact ROS allowlist로 허용하지 않는다."""
+    source = _fake_ros_tree(tmp_path)
+    if "evil" in packages:
+        evil = source / "evil"
+        evil.mkdir()
+        (evil / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    with pytest.raises(EnvironmentSetupError, match="exact"):
+        build_ros_overlay(
+            source,
+            tmp_path / "candidate" / ".ros-overlay",
+            packages=packages,
+        )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "source-trailing",
+        "source-dot",
+        "source-duplicate",
+        "destination-parent",
+        "destination-backslash",
+        "destination-control",
+    ),
+)
+def test_build_ros_overlay_requires_canonical_absolute_paths(
+    tmp_path: Path, kind: str
+):
+    """build root 인자의 alias·separator·control 변형을 canonical path로 거부한다."""
+    source = _fake_ros_tree(tmp_path)
+    destination = tmp_path / "candidate" / ".ros-overlay"
+    source_arg: str | Path = source
+    destination_arg: str | Path = destination
+    if kind == "source-trailing":
+        source_arg = str(source) + "/"
+    elif kind == "source-dot":
+        source_arg = f"{source.parent}/./{source.name}"
+    elif kind == "source-duplicate":
+        source_arg = str(source).replace("/ros-dist-packages", "//ros-dist-packages")
+    elif kind == "destination-parent":
+        destination_arg = f"{tmp_path}/candidate/nested/../.ros-overlay"
+    elif kind == "destination-backslash":
+        destination_arg = f"{tmp_path}/candidate/bad\\name/.ros-overlay"
+    else:
+        destination_arg = f"{tmp_path}/candidate/bad\nname/.ros-overlay"
+
+    with pytest.raises(EnvironmentSetupError, match="canonical"):
+        build_ros_overlay(source_arg, destination_arg)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("filename", ("bad\\name.py", "bad\nname.py"))
+def test_build_ros_overlay_rejects_noncanonical_source_entries(
+    tmp_path: Path, filename: str
+):
+    """자기 생성 manifest에 비정규 source path가 기록되기 전에 source entry를 거부한다."""
+    source = _fake_ros_tree(tmp_path)
+    (source / "rospy" / filename).write_text("VALUE = 1\n", encoding="utf-8")
+    destination = tmp_path / "candidate" / ".ros-overlay"
+
+    with pytest.raises(EnvironmentSetupError, match="canonical"):
+        build_ros_overlay(source, destination)
+    assert not destination.exists()
 
 
 def test_build_ros_overlay_requires_package_init_module(tmp_path: Path):
@@ -530,6 +607,59 @@ def test_verify_ros_overlay_rejects_strict_manifest_violations(tmp_path: Path):
         _write_manifest_payload(manifest.manifest_path, original)
 
 
+@pytest.mark.parametrize(
+    "packages",
+    (
+        list(EXPECTED_ROS_PACKAGES[:-1]),
+        list(reversed(EXPECTED_ROS_PACKAGES)),
+        [*EXPECTED_ROS_PACKAGES[:-1], "evil"],
+    ),
+)
+def test_verify_ros_overlay_requires_exact_manifest_allowlist(
+    tmp_path: Path, packages: list[str]
+):
+    """manifest package 목록도 exact 14-package 순서와 값에서 벗어나지 못한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    payload = _manifest_payload(manifest.manifest_path)
+    payload["packages"] = packages
+    _write_manifest_payload(manifest.manifest_path, payload)
+
+    with pytest.raises(EnvironmentSetupError, match="exact"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("dot", "parent", "duplicate", "trailing", "backslash", "control"),
+)
+def test_verify_ros_overlay_rejects_noncanonical_manifest_source_paths(
+    tmp_path: Path, variant: str
+):
+    """manifest source absolute path의 모든 lexical alias와 control 변형을 거부한다."""
+    _, destination, manifest = _build_overlay(tmp_path)
+    payload = _manifest_payload(manifest.manifest_path)
+    source = payload["files"][0]["source"]
+    if variant == "dot":
+        changed = source.replace("/actionlib_msgs/", "/actionlib_msgs/./")
+    elif variant == "parent":
+        changed = source.replace(
+            "/actionlib_msgs/", "/actionlib_msgs/../actionlib_msgs/"
+        )
+    elif variant == "duplicate":
+        changed = source.replace("/actionlib_msgs/", "//actionlib_msgs/")
+    elif variant == "trailing":
+        changed = source + "/"
+    elif variant == "backslash":
+        changed = source.replace("/actionlib_msgs/", "/actionlib_msgs\\")
+    else:
+        changed = source.replace("/actionlib_msgs/", "/actionlib_msgs\n/")
+    payload["files"][0]["source"] = changed
+    _write_manifest_payload(manifest.manifest_path, payload)
+
+    with pytest.raises(EnvironmentSetupError, match="canonical"):
+        verify_ros_overlay(destination, manifest.manifest_path)
+
+
 def test_verify_ros_overlay_rejects_duplicate_json_keys(tmp_path: Path):
     """JSON decoder가 덮어쓸 duplicate key를 손상 manifest로 분류한다."""
     _, destination, manifest = _build_overlay(tmp_path)
@@ -650,6 +780,132 @@ def test_activate_candidate_preserves_old_current_when_replace_fails(
     assert Path(os.readlink(str(paths.current))) == Path("builds/old")
     assert paths.current.resolve() == old.resolve()
     assert not list(paths.model_root.glob(".current.*"))
+
+
+def test_activate_and_prune_share_lifecycle_lock_and_secure_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """activation과 prune가 같은 0600 regular lock을 acquire/release하는지 검사한다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    active = create_candidate(paths, "active")
+    inactive = create_candidate(paths, "inactive")
+    calls: list[int] = []
+    real_flock = environment_setup.fcntl.flock
+
+    def recording_flock(file_descriptor: int, operation: int) -> None:
+        """실제 Linux flock을 수행하면서 operation 순서를 기록한다."""
+        calls.append(operation)
+        real_flock(file_descriptor, operation)
+
+    monkeypatch.setattr(environment_setup.fcntl, "flock", recording_flock)
+
+    activate_candidate(paths, active)
+    assert prune_inactive_builds(paths) == (inactive,)
+
+    assert calls == [
+        environment_setup.fcntl.LOCK_EX,
+        environment_setup.fcntl.LOCK_UN,
+        environment_setup.fcntl.LOCK_EX,
+        environment_setup.fcntl.LOCK_UN,
+    ]
+    lock_path = paths.model_root / ".lifecycle.lock"
+    assert lock_path.is_file()
+    assert not lock_path.is_symlink()
+    assert lock_path.stat().st_mode & 0o777 == 0o600
+    assert lock_path.parent == paths.model_root
+    assert lock_path.parent != paths.builds
+
+
+def test_lifecycle_lock_errors_preserve_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """lock 획득 실패를 domain 오류로 바꾸고 current를 변경하지 않는다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    candidate = create_candidate(paths, "candidate")
+
+    def fail_lock(_file_descriptor: int, operation: int) -> None:
+        """exclusive acquisition만 injected OSError로 실패시킨다."""
+        if operation == environment_setup.fcntl.LOCK_EX:
+            raise OSError("injected lock failure")
+
+    monkeypatch.setattr(environment_setup.fcntl, "flock", fail_lock)
+
+    with pytest.raises(EnvironmentSetupError, match="lock"):
+        activate_candidate(paths, candidate)
+    assert not paths.current.exists()
+    assert not paths.current.is_symlink()
+
+
+def test_lifecycle_lock_rejects_symlink(tmp_path: Path):
+    """O_NOFOLLOW lifecycle lock이 model root 밖 symlink target을 열지 않는다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    candidate = create_candidate(paths, "candidate")
+    outside = tmp_path / "outside-lock"
+    outside.write_text("keep\n", encoding="utf-8")
+    (paths.model_root / ".lifecycle.lock").symlink_to(outside)
+
+    with pytest.raises(EnvironmentSetupError, match="lock"):
+        activate_candidate(paths, candidate)
+    assert outside.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_lifecycle_lock_prevents_activation_prune_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """activation replace 중 prune가 새 active candidate를 삭제하지 못하게 직렬화한다."""
+    paths = environment_paths(tmp_path, "interfuser")
+    old = create_candidate(paths, "old")
+    new = create_candidate(paths, "new")
+    activate_candidate(paths, old)
+    replace_entered = threading.Event()
+    allow_replace = threading.Event()
+    prune_finished = threading.Event()
+    errors: list[BaseException] = []
+    removed: list[tuple[Path, ...]] = []
+    real_replace = os.replace
+
+    def blocking_replace(source: str | Path, destination: str | Path) -> None:
+        """current 교체 직전 activation을 lock 안에서 일시 정지한다."""
+        if Path(destination) == paths.current:
+            replace_entered.set()
+            if not allow_replace.wait(5.0):
+                raise RuntimeError("timed out waiting to finish activation")
+        real_replace(source, destination)
+
+    def run_activate() -> None:
+        """thread에서 새 candidate activation 예외를 수집한다."""
+        try:
+            activate_candidate(paths, new)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def run_prune() -> None:
+        """thread에서 prune 결과와 예외를 수집한다."""
+        try:
+            removed.append(prune_inactive_builds(paths))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            prune_finished.set()
+
+    monkeypatch.setattr(environment_setup.os, "replace", blocking_replace)
+    activate_thread = threading.Thread(target=run_activate)
+    activate_thread.start()
+    assert replace_entered.wait(5.0)
+    prune_thread = threading.Thread(target=run_prune)
+    prune_thread.start()
+    assert not prune_finished.wait(0.2)
+    allow_replace.set()
+    activate_thread.join(5.0)
+    prune_thread.join(5.0)
+
+    assert not activate_thread.is_alive()
+    assert not prune_thread.is_alive()
+    assert errors == []
+    assert removed == [(old,)]
+    assert Path(os.readlink(str(paths.current))) == Path("builds/new")
+    assert new.is_dir()
+    assert not old.exists()
 
 
 def test_prune_inactive_builds_keeps_active_and_returns_sorted_paths(tmp_path: Path):
