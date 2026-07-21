@@ -252,6 +252,13 @@ def test_integrated_launch_wires_one_model_id_through_all_layers():
     root = ElementTree.parse(launch_path).getroot()
     top_level_args = {element.attrib["name"]: element for element in root.findall("arg")}
     assert "model_id" in top_level_args
+    assert "project_root" in top_level_args
+    assert top_level_args["project_root"].attrib["default"] == (
+        "$(eval '/'.join(find('Validator_pkg').split('/')[:-3]))"
+    )
+    assert top_level_args["model_env_root"].attrib["default"] == (
+        "$(arg project_root)/.venvs"
+    )
 
     includes = {
         Path(element.attrib["file"]).name: element for element in root.findall("include")
@@ -277,6 +284,8 @@ def test_integrated_launch_wires_one_model_id_through_all_layers():
     assert preprocessing_args["model_profiles"] == "$(arg model_id)"
     assert inference_args["model_id"] == "$(arg model_id)"
     assert inference_args["profile_file"] == "$(arg profile_file)"
+    assert inference_args["project_root"] == "$(arg project_root)"
+    assert inference_args["model_env_root"] == "$(arg model_env_root)"
     assert visualization_args["profile_file"] == "$(arg profile_file)"
     for geometry_argument in ("forward_range", "lateral_range", "resolution"):
         expected = f"$(arg {geometry_argument})"

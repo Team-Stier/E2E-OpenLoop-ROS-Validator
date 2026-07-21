@@ -1,5 +1,7 @@
 <launch>
   <arg name="model_id" default="interfuser"/>
+  <arg name="project_root" default="$(eval '/'.join(find('Validator_pkg').split('/')[:-3]))"/>
+  <arg name="model_env_root" default="$(arg project_root)/.venvs"/>
   <arg name="profile_file" default=""/>
   <arg name="record_dir" default="$(find validator_inference)/../../../records/openloop"/>
   <arg name="sensor_config" default="$(find Validator_pkg)/config/0716demo.json"/>
@@ -25,6 +27,8 @@
 
   <include file="$(find validator_inference)/launch/openloop_inference.launch">
     <arg name="model_id" value="$(arg model_id)"/>
+    <arg name="project_root" value="$(arg project_root)"/>
+    <arg name="model_env_root" value="$(arg model_env_root)"/>
     <arg name="profile_file" value="$(arg profile_file)"/>
     <arg name="record_dir" value="$(arg record_dir)"/>
   </include>

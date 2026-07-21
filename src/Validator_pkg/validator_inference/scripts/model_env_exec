@@ -1,0 +1,249 @@
+#!/usr/bin/python3
+"""검증된 모델 환경에서 Catkin inference node relay를 exec한다.
+
+입력: 신뢰된 system-ROS controller 환경과 세 ``OPENLOOP_*`` 값, Catkin relay argv.
+보안: controller의 Python startup 환경은 신뢰 경계이며 target child 환경만 정화한다.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import sys
+from typing import Mapping, NoReturn, Optional
+
+
+SUPPORTED_MODEL_IDS = (
+    "interfuser",
+    "tfv6",
+    "diffusiondrive_v2",
+    "sparsedrive_v2",
+)
+
+
+class ModelEnvironmentExecError(RuntimeError):
+    """launch-prefix 입력 또는 active 환경이 안전하지 않을 때 발생한다."""
+
+
+def _lexical_absolute_path(value: object, context: str) -> Path:
+    """문자열을 보정하지 않고 canonical absolute POSIX path인지 검사한다."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ModelEnvironmentExecError(
+            f"{context} must be a canonical absolute POSIX path"
+        )
+    pure = PurePosixPath(value)
+    if (
+        not pure.is_absolute()
+        or value.startswith("//")
+        or value != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        raise ModelEnvironmentExecError(
+            f"{context} must be a canonical absolute POSIX path"
+        )
+    return Path(*pure.parts)
+
+
+def _require_real_directory(path: Path, context: str) -> Path:
+    """path와 상위 구성 요소가 symlink가 아닌 실제 directory인지 확인한다."""
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ModelEnvironmentExecError(f"{context} directory is missing: {path}") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or resolved != path:
+        raise ModelEnvironmentExecError(
+            f"{context} must be a canonical real directory: {path}"
+        )
+    return path
+
+
+def _require_regular_file(path: Path, context: str) -> Path:
+    """path가 symlink가 아닌 기존 regular file인지 lstat으로 확인한다."""
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ModelEnvironmentExecError(f"{context} file is missing: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ModelEnvironmentExecError(f"{context} must be a regular file: {path}")
+    return path
+
+
+def _environment_path(environ: Mapping[str, str], name: str) -> Path:
+    """필수 environment path를 읽고 canonical real directory로 검증한다."""
+    try:
+        raw = environ[name]
+    except KeyError as exc:
+        raise ModelEnvironmentExecError(f"missing required environment variable: {name}") from exc
+    return _require_real_directory(_lexical_absolute_path(raw, name), name)
+
+
+def _model_id(environ: Mapping[str, str]) -> str:
+    """지원 model ID만 단일 안전 component로 허용한다."""
+    try:
+        value = environ["OPENLOOP_MODEL_ID"]
+    except KeyError as exc:
+        raise ModelEnvironmentExecError(
+            "missing required environment variable: OPENLOOP_MODEL_ID"
+        ) from exc
+    if (
+        value not in SUPPORTED_MODEL_IDS
+        or "/" in value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ModelEnvironmentExecError("OPENLOOP_MODEL_ID is unsupported or unsafe")
+    return value
+
+
+def _node_and_catkin_path(argv: list[str]) -> tuple[Path, Path]:
+    """Catkin relay의 lexical layout에서 prefix와 Python package path를 유도한다."""
+    if len(argv) < 2:
+        raise ModelEnvironmentExecError("missing Catkin node relay argument")
+    node = _lexical_absolute_path(argv[1], "Catkin node relay")
+    if node.parent.name != "validator_inference" or node.parent.parent.name != "lib":
+        raise ModelEnvironmentExecError(
+            "Catkin node relay must match <prefix>/lib/validator_inference/<node>"
+        )
+    if node.name != "inference_engine_node.py":
+        raise ModelEnvironmentExecError(
+            "Catkin node relay must be inference_engine_node.py"
+        )
+    _require_real_directory(node.parent, "Catkin node package path")
+    _require_regular_file(node, "Catkin node relay")
+
+    prefix = node.parents[2]
+    _require_real_directory(prefix, "Catkin prefix")
+    catkin_python = prefix / "lib" / "python3" / "dist-packages"
+    _require_real_directory(catkin_python, "Catkin Python path")
+    inference_package = catkin_python / "validator_inference"
+    message_package = catkin_python / "validator_msgs" / "msg"
+    _require_real_directory(inference_package, "validator_inference package")
+    _require_real_directory(message_package, "validator_msgs message package")
+    _require_regular_file(
+        inference_package / "__init__.py",
+        "validator_inference package marker",
+    )
+    _require_regular_file(
+        message_package / "__init__.py",
+        "validator_msgs message marker",
+    )
+    return node, catkin_python
+
+
+def _package_root() -> Path:
+    """source/install 모두에서 wrapper의 parent.parent package root를 반환한다."""
+    script = _lexical_absolute_path(__file__, "model_env_exec path")
+    root = script.parent.parent
+    _require_real_directory(root, "validator_inference package root")
+    config = root / "config"
+    _require_real_directory(config, "model environment config")
+    _require_regular_file(
+        config / "model_environments.json",
+        "model environment manifest",
+    )
+    return root
+
+
+def _exec_model_environment(
+    argv: list[str], environ: Mapping[str, str]
+) -> NoReturn:
+    """active 환경과 overlay를 검증한 뒤 선택 interpreter로 process를 교체한다."""
+    project_root = _environment_path(environ, "OPENLOOP_PROJECT_ROOT")
+    model_env_root = _environment_path(environ, "OPENLOOP_MODEL_ENV_ROOT")
+    if model_env_root != project_root / ".venvs":
+        raise ModelEnvironmentExecError(
+            "OPENLOOP_MODEL_ENV_ROOT must equal OPENLOOP_PROJECT_ROOT/.venvs"
+        )
+    model_id = _model_id(environ)
+    node_executable, catkin_python_path = _node_and_catkin_path(argv)
+    package_root = _package_root()
+
+    sys.path.insert(0, str(catkin_python_path))
+    try:
+        from validator_inference.environment_setup import (
+            EnvironmentSetupError,
+            verify_ros_overlay,
+        )
+        from validator_inference.model_environment import (
+            ROS_OVERLAY_MANIFEST_FILENAME,
+            EnvironmentConfigError,
+            EnvironmentStateError,
+            build_model_process_environment,
+            environment_paths,
+            inspect_active_environment,
+            load_environment_manifest,
+            select_model_environment,
+            sha256_file,
+        )
+    except (ImportError, OSError) as exc:
+        raise ModelEnvironmentExecError(f"cannot import active Catkin runtime: {exc}") from exc
+
+    try:
+        manifest = load_environment_manifest(
+            package_root / "config" / "model_environments.json"
+        )
+        definition = select_model_environment(manifest, model_id)
+        manifest_digest = sha256_file(manifest.manifest_path)
+        paths = environment_paths(project_root, model_id)
+        if paths.model_root != model_env_root / model_id:
+            raise ModelEnvironmentExecError("model environment path layout is invalid")
+        check = inspect_active_environment(paths, definition, manifest_digest)
+        if not check.valid:
+            raise ModelEnvironmentExecError(check.reason)
+        if check.environment_dir is None or check.state is None:
+            raise ModelEnvironmentExecError("active environment snapshot is incomplete")
+
+        environment_dir = check.environment_dir
+        overlay = environment_dir / ".ros-overlay"
+        overlay_manifest = environment_dir / ROS_OVERLAY_MANIFEST_FILENAME
+        verified_digest = verify_ros_overlay(overlay, overlay_manifest)
+        if verified_digest != check.state.ros_overlay_sha256:
+            raise ModelEnvironmentExecError("ROS overlay manifest digest changed")
+        child_environment = build_model_process_environment(
+            environ,
+            environment_dir,
+            overlay,
+            catkin_python_path,
+            project_root,
+        )
+        venv_python = environment_dir / check.state.python_executable
+        os.execve(
+            str(venv_python),
+            [str(venv_python), str(node_executable), *argv[2:]],
+            child_environment,
+        )
+    except ModelEnvironmentExecError:
+        raise
+    except (
+        EnvironmentConfigError,
+        EnvironmentStateError,
+        EnvironmentSetupError,
+        OSError,
+        UnicodeError,
+    ) as exc:
+        raise ModelEnvironmentExecError(str(exc)) from exc
+
+
+def main(
+    argv: Optional[list[str]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> int:
+    """성공 시 반환하지 않고, 예상된 launch 실패는 한 줄로 보고한다."""
+    selected_argv = sys.argv if argv is None else argv
+    selected_environ = os.environ if environ is None else environ
+    try:
+        _exec_model_environment(selected_argv, selected_environ)
+    except ModelEnvironmentExecError as exc:
+        sys.stderr.write(f"model_env_exec: {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

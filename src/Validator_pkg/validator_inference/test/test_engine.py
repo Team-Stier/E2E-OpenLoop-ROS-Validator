@@ -413,6 +413,46 @@ def test_node_requires_sim_time_and_declares_exactly_one_tenth_second_timer():
     assert "/inference_time" not in source
 
 
+def test_node_passes_validated_environment_project_root_to_model_selection(
+    tmp_path, monkeypatch
+):
+    """wrapper가 검증한 project root를 concrete model asset 해석에 사용한다."""
+    module, _source = _load_node_script()
+    selected_profile = object()
+    calls = []
+    project_root = tmp_path.resolve()
+    monkeypatch.setenv("OPENLOOP_PROJECT_ROOT", str(project_root))
+
+    def record_build(profile, **kwargs):
+        """model selector 호출 형태를 기록한다."""
+        calls.append((profile, kwargs))
+        return "model"
+
+    monkeypatch.setattr(
+        module,
+        "build_selected_model",
+        record_build,
+    )
+
+    assert module._build_model_for_project(selected_profile) == "model"
+    assert calls == [(selected_profile, {"project_root": project_root})]
+
+    monkeypatch.delenv("OPENLOOP_PROJECT_ROOT")
+    calls.clear()
+    assert module._build_model_for_project(selected_profile) == "model"
+    assert calls == [(selected_profile, {})]
+
+
+@pytest.mark.parametrize("value", ("relative", "/tmp/../tmp", "/missing/project"))
+def test_node_rejects_unvalidated_environment_project_root(value, monkeypatch):
+    """직접 node 실행도 상대·비정규·누락 project root를 신뢰하지 않는다."""
+    module, _source = _load_node_script()
+    monkeypatch.setenv("OPENLOOP_PROJECT_ROOT", value)
+
+    with pytest.raises(RuntimeError, match="OPENLOOP_PROJECT_ROOT"):
+        module._build_model_for_project(object())
+
+
 def test_catkin_contract_installs_engine_and_declares_direct_tf_message_dependency():
     package_root = Path(__file__).resolve().parents[1]
     cmake = (package_root / "CMakeLists.txt").read_text(encoding="utf-8")

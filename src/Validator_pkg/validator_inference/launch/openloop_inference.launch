@@ -1,5 +1,7 @@
 <launch>
   <arg name="model_id" default="interfuser"/>
+  <arg name="project_root" default="$(eval '/'.join(find('validator_inference').split('/')[:-3]))"/>
+  <arg name="model_env_root" default="$(arg project_root)/.venvs"/>
   <!-- Empty means: let each node resolve the source/install profile location. -->
   <arg name="profile_file" default=""/>
   <arg name="record_dir" default="$(find validator_inference)/../../../records/openloop"/>
@@ -11,7 +13,10 @@
     <param if="$(eval arg('profile_file') != '')" name="profile_file" value="$(arg profile_file)"/>
   </node>
 
-  <node pkg="validator_inference" type="inference_engine_node.py" name="inference_engine" output="screen" required="true">
+  <node pkg="validator_inference" type="inference_engine_node.py" name="inference_engine" output="screen" required="true" launch-prefix="&quot;$(find validator_inference)/scripts/model_env_exec&quot;">
+    <env name="OPENLOOP_MODEL_ENV_ROOT" value="$(arg model_env_root)"/>
+    <env name="OPENLOOP_MODEL_ID" value="$(arg model_id)"/>
+    <env name="OPENLOOP_PROJECT_ROOT" value="$(arg project_root)"/>
     <param name="model_id" value="$(arg model_id)"/>
     <param if="$(eval arg('profile_file') != '')" name="profile_file" value="$(arg profile_file)"/>
   </node>

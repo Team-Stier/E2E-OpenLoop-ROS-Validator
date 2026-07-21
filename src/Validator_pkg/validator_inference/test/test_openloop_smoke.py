@@ -4,6 +4,7 @@ import csv
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import time
+from xml.etree import ElementTree
 
 import pytest
 import rospy
@@ -54,6 +55,29 @@ def test_launch_uses_sim_time_arguments_and_exactly_three_runtime_nodes():
     ) == 2
     assert '<param name="record_dir" value="$(arg record_dir)"/>' in launch
     assert "/inference_time" not in launch
+
+    root = ElementTree.parse(launch_path).getroot()
+    arguments = {element.attrib["name"]: element for element in root.findall("arg")}
+    assert "project_root" in arguments
+    assert arguments["model_env_root"].attrib["default"] == "$(arg project_root)/.venvs"
+    nodes = root.findall("node")
+    prefixed = [node for node in nodes if "launch-prefix" in node.attrib]
+    assert len(prefixed) == 1
+    engine = prefixed[0]
+    assert engine.attrib["type"] == "inference_engine_node.py"
+    assert engine.attrib["launch-prefix"] == (
+        '"$(find validator_inference)/scripts/model_env_exec"'
+    )
+    engine_environment = {
+        element.attrib["name"]: element.attrib["value"]
+        for element in engine.findall("env")
+    }
+    assert engine_environment == {
+        "OPENLOOP_MODEL_ENV_ROOT": "$(arg model_env_root)",
+        "OPENLOOP_MODEL_ID": "$(arg model_id)",
+        "OPENLOOP_PROJECT_ROOT": "$(arg project_root)",
+    }
+    assert sum(len(node.findall("env")) for node in nodes) == 3
 
     cmake = (PACKAGE_ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
     assert "install(DIRECTORY launch/" in cmake
