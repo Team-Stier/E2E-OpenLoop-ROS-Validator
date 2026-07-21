@@ -386,13 +386,21 @@ def read_environment_state(environment_dir: Path) -> EnvironmentState:
     """선택 build의 고정 state 파일을 읽어 엄격히 검증한다."""
     state_path = Path(environment_dir) / ENVIRONMENT_STATE_FILENAME
     try:
+        metadata = state_path.lstat()
+    except OSError as exc:
+        raise EnvironmentStateError(f"cannot read environment state: {state_path}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise EnvironmentStateError(
+            f"environment state must be a regular non-symlink file: {state_path}"
+        )
+    try:
         payload = json.loads(
             state_path.read_text(encoding="utf-8"),
             object_pairs_hook=_reject_duplicate_state_keys,
         )
     except EnvironmentStateError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise EnvironmentStateError(f"cannot read environment state: {state_path}") from exc
     return _parse_environment_state(payload)
 
@@ -418,6 +426,13 @@ def write_environment_state(path: Path, state: EnvironmentState) -> None:
             target.flush()
             os.fsync(target.fileno())
         os.replace(temporary_path, state_path)
+        directory_descriptor = os.open(
+            str(state_path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except BaseException:
         if descriptor_open:
             os.close(descriptor)
@@ -1003,7 +1018,7 @@ def _is_activation_variable(name: str) -> bool:
 
 def _path_entry_key(value: str) -> str:
     """PATH 항목의 중복과 제거 대상을 비교할 정규화 key를 만든다."""
-    return os.path.normcase(os.path.normpath(value))
+    return os.path.normcase(os.path.normpath(os.path.realpath(value)))
 
 
 def build_model_process_environment(
@@ -1061,6 +1076,7 @@ def build_model_process_environment(
             "PATH": os.pathsep.join((str(selected_bin), *retained_path)),
             "VIRTUAL_ENV": str(selected_environment),
             "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPATH": os.pathsep.join(
                 (str(selected_overlay), str(selected_catkin))
             ),

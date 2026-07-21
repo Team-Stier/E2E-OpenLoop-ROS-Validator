@@ -394,6 +394,68 @@ def test_environment_state_write_replaces_atomically(
     assert read_environment_state(environment_dir) == state
 
 
+def test_environment_state_write_fsyncs_parent_after_replace(
+    tmp_path: Path, manifest: EnvironmentManifest, monkeypatch: pytest.MonkeyPatch
+):
+    """state 교체 뒤 parent directory를 fsync하고 descriptor를 닫는지 검사한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    state = _valid_environment_state(
+        tmp_path, environment_dir, manifest.models["interfuser"]
+    )
+    state_path = environment_dir / ".validator-environment.json"
+    events: list[str] = []
+    directory_fds: set[int] = set()
+    real_open = os.open
+    real_fsync = os.fsync
+    real_replace = os.replace
+    real_close = os.close
+
+    def recording_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        """parent directory open과 O_DIRECTORY 사용을 기록한다."""
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == state_path.parent:
+            assert flags & os.O_DIRECTORY
+            directory_fds.add(descriptor)
+            events.append("directory-open")
+        return descriptor
+
+    def recording_fsync(descriptor: int) -> None:
+        """file과 parent directory fsync 순서를 구분해 기록한다."""
+        events.append(
+            "directory-fsync" if descriptor in directory_fds else "file-fsync"
+        )
+        real_fsync(descriptor)
+
+    def recording_replace(source: Any, target: Any) -> None:
+        """atomic replace 순서를 기록하고 실제 교체를 수행한다."""
+        events.append("replace")
+        real_replace(source, target)
+
+    def recording_close(descriptor: int) -> None:
+        """parent directory descriptor 종료를 기록한다."""
+        if descriptor in directory_fds:
+            events.append("directory-close")
+            directory_fds.remove(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(model_environment.os, "open", recording_open)
+    monkeypatch.setattr(model_environment.os, "fsync", recording_fsync)
+    monkeypatch.setattr(model_environment.os, "replace", recording_replace)
+    monkeypatch.setattr(model_environment.os, "close", recording_close)
+
+    write_environment_state(state_path, state)
+
+    assert events == [
+        "file-fsync",
+        "replace",
+        "directory-open",
+        "directory-fsync",
+        "directory-close",
+    ]
+    assert not directory_fds
+
+
 def test_environment_state_write_cleans_temporary_file_after_replace_failure(
     tmp_path: Path, manifest: EnvironmentManifest, monkeypatch: pytest.MonkeyPatch
 ):
@@ -522,6 +584,49 @@ def test_inspect_active_environment_reports_invalid_utf8_state(
         environment_dir,
         None,
     )
+
+
+def test_environment_state_normalizes_deep_json_recursion(
+    tmp_path: Path, manifest: EnvironmentManifest
+):
+    """decoder recursion 한계를 넘긴 state도 읽기 오류와 invalid 결과로 정규화한다."""
+    definition = manifest.models["interfuser"]
+    paths, environment_dir, _ = _active_environment_fixture(tmp_path, definition)
+    state_path = environment_dir / ".validator-environment.json"
+    state_path.write_text("[" * 2000 + "0" + "]" * 2000, encoding="utf-8")
+
+    with pytest.raises(EnvironmentStateError, match="cannot read environment state"):
+        read_environment_state(environment_dir)
+
+    check = inspect_active_environment(paths, definition, "a" * 64)
+    assert not check.valid
+    assert "invalid environment state" in check.reason
+    assert check.environment_dir == environment_dir
+    assert check.state is None
+
+
+@pytest.mark.parametrize("kind", ("symlink", "fifo"))
+def test_environment_state_rejects_nonregular_path_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+):
+    """state symlink와 FIFO를 따라가거나 읽기 전에 lstat 결과로 거부한다."""
+    environment_dir = tmp_path / "build"
+    environment_dir.mkdir()
+    state_path = environment_dir / ".validator-environment.json"
+    if kind == "symlink":
+        target = tmp_path / "outside-state.json"
+        target.write_text("{}\n", encoding="utf-8")
+        state_path.symlink_to(target)
+    else:
+        os.mkfifo(str(state_path))
+
+    def fail_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        """unsafe state path에서 실제 읽기가 시작되면 즉시 실패시킨다."""
+        raise AssertionError("unsafe state path must not be read")
+
+    monkeypatch.setattr(type(state_path), "read_text", fail_read_text)
+    with pytest.raises(EnvironmentStateError, match="regular non-symlink"):
+        read_environment_state(environment_dir)
 
 
 def test_inspect_active_environment_accepts_matching_state_without_hashing_assets(
@@ -836,16 +941,72 @@ def test_build_model_process_environment_sanitizes_python_activation_state(
     assert actual == {
         "HOME": "/home/operator",
         "PATH": os.pathsep.join(
-            (str(selected_bin), "/usr/local/bin", "/usr/bin", "/bin")
+            (str(selected_bin), "/usr/local/bin", "/usr/bin")
         ),
         "VIRTUAL_ENV": str(environment_dir),
         "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": os.pathsep.join((str(ros_overlay), str(catkin_python_path))),
         "TORCH_HOME": str(project_root / "models" / "shared" / "torch-cache"),
         "ROS_MASTER_URI": "http://127.0.0.1:11311",
         "ROS_IP": "127.0.0.1",
         "CUSTOM_RUNTIME_FLAG": "keep-me",
     }
+
+
+def test_build_model_process_environment_removes_canonical_path_aliases(
+    tmp_path: Path,
+):
+    """선택·virtualenv·Conda bin의 symlink 별칭도 canonical identity로 제거한다."""
+    project_root = tmp_path.resolve()
+    environment_dir = project_root / "environment"
+    selected_bin = environment_dir / "bin"
+    selected_bin.mkdir(parents=True)
+    python = selected_bin / "python"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o700)
+    selected_alias = project_root / "selected-alias"
+    selected_alias.symlink_to(environment_dir, target_is_directory=True)
+
+    foreign = project_root / "foreign"
+    (foreign / "bin").mkdir(parents=True)
+    foreign_alias = project_root / "foreign-alias"
+    foreign_alias.symlink_to(foreign, target_is_directory=True)
+    conda = project_root / "conda"
+    (conda / "bin").mkdir(parents=True)
+    conda_alias = project_root / "conda-alias"
+    conda_alias.symlink_to(conda, target_is_directory=True)
+
+    ros_overlay = environment_dir / ".ros-overlay"
+    catkin_python_path = project_root / "catkin"
+    ros_overlay.mkdir()
+    catkin_python_path.mkdir()
+    inherited = {
+        "PATH": os.pathsep.join(
+            (
+                str(selected_alias / "bin"),
+                str(foreign / "bin"),
+                str(conda_alias / "bin"),
+                "/usr/bin",
+            )
+        ),
+        "VIRTUAL_ENV": str(foreign_alias),
+        "CONDA_PREFIX": str(conda),
+        "ROS_MASTER_URI": "http://127.0.0.1:11311",
+        "UNRELATED": "preserved",
+    }
+
+    actual = build_model_process_environment(
+        inherited,
+        environment_dir,
+        ros_overlay,
+        catkin_python_path,
+        project_root,
+    )
+
+    assert actual["PATH"] == os.pathsep.join((str(selected_bin), "/usr/bin"))
+    assert actual["ROS_MASTER_URI"] == inherited["ROS_MASTER_URI"]
+    assert actual["UNRELATED"] == "preserved"
 
 
 @pytest.mark.parametrize(
