@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -76,6 +77,7 @@ _NATIVE_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES) + (
     ".dylib",
     ".dll",
 )
+_VERSIONED_PYTHON = re.compile(r"python([0-9]+)\.([0-9]+)\Z")
 
 
 class RosCompatibilityError(RuntimeError):
@@ -161,15 +163,37 @@ def _validate_runtime_path_policy(policy: RuntimePathPolicy) -> None:
         raise RosCompatibilityError("target Python must be target environment/bin/python")
     if policy.ros_overlay != policy.target_environment / ".ros-overlay":
         raise RosCompatibilityError("ROS overlay must be inside the target environment")
-    if not policy.target_stdlib_paths:
-        raise RosCompatibilityError("target stdlib path allowlist must not be empty")
+    try:
+        resolved_python = policy.target_python.resolve(strict=True)
+    except OSError as exc:
+        raise RosCompatibilityError("target Python must resolve to an existing file") from exc
+    if not resolved_python.is_file() or not os.access(str(resolved_python), os.X_OK):
+        raise RosCompatibilityError("target Python must resolve to an executable file")
+    version_match = _VERSIONED_PYTHON.fullmatch(resolved_python.name)
+    if version_match is None:
+        raise RosCompatibilityError("resolved target Python must be named pythonX.Y")
+    expected_stdlib = (
+        resolved_python.parent.parent
+        / "lib"
+        / f"python{version_match.group(1)}.{version_match.group(2)}"
+    )
+    try:
+        expected_stdlib = expected_stdlib.resolve(strict=True)
+    except OSError as exc:
+        raise RosCompatibilityError("resolved target Python base stdlib is missing") from exc
+    if len(policy.target_stdlib_paths) != 1:
+        raise RosCompatibilityError("target must declare exactly one base stdlib path")
+    try:
+        declared_stdlib = policy.target_stdlib_paths[0].resolve(strict=True)
+    except OSError as exc:
+        raise RosCompatibilityError("declared target base stdlib is missing") from exc
+    if declared_stdlib != expected_stdlib:
+        raise RosCompatibilityError(
+            "target base stdlib does not belong to the resolved target Python"
+        )
     opt_ros = Path("/opt/ros").resolve(strict=False)
-    for stdlib_path in policy.target_stdlib_paths:
-        stdlib = Path(stdlib_path)
-        if not stdlib.is_absolute() or stdlib == Path("/"):
-            raise RosCompatibilityError("target stdlib paths must be bounded and absolute")
-        if _is_within(_resolved_path(stdlib), opt_ros):
-            raise RosCompatibilityError("target stdlib paths must not trust /opt/ros")
+    if _is_within(declared_stdlib, opt_ros):
+        raise RosCompatibilityError("target stdlib paths must not trust /opt/ros")
     for source_path in policy.project_source_paths:
         source = Path(source_path)
         if not source.is_absolute() or source == Path("/"):
@@ -188,6 +212,7 @@ def validate_loaded_module_origins(
     ros_overlay = _resolved_path(policy.ros_overlay)
     catkin_python = _resolved_path(policy.catkin_python_path)
     stdlib_paths = tuple(_resolved_path(path) for path in policy.target_stdlib_paths)
+    stdlib_lib_dynload = stdlib_paths[0] / "lib-dynload"
     source_paths = tuple(_resolved_path(path) for path in policy.project_source_paths)
     allowed_roots = (
         target_environment,
@@ -209,13 +234,18 @@ def validate_loaded_module_origins(
             raise RosCompatibilityError(
                 f"native extension {module_name} must not originate in the ROS overlay: {origin}"
             )
-        if _is_native_extension(origin) and not (
-            _is_within(origin, target_environment)
-            or any(_is_within(origin, root) for root in stdlib_paths)
-        ):
-            raise RosCompatibilityError(
-                f"native extension {module_name} is outside the target interpreter: {origin}"
-            )
+        if _is_native_extension(origin):
+            in_target_environment = _is_within(origin, target_environment)
+            in_base_stdlib = _is_within(origin, stdlib_paths[0])
+            in_lib_dynload = _is_within(origin, stdlib_lib_dynload)
+            if in_base_stdlib and not in_target_environment and not in_lib_dynload:
+                raise RosCompatibilityError(
+                    f"native extension {module_name} is outside exact stdlib lib-dynload: {origin}"
+                )
+            if not in_target_environment and not in_lib_dynload:
+                raise RosCompatibilityError(
+                    f"native extension {module_name} is outside the target interpreter: {origin}"
+                )
         if top_level in ROS_PACKAGE_NAMES and not _is_within(origin, ros_overlay):
             raise RosCompatibilityError(
                 f"ROS package {module_name} is outside the audited overlay: {origin}"
@@ -244,26 +274,113 @@ def _reserve_local_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _wait_for_ros_master(master_uri: str, deadline: float) -> bool:
-    """absolute monotonic deadline까지 ROS master TCP listener를 기다린다."""
+class _TimeoutTransport(xmlrpc.client.Transport):
+    """한 XML-RPC request의 socket I/O에 남은 deadline timeout을 적용한다."""
+
+    def __init__(self, timeout_seconds: float) -> None:
+        """양수인 request socket timeout을 보관한다."""
+        super().__init__()
+        self._timeout_seconds = timeout_seconds
+
+    def make_connection(self, host: str) -> Any:
+        """기본 HTTP connection을 만들고 socket timeout을 덮어쓴다."""
+        connection = super().make_connection(host)
+        connection.timeout = self._timeout_seconds
+        return connection
+
+
+def _xmlrpc_proxy(master_uri: str, timeout_seconds: float) -> Any:
+    """bounded transport를 사용하는 단일 ROS master XML-RPC proxy를 만든다."""
+    return xmlrpc.client.ServerProxy(
+        master_uri,
+        transport=_TimeoutTransport(timeout_seconds),
+        allow_none=True,
+    )
+
+
+def _xmlrpc_request(
+    master_uri: str,
+    method_name: str,
+    arguments: tuple[object, ...],
+    deadline: float,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    proxy_factory: Callable[[str, float], Any] = _xmlrpc_proxy,
+) -> object:
+    """overall monotonic deadline의 남은 시간 안에서 XML-RPC method를 호출한다."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise RosCompatibilityError("ROS master XML-RPC deadline expired")
+    proxy = proxy_factory(master_uri, remaining)
+    try:
+        method = getattr(proxy, method_name)
+        response = method(*arguments)
+    except (OSError, socket.timeout, xmlrpc.client.Error) as exc:
+        raise RosCompatibilityError(
+            f"ROS master XML-RPC {method_name} failed: {exc}"
+        ) from exc
+    finally:
+        close = getattr(proxy, "close", None)
+        if callable(close):
+            close()
+    if monotonic() > deadline:
+        raise RosCompatibilityError(
+            f"ROS master XML-RPC {method_name} exceeded its deadline"
+        )
+    return response
+
+
+def _wait_for_ros_master(
+    master_uri: str,
+    deadline: float,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    request: Callable[[str, str, tuple[object, ...], float], object] = _xmlrpc_request,
+) -> bool:
+    """absolute deadline까지 ROS master의 정상 getPid XML-RPC 응답을 기다린다."""
     parsed = urlsplit(master_uri)
     if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None:
         return False
-    while time.monotonic() < deadline:
+    while monotonic() < deadline:
         try:
-            with socket.create_connection(
-                (parsed.hostname, parsed.port), timeout=0.1
+            response = request(
+                master_uri,
+                "getPid",
+                ("/validator_ros_compatibility",),
+                deadline,
+            )
+            if (
+                isinstance(response, (list, tuple))
+                and len(response) == 3
+                and response[0] == 1
+                and type(response[2]) is int
+                and response[2] > 0
             ):
                 return True
-        except OSError:
-            time.sleep(0.02)
+        except (OSError, RosCompatibilityError, xmlrpc.client.Error):
+            pass
+        remaining = deadline - monotonic()
+        if remaining > 0:
+            sleep(min(0.02, remaining))
     return False
 
 
-def _set_ros_parameter(master_uri: str, name: str, value: object) -> None:
-    """ROS master XML-RPC parameter server에 smoke 전용 값을 설정한다."""
-    proxy = xmlrpc.client.ServerProxy(master_uri, allow_none=True)
-    response = proxy.setParam("/validator_ros_compatibility", name, value)
+def _set_ros_parameter(
+    master_uri: str,
+    name: str,
+    value: object,
+    deadline: float,
+    *,
+    request: Callable[[str, str, tuple[object, ...], float], object] = _xmlrpc_request,
+) -> None:
+    """overall deadline 안에서 ROS parameter server에 smoke 값을 설정한다."""
+    response = request(
+        master_uri,
+        "setParam",
+        ("/validator_ros_compatibility", name, value),
+        deadline,
+    )
     if (
         not isinstance(response, (list, tuple))
         or len(response) != 3
@@ -285,16 +402,28 @@ def _load_json_report(path: Path) -> object:
         raise RosCompatibilityError(f"cannot read ROS peer report: {path}") from exc
 
 
+def _process_group_alive(process_group_id: int) -> bool:
+    """signal 0으로 tracked process group에 살아 있는 member가 있는지 확인한다."""
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 @dataclass(frozen=True)
 class RosCompatibilityDependencies:
     """subprocess·clock·ROS master I/O를 unit test에서 교체하는 의존성 묶음이다."""
 
     popen: Callable[..., Any] = subprocess.Popen
     killpg: Callable[[int, int], None] = os.killpg
+    process_group_alive: Callable[[int], bool] = _process_group_alive
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     master_ready: Callable[[str, float], bool] = _wait_for_ros_master
-    set_parameter: Callable[[str, str, object], None] = _set_ros_parameter
+    set_parameter: Callable[[str, str, object, float], None] = _set_ros_parameter
     load_report: Callable[[Path], object] = _load_json_report
     reserve_port: Callable[[], int] = _reserve_local_port
 
@@ -639,32 +768,52 @@ def _spawn_process(
 def _terminate_process_group(
     process: Any, dependencies: RosCompatibilityDependencies
 ) -> None:
-    """실행 중인 독립 child group을 TERM 후 bounded KILL로 완전히 종료한다."""
-    try:
-        running = process.poll() is None
-    except (AttributeError, OSError):
-        running = True
-    if not running:
+    """leader 상태와 무관하게 tracked PGID를 TERM 후 bounded KILL로 종료한다."""
+    process_group_id = int(process.pid)
+    if not dependencies.process_group_alive(process_group_id):
         try:
             process.wait(timeout=0)
         except (OSError, subprocess.TimeoutExpired):
             pass
         return
     try:
-        dependencies.killpg(int(process.pid), signal.SIGTERM)
+        dependencies.killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
         return
-    try:
-        process.wait(timeout=2.0)
+    term_deadline = dependencies.monotonic() + 2.0
+    while dependencies.process_group_alive(process_group_id):
+        try:
+            process.poll()
+        except (AttributeError, OSError):
+            pass
+        remaining = term_deadline - dependencies.monotonic()
+        if remaining <= 0:
+            break
+        dependencies.sleep(min(0.02, remaining))
+    if not dependencies.process_group_alive(process_group_id):
+        try:
+            process.wait(timeout=0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         return
-    except (OSError, subprocess.TimeoutExpired):
-        pass
     try:
-        dependencies.killpg(int(process.pid), signal.SIGKILL)
+        dependencies.killpg(process_group_id, signal.SIGKILL)
     except ProcessLookupError:
         return
+    kill_deadline = dependencies.monotonic() + 2.0
+    while dependencies.process_group_alive(process_group_id):
+        try:
+            process.poll()
+        except (AttributeError, OSError):
+            pass
+        remaining = kill_deadline - dependencies.monotonic()
+        if remaining <= 0:
+            raise RosCompatibilityError(
+                f"process group {process_group_id} survived SIGKILL"
+            )
+        dependencies.sleep(min(0.02, remaining))
     try:
-        process.wait(timeout=2.0)
+        process.wait(timeout=0)
     except (OSError, subprocess.TimeoutExpired):
         pass
 
@@ -716,7 +865,7 @@ def run_ros_compatibility_smoke(
             if roscore.poll() is not None:
                 raise RosCompatibilityError("ROS compatibility roscore exited during startup")
             selected_dependencies.set_parameter(
-                master_uri, "/use_sim_time", True
+                master_uri, "/use_sim_time", True, deadline
             )
 
             module_command = "validator_inference.ros_compatibility"
@@ -796,8 +945,16 @@ def run_ros_compatibility_smoke(
             f"ROS compatibility startup failure: {exc}"
         ) from exc
     finally:
+        cleanup_errors: list[RosCompatibilityError] = []
         for process in reversed(started):
-            _terminate_process_group(process, selected_dependencies)
+            try:
+                _terminate_process_group(process, selected_dependencies)
+            except RosCompatibilityError as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise RosCompatibilityError(
+                "; ".join(str(error) for error in cleanup_errors)
+            ) from cleanup_errors[0]
 
 
 def _required_environment_path(

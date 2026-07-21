@@ -5,6 +5,7 @@ import os
 import signal
 import shutil
 import subprocess
+import tempfile
 import warnings
 from dataclasses import replace
 from pathlib import Path
@@ -26,26 +27,48 @@ from validator_inference.ros_compatibility import (
     _build_message_fixtures,
     _extract_message_fields,
     _policy_from_environment,
+    _set_ros_parameter,
     _validate_peer_report,
+    _wait_for_ros_master,
+    _xmlrpc_request,
     main,
     run_ros_compatibility_smoke,
     validate_loaded_module_origins,
 )
 
 
+_POLICY_DIRECTORY = tempfile.TemporaryDirectory(prefix="validator-ros-policy-")
+
+
 def _path_policy() -> RuntimePathPolicy:
-    """가짜 target runtime의 명시적 허용 경로를 만든다."""
+    """실제 symlink interpreter를 가진 target runtime 허용 경로를 만든다."""
+    root = Path(_POLICY_DIRECTORY.name)
+    base = root / "uv/python/cpython-3.8.20"
+    base_python = base / "bin/python3.8"
+    base_python.parent.mkdir(parents=True, exist_ok=True)
+    if not base_python.exists():
+        base_python.write_bytes(b"test interpreter")
+        base_python.chmod(0o755)
+    stdlib = base / "lib/python3.8"
+    (stdlib / "lib-dynload").mkdir(parents=True, exist_ok=True)
+    environment = root / "workspace/.venvs/interfuser/builds/one"
+    (environment / "bin").mkdir(parents=True, exist_ok=True)
+    target_python = environment / "bin/python"
+    if not target_python.exists():
+        target_python.symlink_to(base_python)
+    overlay = environment / ".ros-overlay"
+    overlay.mkdir(parents=True, exist_ok=True)
+    catkin_python = root / "workspace/devel/lib/python3/dist-packages"
+    catkin_python.mkdir(parents=True, exist_ok=True)
+    source = root / "workspace/src/Validator_pkg/validator_inference/src"
+    source.mkdir(parents=True, exist_ok=True)
     return RuntimePathPolicy(
-        target_python=Path("/workspace/.venvs/interfuser/builds/one/bin/python"),
-        target_environment=Path("/workspace/.venvs/interfuser/builds/one"),
-        ros_overlay=Path(
-            "/workspace/.venvs/interfuser/builds/one/.ros-overlay"
-        ),
-        catkin_python_path=Path("/workspace/devel/lib/python3/dist-packages"),
-        target_stdlib_paths=(Path("/uv/python/cpython-3.8.20/lib/python3.8"),),
-        project_source_paths=(
-            Path("/workspace/src/Validator_pkg/validator_inference/src"),
-        ),
+        target_python=target_python,
+        target_environment=environment,
+        ros_overlay=overlay,
+        catkin_python_path=catkin_python,
+        target_stdlib_paths=(stdlib,),
+        project_source_paths=(source,),
     )
 
 
@@ -164,6 +187,33 @@ def test_validate_loaded_module_origins_never_accepts_opt_ros_as_stdlib():
         )
 
 
+def test_validate_loaded_module_origins_rejects_foreign_base_stdlib():
+    """target interpreter prefix가 소유하지 않은 일반 stdlib root를 거부한다."""
+    policy = _path_policy()
+    foreign_stdlib = policy.target_environment.parent / "foreign/lib/python3.8"
+    foreign_stdlib.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(RosCompatibilityError, match="base stdlib"):
+        validate_loaded_module_origins(
+            {"json": foreign_stdlib / "json/__init__.py"},
+            replace(policy, target_stdlib_paths=(foreign_stdlib,)),
+        )
+
+
+def test_validate_loaded_module_origins_rejects_stdlib_site_package_extension():
+    """base stdlib 아래라도 exact lib-dynload 밖의 native extension은 거부한다."""
+    policy = _path_policy()
+    with pytest.raises(RosCompatibilityError, match="lib-dynload"):
+        validate_loaded_module_origins(
+            {
+                "foreign_native": (
+                    policy.target_stdlib_paths[0]
+                    / "site-packages/foreign_native.cpython-38-x86_64-linux-gnu.so"
+                )
+            },
+            policy,
+        )
+
+
 def test_validate_loaded_module_origins_rejects_native_ros_overlay_entries():
     """pure-Python ROS overlay 안의 native binary도 target site package로 보지 않는다."""
     policy = _path_policy()
@@ -178,6 +228,103 @@ def test_validate_loaded_module_origins_rejects_native_ros_overlay_entries():
             },
             policy,
         )
+
+
+def test_xmlrpc_request_uses_only_the_remaining_monotonic_deadline():
+    """XML-RPC connection timeout이 전체 deadline의 남은 시간보다 길지 않다."""
+    observed = {}
+    clock = iter((10.0, 11.0))
+
+    class Proxy:
+        """호출 인자와 정상 ROS XML-RPC 응답을 제공한다."""
+
+        def getPid(self, *arguments):
+            """getPid 인자를 기록하고 성공 응답을 반환한다."""
+            observed["arguments"] = arguments
+            return [1, "ready", 42]
+
+        def close(self):
+            """ServerProxy close 호출을 기록한다."""
+            observed["closed"] = True
+
+    def proxy_factory(uri, timeout_seconds):
+        """계산된 per-request socket timeout을 기록한다."""
+        observed["uri"] = uri
+        observed["timeout"] = timeout_seconds
+        return Proxy()
+
+    response = _xmlrpc_request(
+        "http://127.0.0.1:43210/",
+        "getPid",
+        ("/validator_ros_compatibility",),
+        15.0,
+        monotonic=lambda: next(clock),
+        proxy_factory=proxy_factory,
+    )
+
+    assert response == [1, "ready", 42]
+    assert observed == {
+        "uri": "http://127.0.0.1:43210/",
+        "timeout": pytest.approx(5.0),
+        "arguments": ("/validator_ros_compatibility",),
+        "closed": True,
+    }
+
+
+def test_master_readiness_requires_a_successful_xmlrpc_response():
+    """listener가 열렸더라도 getPid XML-RPC 성공 응답 전에는 ready가 아니다."""
+    responses = iter((OSError("accepted TCP only"), [0, "not ready", 0], [1, "ok", 7]))
+    calls = []
+    now = {"value": 0.0}
+
+    def monotonic():
+        """readiness retry마다 bounded clock을 전진시킨다."""
+        now["value"] += 0.1
+        return now["value"]
+
+    def request(uri, method, arguments, deadline):
+        """TCP-only 실패, invalid 응답, 정상 응답을 순서대로 돌려준다."""
+        calls.append((uri, method, arguments, deadline))
+        response = next(responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    assert _wait_for_ros_master(
+        "http://127.0.0.1:43210/",
+        2.0,
+        monotonic=monotonic,
+        sleep=lambda _seconds: None,
+        request=request,
+    ) is True
+    assert len(calls) == 3
+    assert all(call[1] == "getPid" for call in calls)
+
+
+def test_set_parameter_forwards_the_overall_deadline():
+    """setParam도 readiness와 같은 absolute deadline으로 제한한다."""
+    calls = []
+
+    def request(uri, method, arguments, deadline):
+        """setParam 요청의 URI, 인자와 deadline을 기록한다."""
+        calls.append((uri, method, arguments, deadline))
+        return [1, "set", 0]
+
+    _set_ros_parameter(
+        "http://127.0.0.1:43210/",
+        "/use_sim_time",
+        True,
+        9.5,
+        request=request,
+    )
+    assert calls == [
+        (
+            "http://127.0.0.1:43210/",
+            "setParam",
+            ("/validator_ros_compatibility", "/use_sim_time", True),
+            9.5,
+        )
+    ]
 
 
 def _received_fields(sender):
@@ -280,10 +427,12 @@ def _peer_report(role, policy):
 class _FakeProcess:
     """poll, wait와 process-group 종료를 기록하는 Popen 대역이다."""
 
-    def __init__(self, pid, returncode=None, stubborn=False):
+    def __init__(self, pid, returncode=None, stubborn=False, group_alive=None):
+        """leader 상태와 별도 process-group 생존 상태를 초기화한다."""
         self.pid = pid
         self.returncode = returncode
         self.stubborn = stubborn
+        self.group_alive = returncode is None if group_alive is None else group_alive
 
     def poll(self):
         """현재 가짜 종료 코드를 반환한다."""
@@ -300,6 +449,7 @@ def _dependencies(processes, reports, *, fail_call=None, timeout=False):
     """process 생성·master 준비·JSON load를 완전히 메모리에서 대체한다."""
     calls = []
     signals = []
+    control_calls = {"master": [], "parameter": []}
     clock = {"value": 0.0}
 
     def popen(argv, **kwargs):
@@ -314,7 +464,14 @@ def _dependencies(processes, reports, *, fail_call=None, timeout=False):
         signals.append((pid, selected_signal))
         process = next(item for item in processes if item.pid == pid)
         if selected_signal == signal.SIGKILL or not process.stubborn:
-            process.returncode = -selected_signal
+            process.group_alive = False
+            if process.returncode is None:
+                process.returncode = -selected_signal
+
+    def group_alive(pid):
+        """leader 종료와 독립적인 process-group 생존 상태를 반환한다."""
+        process = next(item for item in processes if item.pid == pid)
+        return process.group_alive
 
     def monotonic():
         """timeout case에서만 매 호출마다 deadline을 전진시킨다."""
@@ -322,17 +479,27 @@ def _dependencies(processes, reports, *, fail_call=None, timeout=False):
             clock["value"] += 1.0
         return clock["value"]
 
+    def master_ready(_uri, deadline):
+        """readiness에 전달된 overall deadline을 기록한다."""
+        control_calls["master"].append(deadline)
+        return True
+
+    def set_parameter(_uri, _name, _value, deadline):
+        """setParam에 동일하게 전달된 overall deadline을 기록한다."""
+        control_calls["parameter"].append(deadline)
+
     dependencies = RosCompatibilityDependencies(
         popen=popen,
         killpg=killpg,
+        process_group_alive=group_alive,
         monotonic=monotonic,
         sleep=lambda _seconds: None,
-        master_ready=lambda _uri, _deadline: True,
-        set_parameter=lambda _uri, _name, _value: None,
+        master_ready=master_ready,
+        set_parameter=set_parameter,
         load_report=lambda path: reports[path.name],
         reserve_port=lambda: 43210,
     )
-    return dependencies, calls, signals
+    return dependencies, calls, signals, control_calls
 
 
 def test_run_ros_compatibility_smoke_validates_reports_and_cleans_roscore():
@@ -347,7 +514,7 @@ def test_run_ros_compatibility_smoke_validates_reports_and_cleans_roscore():
         "system.json": _peer_report("system", policy),
         "target.json": _peer_report("target", policy),
     }
-    dependencies, calls, signals = _dependencies(processes, reports)
+    dependencies, calls, signals, control_calls = _dependencies(processes, reports)
 
     result = run_ros_compatibility_smoke(
         policy,
@@ -371,14 +538,16 @@ def test_run_ros_compatibility_smoke_validates_reports_and_cleans_roscore():
     )
     assert target_environment["VIRTUAL_ENV"] == str(policy.target_environment)
     assert "PYTHONHOME" not in target_environment
+    assert control_calls == {"master": [5.0], "parameter": [5.0]}
     assert signals == [(1001, signal.SIGTERM)]
+    assert not any(process.group_alive for process in processes)
 
 
 def test_run_ros_compatibility_smoke_cleans_started_groups_on_peer_start_failure():
     """target peer 시작이 실패해도 먼저 시작한 roscore와 system peer를 종료한다."""
     policy = _path_policy()
     processes = [_FakeProcess(2001), _FakeProcess(2002)]
-    dependencies, calls, signals = _dependencies(
+    dependencies, calls, signals, _control_calls = _dependencies(
         processes, {}, fail_call=3
     )
 
@@ -405,7 +574,7 @@ def test_run_ros_compatibility_smoke_timeout_kills_every_stubborn_group():
         _FakeProcess(3002, stubborn=True),
         _FakeProcess(3003, stubborn=True),
     ]
-    dependencies, _calls, signals = _dependencies(
+    dependencies, _calls, signals, _control_calls = _dependencies(
         processes, {}, timeout=True
     )
 
@@ -425,6 +594,36 @@ def test_run_ros_compatibility_smoke_timeout_kills_every_stubborn_group():
         (3001, signal.SIGTERM),
         (3001, signal.SIGKILL),
     ]
+    assert not any(process.group_alive for process in processes)
+
+
+def test_cleanup_terminates_descendants_after_the_group_leader_exits():
+    """leader가 이미 성공 종료했어도 같은 PGID의 살아 있는 descendant를 종료한다."""
+    policy = _path_policy()
+    processes = [
+        _FakeProcess(4001),
+        _FakeProcess(4002, returncode=0, group_alive=True),
+        _FakeProcess(4003, returncode=0),
+    ]
+    reports = {
+        "system.json": _peer_report("system", policy),
+        "target.json": _peer_report("target", policy),
+    }
+    dependencies, _calls, signals, _control_calls = _dependencies(
+        processes, reports
+    )
+
+    run_ros_compatibility_smoke(
+        policy,
+        system_python=Path("/usr/bin/python3"),
+        dependencies=dependencies,
+    )
+
+    assert signals == [
+        (4002, signal.SIGTERM),
+        (4001, signal.SIGTERM),
+    ]
+    assert not any(process.group_alive for process in processes)
 
 
 @pytest.mark.parametrize("role", ("system", "target"))
