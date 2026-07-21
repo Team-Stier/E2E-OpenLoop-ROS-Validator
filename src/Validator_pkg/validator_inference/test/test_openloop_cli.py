@@ -65,6 +65,61 @@ def test_normalize_argv_accepts_only_exact_model_shorthand(cli: ModuleType):
     assert cli._normalize_argv([]) == []
 
 
+def test_top_level_help_exposes_shorthand_workflow_and_command_purposes(
+    cli: ModuleType,
+):
+    help_text = cli._parser().format_help()
+
+    assert "./openloop MODEL [--rviz]" in help_text
+    assert "./openloop setup interfuser" in help_text
+    assert "./openloop interfuser --rviz" in help_text
+    assert "./openloop bag" in help_text
+    for purpose in (
+        "create or verify a model environment",
+        "run validation using an explicit model argument",
+        "deep-check an active model environment",
+        "remove inactive model environment builds",
+        "play the configured rosbag with /clock",
+    ):
+        assert purpose in help_text
+
+
+@pytest.mark.parametrize(
+    ("argv", "purpose", "option_help"),
+    (
+        (
+            ["setup", "--help"],
+            "Create or verify a model environment.",
+            "force creation of a new environment build",
+        ),
+        (
+            ["run", "--help"],
+            "Run open-loop validation with a selected model.",
+            "start RViz with the validator",
+        ),
+        (
+            ["bag", "--help"],
+            "Play the configured rosbag with simulated time.",
+            "override the configured bag path",
+        ),
+    ),
+)
+def test_subcommand_help_describes_purpose_and_options(
+    cli: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    purpose: str,
+    option_help: str,
+):
+    with pytest.raises(SystemExit) as caught:
+        cli.main(argv)
+
+    assert caught.value.code == 0
+    output = capsys.readouterr().out
+    assert purpose in output
+    assert option_help in output
+
+
 @pytest.mark.parametrize(
     ("argv", "command", "model_id", "enabled"),
     [

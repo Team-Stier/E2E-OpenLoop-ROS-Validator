@@ -157,21 +157,19 @@ After the model assets are downloaded and the implementation passes its smoke te
 
 ## 8. Runtime command contract
 
-각 모델의 source/checkpoint/auxiliary asset은 선택한 local profile을 기준으로 먼저 내려받고 검증한다. 예시는 InterFuser이며 다른 모델은 model ID를 동일하게 바꾼다.
+기본 실행은 저장소 root의 `openloop` CLI를 사용한다. 예시는 InterFuser이며 다른 모델은 환경 준비가 완료된 경우에만 model ID를 바꾼다.
 
 ```bash
-catkin_make
-source devel/setup.bash
-rosrun validator_inference fetch_model_assets.py --model-id interfuser
-roslaunch Validator_pkg openloop_validator.launch model_id:=interfuser show_rviz:=true
+./openloop setup interfuser
+./openloop interfuser --rviz
+./openloop bag
 ```
 
-`openloop_validator.launch`는 선택한 model ID를 PreprocessLayer, inference layer, visualization layer에 동일하게 전달한다. 별도 terminal에서 ROS simulated time을 공급한다. Inference layer만 독립 점검할 때는 `roslaunch validator_inference openloop_inference.launch model_id:=interfuser`를 사용한다.
+`setup`은 source/checkpoint/auxiliary asset과 모델별 Python 환경을 준비하고 검증한다. 두 번째 명령은 validator와 RViz를 시작하며, 세 번째 명령은 별도 terminal에서 기본 bag과 ROS simulated time을 공급한다. `openloop_validator.launch`는 선택한 model ID를 PreprocessLayer, inference layer, visualization layer에 동일하게 전달한다.
 
-```bash
-source devel/setup.bash
-rosbag play --clock rosbag/2026-07-16-17-13-14.bag
-```
+### 고급 직접 실행
+
+직접 `roslaunch` 인자를 제어하거나 기본 bag 외의 재생 옵션이 필요한 경우에만 [Open-loop 운영 절차](openloop_validator.md#고급-직접-launch)의 고급 절차를 사용한다. 직접 실행은 모델 환경을 생성하거나 preflight하지 않으므로 먼저 `./openloop setup MODEL_ID` 또는 `./openloop verify MODEL_ID`를 완료해야 한다.
 
 launch의 `profile_file`은 로컬 JSON만 허용하며 `record_dir`은 기본적으로 프로젝트의 `records/openloop/`다. SparseDrive V2는 profile의 세 calibration record가 완성되기 전에는 worker를 만들지 않는다.
 

@@ -73,25 +73,78 @@ def _default_project_root() -> Path:
 
 def _parser() -> argparse.ArgumentParser:
     """축약 옵션을 허용하지 않는 명령 parser를 구성한다."""
-    parser = argparse.ArgumentParser(prog="./openloop", allow_abbrev=False)
+    parser = argparse.ArgumentParser(
+        prog="./openloop",
+        description="Manage model environments and run open-loop validation.",
+        epilog=(
+            "Normal workflow:\n"
+            "  ./openloop setup interfuser\n"
+            "  ./openloop interfuser --rviz\n"
+            "  ./openloop bag\n\n"
+            "Run shorthand:\n"
+            "  ./openloop MODEL [--rviz]\n"
+            "  ./openloop run MODEL [--rviz]  (explicit equivalent)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    setup = commands.add_parser("setup", allow_abbrev=False)
-    setup.add_argument("model_id", choices=SUPPORTED_MODEL_IDS)
-    setup.add_argument("--recreate", action="store_true")
+    setup = commands.add_parser(
+        "setup",
+        help="create or verify a model environment",
+        description="Create or verify a model environment.",
+        allow_abbrev=False,
+    )
+    setup.add_argument(
+        "model_id", choices=SUPPORTED_MODEL_IDS, help="model environment to prepare"
+    )
+    setup.add_argument(
+        "--recreate",
+        action="store_true",
+        help="force creation of a new environment build",
+    )
 
-    run = commands.add_parser("run", allow_abbrev=False)
-    run.add_argument("model_id", choices=SUPPORTED_MODEL_IDS)
-    run.add_argument("--rviz", action="store_true")
+    run = commands.add_parser(
+        "run",
+        help="run validation using an explicit model argument",
+        description="Run open-loop validation with a selected model.",
+        allow_abbrev=False,
+    )
+    run.add_argument(
+        "model_id", choices=SUPPORTED_MODEL_IDS, help="model environment to use"
+    )
+    run.add_argument(
+        "--rviz", action="store_true", help="start RViz with the validator"
+    )
 
-    verify = commands.add_parser("verify", allow_abbrev=False)
-    verify.add_argument("model_id", choices=SUPPORTED_MODEL_IDS)
+    verify = commands.add_parser(
+        "verify",
+        help="deep-check an active model environment",
+        description="Deep-check an active model environment.",
+        allow_abbrev=False,
+    )
+    verify.add_argument(
+        "model_id", choices=SUPPORTED_MODEL_IDS, help="model environment to verify"
+    )
 
-    prune = commands.add_parser("prune", allow_abbrev=False)
-    prune.add_argument("model_id", choices=SUPPORTED_MODEL_IDS)
+    prune = commands.add_parser(
+        "prune",
+        help="remove inactive model environment builds",
+        description="Remove inactive model environment builds.",
+        allow_abbrev=False,
+    )
+    prune.add_argument(
+        "model_id", choices=SUPPORTED_MODEL_IDS, help="model environment to prune"
+    )
 
-    bag = commands.add_parser("bag", allow_abbrev=False)
-    bag.add_argument("--path")
+    bag = commands.add_parser(
+        "bag",
+        help="play the configured rosbag with /clock",
+        description="Play the configured rosbag with simulated time.",
+        allow_abbrev=False,
+    )
+    bag.add_argument("--path", help="override the configured bag path")
     return parser
 
 

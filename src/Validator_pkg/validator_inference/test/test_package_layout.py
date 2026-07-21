@@ -95,3 +95,32 @@ def test_pipeline_documentation_separates_normal_cli_from_direct_launch():
     assert "model_env_root:=/" in advanced
     assert "profile_file:=/" in advanced
     assert "sensor_config:=/" in advanced
+
+
+def test_contract_documents_use_cli_workflow_and_label_advanced_commands():
+    """설계 문서의 실행 절차도 CLI를 기본으로 두고 raw 명령을 고급으로 분리한다."""
+    root = _repository_root()
+    documents = (
+        root / "docs/model_io_contracts.md",
+        root / "docs/inference_engine_design.md",
+    )
+    canonical = (
+        "./openloop setup interfuser",
+        "./openloop interfuser --rviz",
+        "./openloop bag",
+    )
+    stale_commands = (
+        "rosrun validator_inference fetch_model_assets.py --model-id interfuser",
+        "roslaunch Validator_pkg openloop_validator.launch model_id:=interfuser",
+        "roslaunch validator_inference openloop_inference.launch model_id:=interfuser",
+        "rosbag play --clock rosbag/2026-07-16-17-13-14.bag",
+    )
+
+    for document in documents:
+        text = document.read_text(encoding="utf-8")
+        for command in canonical:
+            assert command in text, document
+        for command in stale_commands:
+            assert command not in text, document
+        assert "### 고급 직접 실행" in text, document
+        assert "openloop_validator.md" in text, document

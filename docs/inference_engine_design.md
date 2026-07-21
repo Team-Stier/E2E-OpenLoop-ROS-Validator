@@ -385,20 +385,18 @@ DiagnosticArray는 fixed CSV schema가 아니므로 쓰지 않는다. InferenceM
 
 ## 11. 재현 가능한 open-loop 실행
 
-`openloop_inference.launch`는 `/use_sim_time=true`를 설정하고 `OptFeederNode`, `InferenceEngineNode`, `RecorderNode`만 시작한다. `model_id`, 로컬 `profile_file`, `record_dir`를 launch argument로 받는다. 예를 들어 InterFuser 평가는 다음 순서로 준비한다.
+기본 평가는 저장소 root의 `openloop` CLI로 준비하고 실행한다. 예를 들어 InterFuser는 다음 세 명령을 사용한다.
 
 ```bash
-catkin_make
-source devel/setup.bash
-rosrun validator_inference fetch_model_assets.py --model-id interfuser
-roslaunch validator_inference openloop_inference.launch model_id:=interfuser
+./openloop setup interfuser
+./openloop interfuser --rviz
+./openloop bag
 ```
 
-PreprocessLayer가 필요한 model-specific image/LiDAR topic을 발행하도록 실행한 뒤, 별도 terminal에서 bag time을 공급한다.
+첫 명령은 model asset과 전용 Python 환경을 준비하고 검증한다. 두 번째 명령은 PreprocessLayer, inference layer, visualization을 함께 시작하며, 세 번째 명령은 별도 terminal에서 기본 bag과 `/clock`을 재생한다.
 
-```bash
-source devel/setup.bash
-rosbag play --clock rosbag/2026-07-16-17-13-14.bag
-```
+### 고급 직접 실행
 
-launch 기본 CSV 위치는 프로젝트의 `records/openloop/`다. 별도의 timing topic은 없으며 `/inference_metric`의 각 메시지가 정확히 한 CSV row가 된다. SparseDrive V2의 shipped null calibration은 model/worker 생성 전에 거부된다.
+`openloop_inference.launch`만 분리 실행하거나 raw `roslaunch`/`rosbag` 인자를 직접 제어해야 할 때는 [Open-loop 운영 절차](openloop_validator.md#고급-직접-launch)의 고급 절차를 따른다. 직접 launch는 모델 환경을 생성하거나 검증하지 않는다.
+
+통합 launch는 `/use_sim_time=true`를 설정하며 기본 CSV 위치는 프로젝트의 `records/openloop/`다. 별도의 timing topic은 없으며 `/inference_metric`의 각 메시지가 정확히 한 CSV row가 된다. SparseDrive V2의 shipped null calibration은 model/worker 생성 전에 거부된다.
