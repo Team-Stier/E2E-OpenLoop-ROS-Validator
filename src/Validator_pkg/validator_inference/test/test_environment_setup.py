@@ -21,8 +21,10 @@ import pytest
 from validator_inference import environment_setup
 from validator_inference.environment_setup import (
     PURE_ROS_PACKAGES,
+    EnvironmentOperationResult,
     EnvironmentPreflight,
     EnvironmentPreflightDependencies,
+    EnvironmentSetupDependencies,
     EnvironmentSetupError,
     RosOverlayFile,
     RosOverlayManifest,
@@ -33,13 +35,19 @@ from validator_inference.environment_setup import (
     preflight_environment,
     prepare_local_runtime_assets,
     prune_inactive_builds,
+    setup_environment,
     verify_ros_overlay,
 )
 from validator_inference.model_environment import (
+    ENVIRONMENT_STATE_FILENAME,
     ROS_OVERLAY_MANIFEST_FILENAME,
     AssetFingerprint,
+    EnvironmentState,
     EnvironmentPaths,
+    build_uv_sync_argv,
+    build_uv_venv_argv,
     environment_paths,
+    read_environment_state,
     sha256_file,
 )
 
@@ -1612,6 +1620,7 @@ def _assert_probe_call_contract(runner: _RecordingPreflightRunner) -> None:
         assert isinstance(argv, tuple)
         assert kwargs == {
             "check": True,
+            "shell": False,
             "capture_output": True,
             "text": True,
             "timeout": 10.0,
@@ -2689,3 +2698,683 @@ def test_real_interfuser_checkpoint_and_user_cache_integration_is_source_read_on
         (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
         for metadata in before
     )
+
+
+class _SetupRunner:
+    """setup subprocess를 실행하지 않고 파일 효과, stdout과 phase를 기록한다."""
+
+    def __init__(self, root: Path, model_id: str, python_version: str) -> None:
+        self.root = root
+        self.model_id = model_id
+        self.python_version = python_version
+        self.calls: list[tuple[tuple[str, ...], dict[str, Any], str]] = []
+        self.events: list[str] = []
+        self.freeze_output = "z-package==2\r\na-package==1\r\n\r\n"
+        self.git_status_output = ""
+        self.source_commit = ""
+        self.fail_phase: str | None = None
+        self.candidate_cuda_available = True
+
+    @staticmethod
+    def _phase(command: tuple[str, ...]) -> str:
+        executable = Path(command[0]).name
+        if executable == "uv" and command[1:] == ("--version",):
+            return "host_uv"
+        if executable == "nvcc":
+            return "host_nvcc"
+        if executable == "gcc":
+            return "host_gcc"
+        if executable == "g++":
+            return "host_gxx"
+        if executable == "catkin_make":
+            return "catkin_build"
+        if command[0] == "/usr/bin/python3":
+            return "catkin_messages"
+        if executable == "git" and command[-2:] == ("rev-parse", "HEAD"):
+            return "source_head"
+        if executable == "git" and "status" in command:
+            return "source_status"
+        if executable == "uv" and len(command) > 1 and command[1] == "venv":
+            return "uv_venv"
+        if executable == "uv" and command[1:3] == ("pip", "sync"):
+            return "uv_sync"
+        if executable == "uv" and command[1:3] == ("pip", "freeze"):
+            return "freeze"
+        if command[1:] == ("setup.py", "build_ext", "--inplace"):
+            return "sparse_build"
+        code = command[2] if len(command) > 2 and command[1] == "-c" else ""
+        if "platform.python_version" in code:
+            return "python_version"
+        if "deformable_aggregation_with_depth_ext" in code and "origins =" in code:
+            return "sparse_imports"
+        if "torch.cuda.is_available" in code:
+            return "cuda_runtime"
+        if "build_selected_model" in code:
+            return "model_load"
+        if "validator_msgs.msg" in code and "rospy" in code:
+            return "ros_smoke"
+        if "import_module" in code:
+            return "required_imports"
+        return "unexpected"
+
+    def __call__(self, argv: list[str] | tuple[str, ...], **kwargs: Any):
+        assert isinstance(argv, (list, tuple))
+        command = tuple(str(value) for value in argv)
+        phase = self._phase(command)
+        self.calls.append((command, dict(kwargs), phase))
+        self.events.append(phase)
+        if self.fail_phase == phase:
+            raise subprocess.CalledProcessError(7, list(command))
+
+        if phase == "host_uv":
+            stdout = "uv 0.11.14 (x86_64-unknown-linux-gnu)\n"
+        elif phase == "host_nvcc":
+            stdout = "Cuda compilation tools, release 11.8, V11.8.89\n"
+        elif phase in {"host_gcc", "host_gxx"}:
+            stdout = "9.4.0\n"
+        elif phase == "catkin_build":
+            catkin = self.root / "devel" / "lib" / "python3" / "dist-packages"
+            (catkin / "validator_msgs" / "msg").mkdir(parents=True, exist_ok=True)
+            (catkin / "validator_msgs" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (catkin / "validator_msgs" / "msg" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            stdout = ""
+        elif phase == "source_head":
+            stdout = self.source_commit + "\n"
+        elif phase == "source_status":
+            stdout = self.git_status_output
+        elif phase == "uv_venv":
+            candidate = Path(command[-1])
+            python = candidate / "bin" / "python"
+            _write_executable(python)
+            stdout = ""
+        elif phase == "python_version":
+            stdout = self.python_version + "\n"
+        elif phase == "cuda_runtime":
+            stdout = "1\n" if self.candidate_cuda_available else "0\n"
+        elif phase == "freeze":
+            stdout = self.freeze_output
+        elif phase == "unexpected":
+            raise AssertionError(f"unexpected setup command: {command!r}")
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+
+def _setup_fixture(
+    tmp_path: Path,
+    *,
+    model_id: str = "tfv6",
+    gpu_available: bool = True,
+    recommended_policy: bool = False,
+    strip_asset_hashes: bool = False,
+    ros_smoke_hook: bool = True,
+    build_ids: tuple[str, ...] = ("build-001", "build-002", "build-003"),
+) -> tuple[
+    Path,
+    EnvironmentSetupDependencies,
+    _SetupRunner,
+    list[tuple[str, Any]],
+]:
+    """네트워크/GPU와 독립적인 setup project, dependency와 runner를 만든다."""
+    root = _preflight_project(tmp_path)
+    preflight_dependencies, _, _ = _preflight_host(
+        tmp_path, gpu_available=gpu_available
+    )
+    for package in EXPECTED_ROS_PACKAGES:
+        (
+            preflight_dependencies.ros_python_root / package / "__init__.py"
+        ).write_text("", encoding="utf-8")
+    git_path = _write_executable(tmp_path / "host" / "commands" / "git")
+    original_which = preflight_dependencies.which
+    preflight_dependencies = dataclasses.replace(
+        preflight_dependencies,
+        which=lambda command: (
+            str(git_path) if command == "git" else original_which(command)
+        ),
+    )
+    if recommended_policy:
+        original_select = preflight_dependencies.select_definition
+        preflight_dependencies = dataclasses.replace(
+            preflight_dependencies,
+            select_definition=lambda manifest, selected: dataclasses.replace(
+                original_select(manifest, selected), cuda_policy="recommended"
+            ),
+        )
+    if strip_asset_hashes:
+        original_load = preflight_dependencies.load_profile
+
+        def load_without_asset_hashes(path: Path, selected: str):
+            profile = original_load(path, selected)
+            data = json.loads(json.dumps(profile.data))
+            for declaration in data["runtime_assets"]:
+                declaration["sha256"] = None
+            return dataclasses.replace(profile, data=data)
+
+        preflight_dependencies = dataclasses.replace(
+            preflight_dependencies, load_profile=load_without_asset_hashes
+        )
+
+    manifest = preflight_dependencies.load_manifest(
+        root
+        / "src"
+        / "Validator_pkg"
+        / "validator_inference"
+        / "config"
+        / "model_environments.json"
+    )
+    definition = preflight_dependencies.select_definition(manifest, model_id)
+    runner = _SetupRunner(root, model_id, definition.python_version)
+    runner.source_commit = definition.source_commit
+    events: list[tuple[str, Any]] = []
+    checkout_names = {
+        "tfv6": "lead",
+        "interfuser": "interfuser",
+        "diffusiondrive_v2": "diffusiondrive_v2",
+        "sparsedrive_v2": "sparsedrive_v2",
+    }
+
+    def asset_fetcher(
+        profile: dict[str, Any], *, model_id: str, project_root: Path
+    ) -> Path:
+        events.append(("asset_fetch", model_id))
+        for declaration in profile["runtime_assets"]:
+            asset = project_root / declaration["path"]
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            if not asset.exists():
+                asset.write_bytes(("asset:" + declaration["role"]).encode("ascii"))
+        checkout = (
+            project_root / "models" / "sources" / checkout_names[model_id]
+        )
+        checkout.mkdir(parents=True, exist_ok=True)
+        if model_id == "sparsedrive_v2":
+            (
+                checkout / "navsim" / "agents" / "sparsedrive" / "ops"
+            ).mkdir(parents=True, exist_ok=True)
+        if model_id == "diffusiondrive_v2":
+            derivative = (
+                checkout
+                / "navsim"
+                / "agents"
+                / "diffusiondrivev2"
+                / "diffusiondrivev2_model_sel_inference.py"
+            )
+            derivative.parent.mkdir(parents=True, exist_ok=True)
+            derivative.write_text("DERIVATIVE = True\n", encoding="utf-8")
+        return project_root / "models" / model_id / "asset-manifest.json"
+
+    def asset_verifier(
+        profile: dict[str, Any], *, project_root: Path
+    ) -> dict[str, Any]:
+        events.append(("asset_verify", profile["id"]))
+        checkout = (
+            project_root
+            / "models"
+            / "sources"
+            / checkout_names[profile["id"]]
+        )
+        source: dict[str, Any] = {
+            "checkout": str(checkout),
+            "observed_commit": profile["source"]["commit"],
+        }
+        if profile["id"] == "diffusiondrive_v2":
+            relative = Path(
+                "navsim/agents/diffusiondrivev2/"
+                "diffusiondrivev2_model_sel_inference.py"
+            )
+            source["local_derivative"] = {
+                "path": relative.as_posix(),
+                "sha256": sha256_file(checkout / relative),
+            }
+        return {"source": source, "assets": []}
+
+    identifiers = iter(build_ids)
+
+    def smoke(python: Path, child_environment: dict[str, str]) -> None:
+        events.append(("ros_smoke", (python, dict(child_environment))))
+
+    dependencies = EnvironmentSetupDependencies(
+        preflight_dependencies=preflight_dependencies,
+        asset_fetcher=asset_fetcher,
+        asset_verifier=asset_verifier,
+        build_id=lambda: next(identifiers),
+        utc_now=lambda: "2026-07-22T01:02:03Z",
+        ros_smoke=smoke if ros_smoke_hook else None,
+    )
+    return root, dependencies, runner, events
+
+
+def _setup_call(runner: _SetupRunner, phase: str):
+    """runner 기록에서 유일한 setup phase call을 반환한다."""
+    matches = [call for call in runner.calls if call[2] == phase]
+    assert len(matches) == 1, (phase, matches)
+    return matches[0]
+
+
+def test_setup_public_result_and_success_phase_contract_are_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """새 candidate를 exact phase로 검증하고 state 기록 뒤에만 활성화한다."""
+    root, dependencies, runner, events = _setup_fixture(tmp_path)
+    lifecycle_events: list[str] = []
+    real_write = environment_setup.write_environment_state
+    real_activate = environment_setup.activate_candidate
+
+    def record_write(path: Path, state: EnvironmentState) -> None:
+        lifecycle_events.append("state")
+        real_write(path, state)
+
+    def record_activate(paths: EnvironmentPaths, candidate: Path) -> None:
+        lifecycle_events.append("activate")
+        real_activate(paths, candidate)
+
+    monkeypatch.setattr(environment_setup, "write_environment_state", record_write)
+    monkeypatch.setattr(environment_setup, "activate_candidate", record_activate)
+
+    result = setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert tuple(field.name for field in dataclasses.fields(EnvironmentOperationResult)) == (
+        "environment_dir",
+        "state",
+        "warnings",
+        "changed",
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.changed = False  # type: ignore[misc]
+    assert result.changed is True
+    assert result.environment_dir.name == "build-001"
+    assert result.state == read_environment_state(result.environment_dir)
+    assert result.warnings == ()
+    assert environment_paths(root, "tfv6").current.resolve() == result.environment_dir
+    assert lifecycle_events == ["state", "activate"]
+    assert events[:2] == [("asset_fetch", "tfv6"), ("asset_verify", "tfv6")]
+    assert events[-1][0] == "ros_smoke"
+    assert [phase for _, _, phase in runner.calls] == [
+        "host_uv",
+        "catkin_build",
+        "catkin_messages",
+        "source_head",
+        "source_status",
+        "uv_venv",
+        "uv_sync",
+        "python_version",
+        "required_imports",
+        "cuda_runtime",
+        "model_load",
+        "freeze",
+    ]
+    assert all(call[1]["check"] is True for call in runner.calls)
+    assert all(call[1]["shell"] is False for call in runner.calls)
+
+    catkin_command, catkin_kwargs, _ = _setup_call(runner, "catkin_build")
+    assert Path(catkin_command[0]).is_absolute()
+    assert catkin_command == (str(dependencies.preflight_dependencies.which("catkin_make")),)
+    assert catkin_kwargs["cwd"] == root
+    message_command, message_kwargs, _ = _setup_call(runner, "catkin_messages")
+    assert message_command[:2] == ("/usr/bin/python3", "-c")
+    assert str(root / "devel" / "lib" / "python3" / "dist-packages") in message_command[2]
+    assert str(dependencies.preflight_dependencies.ros_python_root) in message_command[2]
+    assert all(
+        name in message_command[2]
+        for name in ("CameraCalibration", "DrivingFeature", "InferenceMetric")
+    )
+    assert message_kwargs["cwd"] == root
+
+    candidate = result.environment_dir
+    assert _setup_call(runner, "uv_venv")[0] == build_uv_venv_argv(
+        result.state and Path(dependencies.preflight_dependencies.which("uv")),
+        dependencies.preflight_dependencies.select_definition(
+            dependencies.preflight_dependencies.load_manifest(
+                root
+                / "src"
+                / "Validator_pkg"
+                / "validator_inference"
+                / "config"
+                / "model_environments.json"
+            ),
+            "tfv6",
+        ),
+        candidate,
+    )
+    definition = dependencies.preflight_dependencies.select_definition(
+        dependencies.preflight_dependencies.load_manifest(
+            root
+            / "src"
+            / "Validator_pkg"
+            / "validator_inference"
+            / "config"
+            / "model_environments.json"
+        ),
+        "tfv6",
+    )
+    assert _setup_call(runner, "uv_sync")[0] == build_uv_sync_argv(
+        Path(dependencies.preflight_dependencies.which("uv")), definition, candidate
+    )
+    normalized = b"a-package==1\nz-package==2\n"
+    assert result.state.installed_packages_sha256 == hashlib.sha256(normalized).hexdigest()
+    freeze_command, _, _ = _setup_call(runner, "freeze")
+    assert freeze_command == (
+        str(Path(dependencies.preflight_dependencies.which("uv"))),
+        "pip",
+        "freeze",
+        "--python",
+        str(result.environment_dir / "bin" / "python"),
+        "--strict",
+        "--no-python-downloads",
+    )
+    assert result.state.assets == fingerprint_runtime_assets(
+        preflight_environment(
+            root,
+            "tfv6",
+            runner=runner,
+            dependencies=dependencies.preflight_dependencies,
+        )
+    )
+
+
+def test_setup_host_blocker_runs_before_lock_or_any_mutator(tmp_path: Path):
+    """host preflight 실패는 .venvs, catkin, asset callback을 전혀 만들지 않는다."""
+    root, dependencies, runner, events = _setup_fixture(
+        tmp_path, gpu_available=False
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="CUDA GPU is required") as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert caught.value.action == "host_preflight"
+    assert [phase for _, _, phase in runner.calls] == ["host_uv"]
+    assert events == []
+    assert not (root / ".venvs").exists()
+    assert not (root / "devel").exists()
+
+
+def test_setup_failed_sync_retains_candidate_and_preserves_old_current(tmp_path: Path):
+    """candidate phase 실패는 state를 쓰지 않고 기존 current를 그대로 보존한다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    paths = environment_paths(root, "tfv6")
+    old = create_candidate(paths, "old-build")
+    paths.current.symlink_to(Path("builds/old-build"))
+    runner.fail_phase = "uv_sync"
+
+    with pytest.raises(EnvironmentSetupError) as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    candidate = paths.builds / "build-001"
+    assert caught.value.action == "environment_sync"
+    assert paths.current.resolve() == old
+    assert candidate.is_dir()
+    assert not (candidate / ENVIRONMENT_STATE_FILENAME).exists()
+
+
+def test_setup_reuses_deep_valid_current_and_recreate_forces_new_build(tmp_path: Path):
+    """deep-valid current는 재사용하고 recreate는 항상 새 candidate를 활성화한다."""
+    root, dependencies, first_runner, events = _setup_fixture(tmp_path)
+    first = setup_environment(
+        root, "tfv6", runner=first_runner, dependencies=dependencies
+    )
+    events.clear()
+    second_runner = _SetupRunner(root, "tfv6", first.state.python_version)
+    second_runner.source_commit = first.state.source_commit
+
+    reused = setup_environment(
+        root, "tfv6", runner=second_runner, dependencies=dependencies
+    )
+
+    assert reused == EnvironmentOperationResult(
+        environment_dir=first.environment_dir,
+        state=first.state,
+        warnings=(),
+        changed=False,
+    )
+    assert not any(
+        phase in {"uv_venv", "uv_sync"}
+        for _, _, phase in second_runner.calls
+    )
+    assert events[0] == ("asset_verify", "tfv6")
+
+    recreate_runner = _SetupRunner(root, "tfv6", first.state.python_version)
+    recreate_runner.source_commit = first.state.source_commit
+    recreated = setup_environment(
+        root,
+        "tfv6",
+        recreate=True,
+        runner=recreate_runner,
+        dependencies=dependencies,
+    )
+    assert recreated.changed is True
+    assert recreated.environment_dir.name == "build-002"
+    assert recreated.environment_dir != first.environment_dir
+    assert environment_paths(root, "tfv6").current.resolve() == recreated.environment_dir
+    assert first.environment_dir.is_dir()
+
+
+def test_setup_reuse_deep_hash_rejects_same_metadata_asset_tamper(tmp_path: Path):
+    """size와 mtime을 복원한 asset 변조도 deep reuse 검사에서 차단한다."""
+    root, dependencies, first_runner, _ = _setup_fixture(tmp_path)
+    first = setup_environment(
+        root, "tfv6", runner=first_runner, dependencies=dependencies
+    )
+    asset = root / first.state.assets[0].path
+    before = asset.lstat()
+    payload = asset.read_bytes()
+    asset.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+    os.utime(asset, ns=(before.st_atime_ns, before.st_mtime_ns))
+    runner = _SetupRunner(root, "tfv6", first.state.python_version)
+    runner.source_commit = first.state.source_commit
+
+    with pytest.raises(EnvironmentSetupError, match="asset"):
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert environment_paths(root, "tfv6").current.resolve() == first.environment_dir
+    assert not (environment_paths(root, "tfv6").builds / "build-002").exists()
+
+
+@pytest.mark.parametrize("preflight_variant", ("stale", "missing", "extra"))
+def test_setup_reuse_rejects_nonexact_preflight_identifiers(
+    tmp_path: Path, preflight_variant: str
+):
+    """재사용 state는 현재 setup이 완료한 exact preflight 집합을 증명해야 한다."""
+    root, dependencies, first_runner, _ = _setup_fixture(tmp_path)
+    first = setup_environment(
+        root, "tfv6", runner=first_runner, dependencies=dependencies
+    )
+    expected = first.state.preflight_ids
+    variants = {
+        "stale": ("legacy_host",) + expected[1:],
+        "missing": expected[:-1],
+        "extra": expected + ("future_check",),
+    }
+    stale_state = dataclasses.replace(
+        first.state, preflight_ids=variants[preflight_variant]
+    )
+    environment_setup.write_environment_state(
+        first.environment_dir / ENVIRONMENT_STATE_FILENAME, stale_state
+    )
+    runner = _SetupRunner(root, "tfv6", first.state.python_version)
+    runner.source_commit = first.state.source_commit
+
+    with pytest.raises(EnvironmentSetupError, match="preflight") as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    paths = environment_paths(root, "tfv6")
+    assert caught.value.action == "reuse_verification"
+    assert paths.current.resolve() == first.environment_dir
+    assert not (paths.builds / "build-002").exists()
+
+
+def test_setup_propagates_preflight_warning_without_duplicate_runtime_warning(
+    tmp_path: Path,
+):
+    """host/runtime CUDA가 모두 없으면 recommended warning을 중복 기록하지 않는다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, gpu_available=False, recommended_policy=True
+    )
+    runner.candidate_cuda_available = False
+
+    result = setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert result.warnings == (
+        "CUDA GPU is not available; continuing because "
+        "tfv6 declares cuda_policy=recommended",
+    )
+    assert any(phase == "cuda_runtime" for _, _, phase in runner.calls)
+
+
+def test_setup_warns_when_host_gpu_exists_but_recommended_candidate_cuda_is_absent(
+    tmp_path: Path,
+):
+    """host probe 성공 뒤 candidate torch CUDA 부재도 recommended 결과에 기록한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, gpu_available=True, recommended_policy=True
+    )
+    runner.candidate_cuda_available = False
+
+    result = setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert result.warnings == (
+        "candidate torch CUDA is not available; continuing because "
+        "tfv6 declares cuda_policy=recommended",
+    )
+
+
+def test_setup_sparse_runs_exact_declared_extension_action(tmp_path: Path):
+    """SparseDrive만 exact build_ext 환경과 두 extension origin import를 실행한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, model_id="sparsedrive_v2", strip_asset_hashes=True
+    )
+
+    result = setup_environment(
+        root, "sparsedrive_v2", runner=runner, dependencies=dependencies
+    )
+
+    build_command, build_kwargs, _ = _setup_call(runner, "sparse_build")
+    assert build_command == (
+        str(result.environment_dir / "bin" / "python"),
+        "setup.py",
+        "build_ext",
+        "--inplace",
+    )
+    assert build_kwargs["cwd"] == (
+        root
+        / "models"
+        / "sources"
+        / "sparsedrive_v2"
+        / "navsim"
+        / "agents"
+        / "sparsedrive"
+        / "ops"
+    )
+    assert {
+        key: build_kwargs["env"][key]
+        for key in ("CUDA_HOME", "FORCE_CUDA", "TORCH_CUDA_ARCH_LIST", "CC", "CXX")
+    } == {
+        "CUDA_HOME": str(dependencies.preflight_dependencies.cuda_root),
+        "FORCE_CUDA": "1",
+        "TORCH_CUDA_ARCH_LIST": "8.6",
+        "CC": str(dependencies.preflight_dependencies.gcc_path),
+        "CXX": str(dependencies.preflight_dependencies.gxx_path),
+    }
+    import_command, _, _ = _setup_call(runner, "sparse_imports")
+    assert "deformable_aggregation_ext" in import_command[2]
+    assert "deformable_aggregation_with_depth_ext" in import_command[2]
+    assert "sys.path.insert" in import_command[2]
+    assert str(build_kwargs["cwd"]) in import_command
+    required_imports = _setup_call(runner, "required_imports")
+    assert required_imports[1]["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(
+        build_kwargs["cwd"]
+    )
+    assert [phase for _, _, phase in runner.calls].index("sparse_build") < [
+        phase for _, _, phase in runner.calls
+    ].index("sparse_imports")
+
+
+def test_setup_postinstall_cuda_failure_never_writes_state_or_switches_current(
+    tmp_path: Path,
+):
+    """host GPU가 있어도 candidate torch CUDA가 없으면 activation 전에 차단한다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    paths = environment_paths(root, "tfv6")
+    old = create_candidate(paths, "old-build")
+    paths.current.symlink_to(Path("builds/old-build"))
+    runner.fail_phase = "cuda_runtime"
+
+    with pytest.raises(EnvironmentSetupError) as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    candidate = paths.builds / "build-001"
+    assert caught.value.action == "cuda_runtime"
+    assert paths.current.resolve() == old
+    assert candidate.is_dir()
+    assert not (candidate / ENVIRONMENT_STATE_FILENAME).exists()
+
+
+def test_setup_default_ros_smoke_is_bounded_and_uses_sanitized_child_environment(
+    tmp_path: Path,
+):
+    """hook이 없으면 target Python으로 standard/custom ROS imports를 bounded 실행한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, ros_smoke_hook=False
+    )
+
+    result = setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    command, kwargs, _ = _setup_call(runner, "ros_smoke")
+    assert command[:2] == (str(result.environment_dir / "bin" / "python"), "-c")
+    assert all(
+        token in command[2]
+        for token in (
+            "rospy",
+            "std_msgs.msg",
+            "sensor_msgs.msg",
+            "geometry_msgs.msg",
+            "nav_msgs.msg",
+            "tf2_msgs.msg",
+            "actionlib_msgs.msg",
+            "validator_msgs.msg",
+        )
+    )
+    assert kwargs["timeout"] > 0
+    assert kwargs["env"]["VIRTUAL_ENV"] == str(result.environment_dir)
+    assert kwargs["env"]["PYTHONPATH"].split(os.pathsep) == [
+        str(result.environment_dir / ".ros-overlay"),
+        str(root / "devel" / "lib" / "python3" / "dist-packages"),
+    ]
+
+
+def test_setup_rejects_dirty_source_before_candidate_creation(tmp_path: Path):
+    """tracked checkout 변경은 asset 검증 뒤 candidate 생성 전에 차단한다."""
+    root, dependencies, runner, _ = _setup_fixture(tmp_path)
+    runner.git_status_output = " M tracked.py\n"
+
+    with pytest.raises(EnvironmentSetupError, match="dirty") as caught:
+        setup_environment(root, "tfv6", runner=runner, dependencies=dependencies)
+
+    assert caught.value.action == "source_verification"
+    assert not (environment_paths(root, "tfv6").builds / "build-001").exists()
+
+
+def test_setup_allows_only_exact_verified_diffusion_derivative_dirty_entry(
+    tmp_path: Path,
+):
+    """Diffusion의 deep-verified generated derivative 한 경로만 dirty 예외로 허용한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path,
+        model_id="diffusiondrive_v2",
+        strip_asset_hashes=True,
+    )
+    runner.git_status_output = (
+        "?? navsim/agents/diffusiondrivev2/"
+        "diffusiondrivev2_model_sel_inference.py\n"
+    )
+
+    result = setup_environment(
+        root,
+        "diffusiondrive_v2",
+        runner=runner,
+        dependencies=dependencies,
+    )
+
+    assert result.changed is True
