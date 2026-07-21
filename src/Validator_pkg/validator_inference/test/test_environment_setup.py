@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -27,12 +29,15 @@ from validator_inference.environment_setup import (
     activate_candidate,
     build_ros_overlay,
     create_candidate,
+    fingerprint_runtime_assets,
     preflight_environment,
+    prepare_local_runtime_assets,
     prune_inactive_builds,
     verify_ros_overlay,
 )
 from validator_inference.model_environment import (
     ROS_OVERLAY_MANIFEST_FILENAME,
+    AssetFingerprint,
     EnvironmentPaths,
     environment_paths,
     sha256_file,
@@ -2045,3 +2050,535 @@ def test_real_host_interfuser_preflight_is_nonmutating_when_prerequisites_exist(
     assert result.definition.model_id == "interfuser"
     assert result.warnings == (_PREFLIGHT_WARNING.format(model_id="interfuser"),)
     assert before == after
+
+
+_INTERFUSER_CHECKPOINT_PATH = Path(
+    "models/interfuser/official_carla/interfuser.pth.tar"
+)
+_INTERFUSER_BACKBONE_PATH = Path(
+    "models/shared/torch-cache/hub/checkpoints/resnet50d_ra2-464e36ba.pth"
+)
+_INTERFUSER_CHECKPOINT_SHA256 = (
+    "39548dcfa56cdc06b8ccc52d7f6187a7d70ef36b05b7027db4d64a57ac3e30b2"
+)
+_INTERFUSER_BACKBONE_SHA256 = (
+    "464e36baa940a80971e717454e61e8f6fc1a1b284b7a3dbb6f6fd4c3da78533d"
+)
+
+
+def _bytes_sha256(payload: bytes) -> str:
+    """작은 asset fixture bytes의 SHA-256을 계산한다."""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _interfuser_runtime_assets(
+    checkpoint_sha256: str,
+    backbone_sha256: str,
+) -> list[dict[str, Any]]:
+    """InterFuser의 두 runtime asset 선언을 fixture hash로 만든다."""
+    return [
+        {
+            "role": "checkpoint",
+            "path": _INTERFUSER_CHECKPOINT_PATH.as_posix(),
+            "expected_filename": "interfuser.pth.tar",
+            "sha256": checkpoint_sha256,
+            "provenance": {
+                "classification": "third_party_compatibility_artifact",
+                "repository": "https://github.com/MingfeiCheng/Drivora",
+                "commit": "25d56d2300f422d502c6549695b9e49efd5e5e00",
+                "google_drive_id": "1GKiASmGPbD4FwHkUoVfGRk_lMLrGb2f6",
+            },
+        },
+        {
+            "role": "image_backbone",
+            "path": _INTERFUSER_BACKBONE_PATH.as_posix(),
+            "source_url": (
+                "https://github.com/rwightman/pytorch-image-models/releases/"
+                "download/v0.1-weights/resnet50d_ra2-464e36ba.pth"
+            ),
+            "sha256": backbone_sha256,
+        },
+    ]
+
+
+def _asset_preflight(
+    tmp_path: Path,
+    runtime_assets: list[dict[str, Any]],
+    *,
+    model_id: str = "interfuser",
+) -> EnvironmentPreflight:
+    """host 검증을 통과한 preflight에 격리 runtime asset 선언을 넣는다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    preflight = preflight_environment(
+        root, model_id, runner=runner, dependencies=dependencies
+    )
+    profile = dict(preflight.selected_profile.data)
+    profile["runtime_assets"] = runtime_assets
+    selected_profile = dataclasses.replace(preflight.selected_profile, data=profile)
+    return dataclasses.replace(preflight, selected_profile=selected_profile)
+
+
+def _write_asset(root: Path, relative: Path, payload: bytes) -> Path:
+    """격리 project 아래에 작은 regular asset을 만든다."""
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return path
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        "",
+        "/absolute.bin",
+        "../escape.bin",
+        "models/../escape.bin",
+        "models/./escape.bin",
+        "models//escape.bin",
+        "models/escape.bin/",
+        "models\\escape.bin",
+        "models/bad\nname.bin",
+    ),
+)
+def test_fingerprint_rejects_noncanonical_repository_relative_asset_paths(
+    tmp_path: Path,
+    unsafe_path: str,
+):
+    """asset 선언은 root 탈출, alias, backslash와 control 문자를 허용하지 않는다."""
+    preflight = _asset_preflight(
+        tmp_path,
+        [{"role": "checkpoint", "path": unsafe_path, "sha256": None}],
+        model_id="tfv6",
+    )
+
+    with pytest.raises(EnvironmentSetupError, match="repository-relative") as caught:
+        fingerprint_runtime_assets(preflight)
+
+    assert caught.value.action == "assets"
+    assert not (preflight.root / "models").exists()
+
+
+@pytest.mark.parametrize("kind", ("parent_symlink", "final_symlink", "fifo"))
+def test_fingerprint_rejects_symlinked_and_special_asset_files(
+    tmp_path: Path,
+    kind: str,
+):
+    """asset parent/final symlink과 blocking special file을 no-follow로 거부한다."""
+    declaration = {
+        "role": "checkpoint",
+        "path": "models/tfv6/checkpoint.bin",
+        "sha256": None,
+    }
+    preflight = _asset_preflight(tmp_path, [declaration], model_id="tfv6")
+    asset_path = preflight.root / declaration["path"]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "target.bin"
+    target.write_bytes(b"outside")
+    if kind == "parent_symlink":
+        (preflight.root / "models").symlink_to(outside, target_is_directory=True)
+    else:
+        asset_path.parent.mkdir(parents=True)
+        if kind == "final_symlink":
+            asset_path.symlink_to(target)
+        else:
+            os.mkfifo(asset_path)
+
+    with pytest.raises(EnvironmentSetupError, match="symlink|regular file") as caught:
+        fingerprint_runtime_assets(preflight)
+
+    assert caught.value.action == "assets"
+
+
+def test_prepare_missing_interfuser_checkpoint_reports_full_provenance_first(
+    tmp_path: Path,
+):
+    """checkpoint 누락은 cache 검사나 directory 생성 전에 완전한 복구 정보를 준다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    preflight = preflight_environment(
+        root, "interfuser", runner=runner, dependencies=dependencies
+    )
+    expected_path = root / _INTERFUSER_CHECKPOINT_PATH
+
+    with pytest.raises(EnvironmentSetupError) as caught:
+        prepare_local_runtime_assets(
+            preflight,
+            interfuser_user_cache=Path("relative-cache-must-not-be-read"),
+        )
+
+    assert caught.value.action == "assets"
+    message = str(caught.value)
+    assert str(expected_path) in message
+    assert _INTERFUSER_CHECKPOINT_SHA256 in message
+    assert "third_party_compatibility_artifact" in message
+    assert "https://github.com/MingfeiCheng/Drivora" in message
+    assert "25d56d2300f422d502c6549695b9e49efd5e5e00" in message
+    assert "1GKiASmGPbD4FwHkUoVfGRk_lMLrGb2f6" in message
+    assert not (root / "models").exists()
+
+
+@pytest.mark.parametrize("kind", ("mismatch", "symlink"))
+def test_prepare_never_overwrites_invalid_interfuser_checkpoint(
+    tmp_path: Path,
+    kind: str,
+):
+    """기존 checkpoint hash 불일치와 symlink는 원본을 바꾸지 않고 실패한다."""
+    checkpoint_payload = b"expected checkpoint"
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), "b" * 64
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    checkpoint = preflight.root / _INTERFUSER_CHECKPOINT_PATH
+    checkpoint.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-checkpoint.bin"
+    outside.write_bytes(b"outside checkpoint")
+    if kind == "mismatch":
+        checkpoint.write_bytes(b"wrong checkpoint")
+        before = checkpoint.read_bytes()
+    else:
+        checkpoint.symlink_to(outside)
+        before = outside.read_bytes()
+
+    with pytest.raises(EnvironmentSetupError, match="SHA-256|symlink") as caught:
+        prepare_local_runtime_assets(
+            preflight, interfuser_user_cache=tmp_path / "unused-cache.pth"
+        )
+
+    assert caught.value.action == "assets"
+    if kind == "mismatch":
+        assert checkpoint.read_bytes() == before
+    else:
+        assert checkpoint.is_symlink()
+        assert outside.read_bytes() == before
+
+
+@pytest.mark.parametrize("exact", (True, False))
+def test_prepare_never_rewrites_existing_project_backbone(
+    tmp_path: Path,
+    exact: bool,
+):
+    """기존 project backbone은 exact면 재사용하고 mismatch면 덮어쓰지 않는다."""
+    checkpoint_payload = b"checkpoint"
+    backbone_payload = b"backbone"
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), _bytes_sha256(backbone_payload)
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    _write_asset(preflight.root, _INTERFUSER_CHECKPOINT_PATH, checkpoint_payload)
+    backbone = _write_asset(
+        preflight.root,
+        _INTERFUSER_BACKBONE_PATH,
+        backbone_payload if exact else b"existing mismatch",
+    )
+    before = backbone.lstat()
+    if exact:
+        outside = tmp_path / "outside-cache.pth"
+        outside.write_bytes(b"must not be read")
+        cache = tmp_path / "cache-link.pth"
+        cache.symlink_to(outside)
+    else:
+        cache = _write_asset(
+            tmp_path, Path("user-cache/backbone.pth"), backbone_payload
+        )
+
+    if exact:
+        prepare_local_runtime_assets(preflight, interfuser_user_cache=cache)
+    else:
+        with pytest.raises(EnvironmentSetupError, match="SHA-256"):
+            prepare_local_runtime_assets(preflight, interfuser_user_cache=cache)
+
+    after = backbone.lstat()
+    assert backbone.read_bytes() == (
+        backbone_payload if exact else b"existing mismatch"
+    )
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+def test_prepare_leaves_project_cache_absent_when_user_cache_is_absent(
+    tmp_path: Path,
+):
+    """user cache가 없으면 official source_url fetcher를 위해 project를 건드리지 않는다."""
+    checkpoint_payload = b"checkpoint"
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), "c" * 64
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    _write_asset(preflight.root, _INTERFUSER_CHECKPOINT_PATH, checkpoint_payload)
+
+    prepare_local_runtime_assets(
+        preflight, interfuser_user_cache=tmp_path / "missing-user-cache.pth"
+    )
+
+    assert not (preflight.root / _INTERFUSER_BACKBONE_PATH).exists()
+    assert not (preflight.root / "models" / "shared").exists()
+
+
+def test_prepare_copies_exact_user_cache_with_atomic_fsync_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """exact user cache를 sibling temp에서 fsync한 뒤 atomic replace와 parent fsync한다."""
+    checkpoint_payload = b"checkpoint"
+    backbone_payload = b"cached backbone" * 4096
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), _bytes_sha256(backbone_payload)
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    _write_asset(preflight.root, _INTERFUSER_CHECKPOINT_PATH, checkpoint_payload)
+    user_cache = _write_asset(tmp_path, Path("user/cache/backbone.pth"), backbone_payload)
+    events: list[tuple[Any, ...]] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def recording_fsync(descriptor: int) -> None:
+        mode = os.fstat(descriptor).st_mode
+        events.append(("fsync", "directory" if stat.S_ISDIR(mode) else "file"))
+        real_fsync(descriptor)
+
+    def recording_replace(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        events.append(("replace", source, destination, src_dir_fd == dst_dir_fd))
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(environment_setup.os, "fsync", recording_fsync)
+    monkeypatch.setattr(environment_setup.os, "replace", recording_replace)
+
+    prepare_local_runtime_assets(preflight, interfuser_user_cache=user_cache)
+
+    destination = preflight.root / _INTERFUSER_BACKBONE_PATH
+    assert destination.read_bytes() == backbone_payload
+    assert events[0] == ("fsync", "file")
+    assert events[1][0] == "replace"
+    assert events[1][2:] == (destination.name, True)
+    assert events[2] == ("fsync", "directory")
+    assert not any(path.name.startswith(".asset-") for path in destination.parent.iterdir())
+
+
+@pytest.mark.parametrize("kind", ("mismatch", "final_symlink", "parent_symlink"))
+def test_prepare_rejects_invalid_user_cache_without_installing_backbone(
+    tmp_path: Path,
+    kind: str,
+):
+    """cache hash 불일치와 parent/final symlink는 project asset으로 복사하지 않는다."""
+    checkpoint_payload = b"checkpoint"
+    backbone_payload = b"backbone"
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), _bytes_sha256(backbone_payload)
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    _write_asset(preflight.root, _INTERFUSER_CHECKPOINT_PATH, checkpoint_payload)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "backbone.pth"
+    target.write_bytes(backbone_payload if kind != "mismatch" else b"wrong")
+    if kind == "parent_symlink":
+        cache_parent = tmp_path / "user-cache"
+        cache_parent.symlink_to(outside, target_is_directory=True)
+        user_cache = cache_parent / target.name
+    elif kind == "final_symlink":
+        user_cache = tmp_path / "cache-link.pth"
+        user_cache.symlink_to(target)
+    else:
+        user_cache = target
+
+    with pytest.raises(EnvironmentSetupError, match="SHA-256|symlink") as caught:
+        prepare_local_runtime_assets(preflight, interfuser_user_cache=user_cache)
+
+    assert caught.value.action == "assets"
+    assert not (preflight.root / _INTERFUSER_BACKBONE_PATH).exists()
+
+
+def test_prepare_copy_failure_cleans_temp_and_leaves_destination_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """stream copy 오류는 sibling temp를 제거하고 destination을 만들지 않는다."""
+    checkpoint_payload = b"checkpoint"
+    backbone_payload = b"backbone" * 4096
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), _bytes_sha256(backbone_payload)
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    _write_asset(preflight.root, _INTERFUSER_CHECKPOINT_PATH, checkpoint_payload)
+    user_cache = _write_asset(tmp_path, Path("user-cache/backbone.pth"), backbone_payload)
+
+    def fail_write(descriptor: int, block: bytes) -> int:
+        raise OSError("injected copy failure")
+
+    monkeypatch.setattr(environment_setup.os, "write", fail_write)
+
+    with pytest.raises(EnvironmentSetupError, match="copy") as caught:
+        prepare_local_runtime_assets(preflight, interfuser_user_cache=user_cache)
+
+    destination = preflight.root / _INTERFUSER_BACKBONE_PATH
+    assert caught.value.action == "assets"
+    assert not destination.exists()
+    assert destination.parent.is_dir()
+    assert list(destination.parent.iterdir()) == []
+
+
+def test_fingerprint_hashes_every_asset_in_declaration_order_with_lstat_metadata(
+    tmp_path: Path,
+):
+    """모든 asset을 선언 순서대로 deep hash하고 repo-relative metadata를 반환한다."""
+    checkpoint_payload = b"checkpoint fingerprint"
+    backbone_payload = b"backbone fingerprint"
+    assets = _interfuser_runtime_assets(
+        _bytes_sha256(checkpoint_payload), _bytes_sha256(backbone_payload)
+    )
+    preflight = _asset_preflight(tmp_path, assets)
+    checkpoint = _write_asset(
+        preflight.root, _INTERFUSER_CHECKPOINT_PATH, checkpoint_payload
+    )
+    backbone = _write_asset(
+        preflight.root, _INTERFUSER_BACKBONE_PATH, backbone_payload
+    )
+
+    fingerprints = fingerprint_runtime_assets(preflight)
+
+    assert fingerprints == tuple(
+        AssetFingerprint(
+            path=relative,
+            sha256=_bytes_sha256(payload),
+            size=len(payload),
+            mtime_ns=absolute.lstat().st_mtime_ns,
+        )
+        for relative, absolute, payload in (
+            (_INTERFUSER_CHECKPOINT_PATH, checkpoint, checkpoint_payload),
+            (_INTERFUSER_BACKBONE_PATH, backbone, backbone_payload),
+        )
+    )
+
+
+def test_fingerprint_rejects_nonnull_expected_sha256_mismatch(tmp_path: Path):
+    """선언된 expected SHA-256과 본문 hash 불일치는 fingerprint로 기록하지 않는다."""
+    declaration = {
+        "role": "checkpoint",
+        "path": "models/tfv6/checkpoint.bin",
+        "sha256": "0" * 64,
+    }
+    preflight = _asset_preflight(tmp_path, [declaration], model_id="tfv6")
+    _write_asset(preflight.root, Path(declaration["path"]), b"not zero")
+
+    with pytest.raises(EnvironmentSetupError, match="expected.*0{64}") as caught:
+        fingerprint_runtime_assets(preflight)
+
+    assert caught.value.action == "assets"
+
+
+def test_fingerprint_streams_assets_larger_than_overlay_limit(tmp_path: Path):
+    """runtime asset deep hash에는 ROS overlay의 64MiB 상한을 재사용하지 않는다."""
+    relative = Path("models/tfv6/large-checkpoint.bin")
+    declaration = {"role": "checkpoint", "path": relative.as_posix(), "sha256": None}
+    preflight = _asset_preflight(tmp_path, [declaration], model_id="tfv6")
+    asset = preflight.root / relative
+    asset.parent.mkdir(parents=True)
+    with asset.open("wb") as stream:
+        stream.seek(64 * 1024 * 1024)
+        stream.write(b"asset-tail")
+
+    fingerprints = fingerprint_runtime_assets(preflight)
+
+    assert len(fingerprints) == 1
+    assert fingerprints[0].path == relative
+    assert fingerprints[0].size == 64 * 1024 * 1024 + len(b"asset-tail")
+    assert fingerprints[0].sha256 == sha256_file(asset)
+
+
+_REAL_INTERFUSER_CHECKPOINT = _REPOSITORY_ROOT / _INTERFUSER_CHECKPOINT_PATH
+_REAL_INTERFUSER_USER_CACHE = (
+    Path.home()
+    / ".cache"
+    / "torch"
+    / "hub"
+    / "checkpoints"
+    / _INTERFUSER_BACKBONE_PATH.name
+)
+
+
+@pytest.mark.skipif(
+    not all(
+        path.is_file() and not path.is_symlink()
+        for path in (_REAL_INTERFUSER_CHECKPOINT, _REAL_INTERFUSER_USER_CACHE)
+    ),
+    reason="local InterFuser checkpoint/user cache are unavailable",
+)
+def test_real_interfuser_checkpoint_and_user_cache_integration_is_source_read_only(
+    tmp_path: Path,
+):
+    """실제 두 대용량 source는 읽기만 하고 cache copy는 temp project에 제한한다."""
+    dependencies, runner, _ = _preflight_host(tmp_path)
+    checkpoint_preflight = preflight_environment(
+        _REPOSITORY_ROOT,
+        "tfv6",
+        runner=runner,
+        dependencies=dependencies,
+    )
+    checkpoint_profile = dict(checkpoint_preflight.selected_profile.data)
+    checkpoint_profile["runtime_assets"] = [
+        {
+            "role": "checkpoint",
+            "path": _INTERFUSER_CHECKPOINT_PATH.as_posix(),
+            "sha256": _INTERFUSER_CHECKPOINT_SHA256,
+        }
+    ]
+    checkpoint_preflight = dataclasses.replace(
+        checkpoint_preflight,
+        selected_profile=dataclasses.replace(
+            checkpoint_preflight.selected_profile, data=checkpoint_profile
+        ),
+    )
+    before = (
+        _REAL_INTERFUSER_CHECKPOINT.lstat(),
+        _REAL_INTERFUSER_USER_CACHE.lstat(),
+    )
+    checkpoint_fingerprint = fingerprint_runtime_assets(checkpoint_preflight)
+
+    fixture_checkpoint = b"fixture checkpoint"
+    preflight = _asset_preflight(
+        tmp_path / "cache-copy",
+        _interfuser_runtime_assets(
+            _bytes_sha256(fixture_checkpoint), _INTERFUSER_BACKBONE_SHA256
+        ),
+    )
+    _write_asset(preflight.root, _INTERFUSER_CHECKPOINT_PATH, fixture_checkpoint)
+    prepare_local_runtime_assets(
+        preflight, interfuser_user_cache=_REAL_INTERFUSER_USER_CACHE
+    )
+    fingerprints = fingerprint_runtime_assets(preflight)
+    after = (
+        _REAL_INTERFUSER_CHECKPOINT.lstat(),
+        _REAL_INTERFUSER_USER_CACHE.lstat(),
+    )
+
+    assert checkpoint_fingerprint[0].sha256 == _INTERFUSER_CHECKPOINT_SHA256
+    assert checkpoint_fingerprint[0].size == 636107072
+    assert tuple(fingerprint.path for fingerprint in fingerprints) == (
+        _INTERFUSER_CHECKPOINT_PATH,
+        _INTERFUSER_BACKBONE_PATH,
+    )
+    assert fingerprints[1].sha256 == _INTERFUSER_BACKBONE_SHA256
+    assert fingerprints[1].size == 102567109
+    assert tuple(
+        (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+        for metadata in after
+    ) == tuple(
+        (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+        for metadata in before
+    )

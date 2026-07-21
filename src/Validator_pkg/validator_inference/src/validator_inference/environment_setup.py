@@ -40,6 +40,7 @@ from validator_inference.model_environment import (
     EXPECTED_UV_VERSION,
     ROS_OVERLAY_MANIFEST_FILENAME,
     SUPPORTED_MODEL_IDS,
+    AssetFingerprint,
     EnvironmentConfigError,
     EnvironmentManifest,
     EnvironmentPaths,
@@ -94,6 +95,21 @@ _COMPILER_VERSION_OUTPUT = re.compile(
 )
 _SPARSE_COMPILER_MIN_MAJOR = 6
 _SPARSE_COMPILER_MAX_MAJOR = 11
+_ASSETS_ACTION = "assets"
+_INTERFUSER_CHECKPOINT_PATH = Path(
+    "models/interfuser/official_carla/interfuser.pth.tar"
+)
+_INTERFUSER_BACKBONE_PATH = Path(
+    "models/shared/torch-cache/hub/checkpoints/resnet50d_ra2-464e36ba.pth"
+)
+_INTERFUSER_USER_CACHE = (
+    Path.home()
+    / ".cache"
+    / "torch"
+    / "hub"
+    / "checkpoints"
+    / "resnet50d_ra2-464e36ba.pth"
+)
 
 
 def _read_host_os_release() -> Mapping[str, str]:
@@ -843,6 +859,443 @@ def preflight_environment(
         paths=paths,
         uv_path=uv_path,
         warnings=tuple(warnings),
+    )
+
+
+@dataclass(frozen=True)
+class _RuntimeAssetDeclaration:
+    """검증된 asset 선언의 role, 상대/절대 경로와 expected hash를 보관한다."""
+
+    role: str
+    relative_path: Path
+    absolute_path: Path
+    expected_sha256: Optional[str]
+    payload: Mapping[str, Any]
+
+
+def _repository_relative_asset_path(value: Any, index: int) -> Path:
+    """profile asset 경로를 canonical repository-relative POSIX path로 제한한다."""
+    context = f"runtime_assets[{index}].path"
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_PATH_STRING_LENGTH
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        _raise(_ASSETS_ACTION, f"{context} must be a canonical repository-relative path")
+    pure = PurePosixPath(value)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or value != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        _raise(_ASSETS_ACTION, f"{context} must be a canonical repository-relative path")
+    return Path(*pure.parts)
+
+
+def _runtime_asset_declarations(
+    preflight: EnvironmentPreflight,
+) -> tuple[_RuntimeAssetDeclaration, ...]:
+    """preflight profile의 runtime asset 선언을 mutation 없는 검증 값으로 바꾼다."""
+    if not isinstance(preflight, EnvironmentPreflight):
+        _raise(_ASSETS_ACTION, "preflight must be an EnvironmentPreflight")
+    root = _canonical_absolute_posix_path(
+        preflight.root, "project root", _ASSETS_ACTION
+    )
+    _require_real_directory(root, _ASSETS_ACTION, "project root")
+    profile = getattr(preflight.selected_profile, "data", None)
+    if not isinstance(profile, Mapping):
+        _raise(_ASSETS_ACTION, "selected profile data must be a mapping")
+    values = profile.get("runtime_assets")
+    if not isinstance(values, list):
+        _raise(_ASSETS_ACTION, "runtime_assets must be an array")
+
+    declarations: list[_RuntimeAssetDeclaration] = []
+    seen_paths: set[Path] = set()
+    for index, payload in enumerate(values):
+        if not isinstance(payload, Mapping):
+            _raise(_ASSETS_ACTION, f"runtime_assets[{index}] must be an object")
+        role = payload.get("role")
+        if not isinstance(role, str) or not role:
+            _raise(_ASSETS_ACTION, f"runtime_assets[{index}].role must be nonempty")
+        expected_sha256 = payload.get("sha256")
+        if expected_sha256 is not None and (
+            not isinstance(expected_sha256, str)
+            or _SHA256.fullmatch(expected_sha256) is None
+        ):
+            _raise(
+                _ASSETS_ACTION,
+                f"runtime_assets[{index}].sha256 must be null or lowercase SHA-256",
+            )
+        relative = _repository_relative_asset_path(payload.get("path"), index)
+        if relative in seen_paths:
+            _raise(_ASSETS_ACTION, f"duplicate runtime asset path: {relative.as_posix()}")
+        seen_paths.add(relative)
+        absolute = _canonical_absolute_posix_path(
+            root.joinpath(*relative.parts),
+            f"runtime asset {role}",
+            _ASSETS_ACTION,
+        )
+        declarations.append(
+            _RuntimeAssetDeclaration(
+                role=role,
+                relative_path=relative,
+                absolute_path=absolute,
+                expected_sha256=expected_sha256,
+                payload=payload,
+            )
+        )
+    return tuple(declarations)
+
+
+def _require_interfuser_asset_contract(
+    preflight: EnvironmentPreflight,
+    declarations: tuple[_RuntimeAssetDeclaration, ...],
+) -> tuple[_RuntimeAssetDeclaration, _RuntimeAssetDeclaration]:
+    """InterFuser의 checkpoint-first 두 asset 계약을 exact 순서로 검증한다."""
+    model_id = getattr(preflight.selected_profile, "model_id", None)
+    if model_id != "interfuser":
+        _raise(_ASSETS_ACTION, "selected profile is not InterFuser")
+    expected = (
+        ("checkpoint", _INTERFUSER_CHECKPOINT_PATH),
+        ("image_backbone", _INTERFUSER_BACKBONE_PATH),
+    )
+    if (
+        len(declarations) != len(expected)
+        or tuple(
+            (declaration.role, declaration.relative_path)
+            for declaration in declarations
+        )
+        != expected
+        or any(declaration.expected_sha256 is None for declaration in declarations)
+    ):
+        _raise(
+            _ASSETS_ACTION,
+            "InterFuser requires exact checkpoint-first and image_backbone assets with SHA-256",
+        )
+    return declarations[0], declarations[1]
+
+
+def _asset_error_is_missing(error: EnvironmentSetupError) -> bool:
+    """secure open 오류 chain이 FileNotFoundError에서 시작됐는지 확인한다."""
+    cause: Optional[BaseException] = error
+    while cause is not None:
+        if isinstance(cause, FileNotFoundError):
+            return True
+        cause = cause.__cause__
+    return False
+
+
+def _same_open_file(
+    before: os.stat_result,
+    after: os.stat_result,
+) -> bool:
+    """stream 처리 중 열린 파일의 identity와 본문 metadata가 유지됐는지 확인한다."""
+    return (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+
+
+def _fingerprint_runtime_asset(
+    declaration: _RuntimeAssetDeclaration,
+    *,
+    missing_message: Optional[str] = None,
+) -> AssetFingerprint:
+    """용량 제한 없이 같은 no-follow regular fd에서 asset SHA와 metadata를 읽는다."""
+    context = f"runtime asset {declaration.role}"
+    try:
+        with _open_regular_file(
+            declaration.absolute_path, _ASSETS_ACTION, context
+        ) as (descriptor, before):
+            digest = hashlib.sha256()
+            try:
+                while True:
+                    block = os.read(descriptor, _READ_BLOCK_SIZE)
+                    if not block:
+                        break
+                    digest.update(block)
+                after = os.fstat(descriptor)
+            except (MemoryError, OSError) as exc:
+                raise EnvironmentSetupError(
+                    _ASSETS_ACTION,
+                    f"cannot hash {context}: {declaration.absolute_path}",
+                ) from exc
+            if not _same_open_file(before, after):
+                _raise(
+                    _ASSETS_ACTION,
+                    f"{context} changed while hashing: {declaration.absolute_path}",
+                )
+    except EnvironmentSetupError as exc:
+        if missing_message is not None and _asset_error_is_missing(exc):
+            raise EnvironmentSetupError(_ASSETS_ACTION, missing_message) from exc
+        raise
+
+    actual_sha256 = digest.hexdigest()
+    if (
+        declaration.expected_sha256 is not None
+        and actual_sha256 != declaration.expected_sha256
+    ):
+        _raise(
+            _ASSETS_ACTION,
+            f"{context} SHA-256 mismatch for {declaration.absolute_path}: "
+            f"expected {declaration.expected_sha256}, got {actual_sha256}",
+        )
+    return AssetFingerprint(
+        path=declaration.relative_path,
+        sha256=actual_sha256,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+    )
+
+
+def _checkpoint_missing_message(declaration: _RuntimeAssetDeclaration) -> str:
+    """InterFuser checkpoint의 수동 복구에 필요한 provenance 전체를 직렬화한다."""
+    provenance = declaration.payload.get("provenance")
+    values = provenance if isinstance(provenance, Mapping) else {}
+    return (
+        f"required InterFuser checkpoint is missing: {declaration.absolute_path}; "
+        f"expected SHA-256 {declaration.expected_sha256}; "
+        f"classification={values.get('classification', '<missing>')}; "
+        f"repository={values.get('repository', '<missing>')}; "
+        f"commit={values.get('commit', '<missing>')}; "
+        f"google_drive_id={values.get('google_drive_id', '<missing>')}"
+    )
+
+
+@contextmanager
+def _ensure_runtime_asset_parent(
+    root: Path,
+    relative_parent: Path,
+) -> Iterator[int]:
+    """project root fd 아래 parent를 component별 no-follow open/mkdir해 반환한다."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        _raise(_ASSETS_ACTION, "runtime asset preparation requires O_NOFOLLOW support")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | no_follow
+    )
+    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    with _open_absolute_nofollow(
+        root, root_flags, _ASSETS_ACTION, "project root"
+    ) as root_descriptor:
+        current = root_descriptor
+        owns_current = False
+        try:
+            for component in relative_parent.parts:
+                try:
+                    child = os.open(component, flags, dir_fd=current)
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(component, mode=0o755, dir_fd=current)
+                    except FileExistsError:
+                        pass
+                    except OSError as exc:
+                        raise EnvironmentSetupError(
+                            _ASSETS_ACTION,
+                            f"cannot create runtime asset directory component: {component}",
+                        ) from exc
+                    try:
+                        child = os.open(component, flags, dir_fd=current)
+                    except OSError as exc:
+                        raise EnvironmentSetupError(
+                            _ASSETS_ACTION,
+                            f"runtime asset parent is not a real directory: {component}",
+                        ) from exc
+                except OSError as exc:
+                    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        message = (
+                            "runtime asset parent contains a symlink or non-directory: "
+                            f"{component}"
+                        )
+                    else:
+                        message = f"cannot open runtime asset directory component: {component}"
+                    raise EnvironmentSetupError(_ASSETS_ACTION, message) from exc
+                if owns_current:
+                    os.close(current)
+                current = child
+                owns_current = True
+            yield current
+        finally:
+            if owns_current:
+                os.close(current)
+
+
+def _write_all(descriptor: int, block: bytes) -> None:
+    """한 source block을 short write 없이 destination fd에 모두 기록한다."""
+    offset = 0
+    while offset < len(block):
+        written = os.write(descriptor, block[offset:])
+        if written <= 0:
+            raise OSError("runtime asset copy made no progress")
+        offset += written
+
+
+def _copy_interfuser_user_cache(
+    preflight: EnvironmentPreflight,
+    declaration: _RuntimeAssetDeclaration,
+    user_cache: Path,
+) -> bool:
+    """user cache가 있으면 same-fd hash와 atomic sibling install로 project에 복사한다."""
+    source = _canonical_absolute_posix_path(
+        user_cache, "InterFuser user cache", _ASSETS_ACTION
+    )
+    context = "InterFuser user cache"
+    try:
+        source_file = _open_regular_file(source, _ASSETS_ACTION, context)
+        with source_file as (source_descriptor, source_before):
+            with _ensure_runtime_asset_parent(
+                preflight.root, declaration.relative_path.parent
+            ) as parent_descriptor:
+                temporary_name: Optional[str] = None
+                temporary_descriptor: Optional[int] = None
+                try:
+                    for _ in range(16):
+                        candidate = f".asset-{secrets.token_hex(12)}.tmp"
+                        try:
+                            temporary_descriptor = os.open(
+                                candidate,
+                                os.O_WRONLY
+                                | os.O_CREAT
+                                | os.O_EXCL
+                                | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0),
+                                0o644,
+                                dir_fd=parent_descriptor,
+                            )
+                        except FileExistsError:
+                            continue
+                        temporary_name = candidate
+                        break
+                    if temporary_descriptor is None or temporary_name is None:
+                        _raise(_ASSETS_ACTION, "cannot allocate runtime asset temporary file")
+
+                    digest = hashlib.sha256()
+                    try:
+                        while True:
+                            block = os.read(source_descriptor, _READ_BLOCK_SIZE)
+                            if not block:
+                                break
+                            _write_all(temporary_descriptor, block)
+                            digest.update(block)
+                        source_after = os.fstat(source_descriptor)
+                    except (MemoryError, OSError) as exc:
+                        raise EnvironmentSetupError(
+                            _ASSETS_ACTION,
+                            f"cannot copy {context}: {source}",
+                        ) from exc
+                    if not _same_open_file(source_before, source_after):
+                        _raise(_ASSETS_ACTION, f"{context} changed while copying: {source}")
+                    actual_sha256 = digest.hexdigest()
+                    if actual_sha256 != declaration.expected_sha256:
+                        _raise(
+                            _ASSETS_ACTION,
+                            f"{context} SHA-256 mismatch for {source}: expected "
+                            f"{declaration.expected_sha256}, got {actual_sha256}",
+                        )
+                    try:
+                        os.fsync(temporary_descriptor)
+                        os.close(temporary_descriptor)
+                        temporary_descriptor = None
+                        try:
+                            os.stat(
+                                declaration.absolute_path.name,
+                                dir_fd=parent_descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            _raise(
+                                _ASSETS_ACTION,
+                                "runtime asset destination appeared during copy; "
+                                "refusing to overwrite",
+                            )
+                        os.replace(
+                            temporary_name,
+                            declaration.absolute_path.name,
+                            src_dir_fd=parent_descriptor,
+                            dst_dir_fd=parent_descriptor,
+                        )
+                        temporary_name = None
+                        os.fsync(parent_descriptor)
+                    except EnvironmentSetupError:
+                        raise
+                    except OSError as exc:
+                        raise EnvironmentSetupError(
+                            _ASSETS_ACTION,
+                            f"cannot copy {context} into {declaration.absolute_path}",
+                        ) from exc
+                finally:
+                    if temporary_descriptor is not None:
+                        try:
+                            os.close(temporary_descriptor)
+                        except OSError:
+                            pass
+                    if temporary_name is not None:
+                        try:
+                            os.unlink(temporary_name, dir_fd=parent_descriptor)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            pass
+    except EnvironmentSetupError as exc:
+        missing_source_message = (
+            f"{_ASSETS_ACTION}: {context} is missing: {source}"
+        )
+        if _asset_error_is_missing(exc) and str(exc) == missing_source_message:
+            return False
+        raise
+    return True
+
+
+def prepare_local_runtime_assets(
+    preflight: EnvironmentPreflight,
+    *,
+    interfuser_user_cache: Path = _INTERFUSER_USER_CACHE,
+) -> None:
+    """필수 local checkpoint를 검증하고 exact InterFuser cache만 안전하게 준비한다."""
+    declarations = _runtime_asset_declarations(preflight)
+    if getattr(preflight.selected_profile, "model_id", None) != "interfuser":
+        return
+    checkpoint, backbone = _require_interfuser_asset_contract(
+        preflight, declarations
+    )
+    _fingerprint_runtime_asset(
+        checkpoint,
+        missing_message=_checkpoint_missing_message(checkpoint),
+    )
+    try:
+        _fingerprint_runtime_asset(backbone)
+    except EnvironmentSetupError as exc:
+        if not _asset_error_is_missing(exc):
+            raise
+    else:
+        return
+    _copy_interfuser_user_cache(preflight, backbone, interfuser_user_cache)
+
+
+def fingerprint_runtime_assets(
+    preflight: EnvironmentPreflight,
+) -> tuple[AssetFingerprint, ...]:
+    """선언 순서대로 모든 runtime asset의 deep SHA와 regular-fd metadata를 반환한다."""
+    declarations = _runtime_asset_declarations(preflight)
+    if getattr(preflight.selected_profile, "model_id", None) == "interfuser":
+        _require_interfuser_asset_contract(preflight, declarations)
+    return tuple(
+        _fingerprint_runtime_asset(declaration) for declaration in declarations
     )
 
 
