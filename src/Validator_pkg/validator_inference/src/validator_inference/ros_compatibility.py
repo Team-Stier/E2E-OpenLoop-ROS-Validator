@@ -1299,8 +1299,9 @@ def _is_attested_torch_generated_module(
             or directory_metadata.st_uid != os.geteuid()
             or path_metadata.st_uid != os.geteuid()
             or stat.S_IMODE(directory_metadata.st_mode) != 0o700
-            or path_mode & ~0o644
+            or path_mode & ~0o666
             or path_mode & 0o600 != 0o600
+            or path_mode & 0o002
             or path_metadata.st_nlink != 1
         ):
             return False

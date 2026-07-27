@@ -227,6 +227,38 @@ def test_loaded_module_origins_accepts_torch_file_from_standard_umask(
     assert "_remote_module_non_scriptable" not in origins
 
 
+def test_loaded_module_origins_accepts_torch_file_from_collaborative_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """owner-only Torch tempdir 안의 umask 002 source mode도 허용한다."""
+    _, _, origin = _install_fake_torch_generated_module(tmp_path, monkeypatch)
+    origin.chmod(0o664)
+
+    origins = _loaded_module_origins()
+
+    assert "_remote_module_non_scriptable" not in origins
+
+
+@pytest.mark.parametrize(
+    ("directory_mode", "source_mode"),
+    ((0o770, 0o664), (0o700, 0o674), (0o700, 0o2664)),
+)
+def test_loaded_module_origins_rejects_unsafe_collaborative_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    directory_mode: int,
+    source_mode: int,
+):
+    """group-write는 owner-only 부모와 비실행 일반 source일 때만 허용한다."""
+    _, _, origin = _install_fake_torch_generated_module(tmp_path, monkeypatch)
+    origin.parent.chmod(directory_mode)
+    origin.chmod(source_mode)
+
+    origins = _loaded_module_origins()
+
+    assert origins["_remote_module_non_scriptable"] == str(origin)
+
+
 def test_loaded_module_origins_does_not_execute_dynamic_file_lookup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
