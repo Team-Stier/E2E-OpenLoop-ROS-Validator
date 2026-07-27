@@ -2,7 +2,7 @@
 
 ## 기본 실행
 
-저장소 root에서 다음 순서로 실행한다. 첫 명령은 InterFuser 전용 환경을 준비하고, 두 번째 명령은 validator와 RViz를 시작한다. 세 번째 명령은 별도 terminal에서 기본 bag과 `/clock`을 재생한다.
+저장소 root에서 다음 순서로 실행한다. 아래는 InterFuser 예시이며, `interfuser` 대신 `tfv6`, `diffusiondrive_v2`, `sparsedrive_v2`를 넣어도 같은 절차로 실행된다. 첫 명령은 선택 모델 전용 환경을 준비하고, 두 번째 명령은 validator와 RViz를 시작한다. 세 번째 명령은 별도 terminal에서 기본 bag과 `/clock`을 재생한다.
 
 ```bash
 ./openloop setup interfuser
@@ -10,11 +10,11 @@
 ./openloop bag
 ```
 
-RViz가 필요 없으면 `./openloop interfuser`를 사용한다. 다른 bag은 `./openloop bag --path /absolute/path/to/input.bag`으로 지정한다.
+RViz가 필요 없으면 `./openloop interfuser`처럼 모델 이름만 사용한다. 다른 bag은 `./openloop bag --path /absolute/path/to/input.bag`으로 지정한다.
 
 ## 환경 관리
 
-지원 host는 Ubuntu 20.04 x86_64와 ROS Noetic이며, PATH에서 정확히 `uv 0.11.14`를 찾을 수 있어야 한다. 모델별 required CUDA/toolchain 조건은 setup preflight가 실제 파일과 version으로 검사한다.
+지원 host는 Ubuntu 20.04 x86_64와 ROS Noetic이며, PATH에서 정확히 `uv 0.11.14`를 찾을 수 있어야 한다. SparseDrive V2의 CUDA extension에 필요한 최소 CUDA 11.8 compiler는 setup이 프로젝트 `.toolchains/cuda-11.8`에 exact SHA-256 패키지로 준비한다. 시스템 CUDA 설치나 별도 `CUDA_HOME` 설정은 필요 없다.
 
 활성 환경의 source, runtime asset, ROS overlay, Python package lock을 다시 검사하려면 다음 명령을 실행한다.
 
@@ -31,15 +31,15 @@ RViz가 필요 없으면 `./openloop interfuser`를 사용한다. 다른 bag은 
 환경이 없거나 빠른 fingerprint가 달라진 경우 `run`은 ROS를 시작하지 않고 다음 복구 명령을 출력한다.
 
 ```text
-interfuser environment is missing or stale.
-Run: ./openloop setup interfuser
+MODEL environment is missing or stale.
+Run: ./openloop setup MODEL
 ```
 
-setup 오류는 실패한 phase와 prerequisite를 함께 표시한다. 새 환경을 강제로 만들 때는 `./openloop setup interfuser --recreate`를 사용한다.
+setup 오류는 실패한 phase와 prerequisite를 함께 표시한다. 새 환경을 강제로 만들 때는 `./openloop setup MODEL --recreate`를 사용한다.
 
 ## 모델 준비 범위
 
-`interfuser`, `tfv6`, `diffusiondrive_v2`, `sparsedrive_v2` 네 모델의 Python version, hash lock, CUDA 정책, source commit과 setup/preflight 계약이 정의되어 있다. 현재 실제 설치와 rosbag acceptance 범위는 InterFuser다. TFv6와 SparseDrive V2의 required CUDA/toolchain 또는 SparseDrive V2의 세 카메라 calibration이 없으면 setup은 download나 compile 전에 중단한다.
+`interfuser`, `tfv6`, `diffusiondrive_v2`, `sparsedrive_v2` 네 모델의 Python version, hash lock, CUDA 정책, source commit과 setup/preflight 계약이 정의되어 있다. 네 모델 모두 setup에서 source/assets/dependency와 실제 model load를 검증한다. TFv6는 CUDA GPU를 요구하며, SparseDrive V2는 shipped camera calibration을 검증하고 프로젝트 로컬 CUDA 11.8 compiler로 extension을 빌드한다.
 
 InterFuser checkpoint는 Drivora commit `25d56d2300f422d502c6549695b9e49efd5e5e00`이 가리키는 Google Drive object를 검증한 `third-party compatibility artifact`다. 기대 SHA256은 `39548dcfa56cdc06b8ccc52d7f6187a7d70ef36b05b7027db4d64a57ac3e30b2`이며, 파일이 없으면 setup이 기대 경로와 provenance를 출력한다.
 

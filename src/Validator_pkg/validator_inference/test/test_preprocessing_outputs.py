@@ -32,6 +32,11 @@ def image_adaptor():
 
 
 @pytest.fixture(scope="module")
+def camera_stitcher():
+    return _load_pipeline_script("camera_bev_stitcher.py")
+
+
+@pytest.fixture(scope="module")
 def lidar_processor():
     return _load_pipeline_script("lidar_bev_processor.py")
 
@@ -102,6 +107,64 @@ def test_all_camera_profiles_emit_model_transport_contracts(
     assert all(value.shape == (256, 512, 3) for value in sparse.values())
     assert all(value.dtype == np.float32 for value in sparse.values())
     assert all(np.isfinite(value).all() for value in sparse.values())
+
+
+def test_morai_camera_rotations_match_recorded_optical_frame_transforms(
+    image_adaptor,
+    camera_stitcher,
+):
+    config_path = (
+        PACKAGE_ROOT.parent
+        / "validator_pipeline"
+        / "config"
+        / "0716demo.json"
+    )
+    sparse_calibration = image_adaptor.load_sparsedrive_calibration(config_path)
+    bev_calibrations = camera_stitcher.load_camera_calibrations(config_path)
+    expected_camera_to_lidar = {
+        "front": np.asarray(
+            [
+                [0.0, -0.03489949670250097, 0.9993908270190958],
+                [-1.0, 0.0, 0.0],
+                [0.0, -0.9993908270190958, -0.03489949670250097],
+            ]
+        ),
+        "left": np.asarray(
+            [
+                [0.9254165783983233, -0.17364817766693033, 0.33682408883346526],
+                [-0.3420201433256688, 0.0, 0.9396926207859083],
+                [-0.1631759111665348, -0.984807753012208, -0.05939117461388472],
+            ]
+        ),
+        "right": np.asarray(
+            [
+                [-0.9254165783983233, -0.17364817766693033, 0.33682408883346543],
+                [-0.342020143325669, 0.0, -0.9396926207859083],
+                [0.1631759111665348, -0.984807753012208, -0.05939117461388475],
+            ]
+        ),
+    }
+
+    for camera_name, expected in expected_camera_to_lidar.items():
+        vehicle_to_optical = (
+            image_adaptor.camera_vehicle_to_optical_rotation(
+                sparse_calibration["cameras"][camera_name]
+            )
+        )
+        np.testing.assert_allclose(
+            vehicle_to_optical,
+            expected.T,
+            atol=1.0e-12,
+        )
+
+        right, down, forward = camera_stitcher.camera_axes(
+            bev_calibrations[camera_name]
+        )
+        np.testing.assert_allclose(
+            np.stack([right, down, forward], axis=1),
+            expected,
+            atol=1.0e-7,
+        )
 
 
 def test_lidar_profiles_emit_expected_hwc_transport_shapes(lidar_processor):

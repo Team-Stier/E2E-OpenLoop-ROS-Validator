@@ -259,7 +259,7 @@ PDM import, PDM process pool, metric-cache, evaluator, reward_dict return은 inf
 
 ### 6.3 SparseDrive V2 calibration은 profile 내부 값이다
 
-별도 calibration file은 없다. profile.json의 sparsedrive_v2.static_runtime_inputs.camera_calibration 안에서 user가 아래 값을 세 camera 모두 채운다.
+별도 calibration file은 없다. profile.json의 sparsedrive_v2.static_runtime_inputs.camera_calibration 안에 아래 값이 세 camera 모두 포함된다. intrinsic은 저장된 MORAI sensor JSON의 image size/FOV/principal point에서 계산했고, extrinsic 회전은 bag `/tf`로 순서를 확정한 뒤 동시각 LiDAR/image 투영으로 검증했다.
 
 ~~~text
 K_original_3x3
@@ -369,9 +369,9 @@ DiagnosticArray는 fixed CSV schema가 아니므로 쓰지 않는다. InferenceM
 | TFv6 | official `noradar_resnet34` two-weight ensemble + 10-sweep | 없음 | config/weights, 10 sweep warm-up, paired TF pose |
 | InterFuser | official single-frame forward | 없음 | checkpoint |
 | DiffusionDrive V2 | official anchor + PDM-free source inference path | 없음 | checkpoint, anchor, backbone |
-| SparseDrive V2 | official calibration-conditioned forward | inline camera calibration | checkpoint assets와 세 camera calibration 완성 |
+| SparseDrive V2 | official calibration-conditioned forward | 없음 | checkpoint assets, CUDA extension, shipped calibration 검증 |
 
-따라서 이 설계를 구현·smoke test한 뒤 사용자가 직접 넣는 runtime 정보는 SparseDrive V2 profile 내부 calibration 값뿐이다. checkpoint, backbone, vocabulary, official anchor, PDM 제거, TFv6 official no-radar 경로, route fallback, shape/coordinate/timing 계약은 구현 책임이다.
+따라서 shipped profile을 사용할 때 사용자가 직접 넣는 추가 runtime 정보는 없다. checkpoint, backbone, vocabulary, official anchor, PDM 제거, TFv6 official no-radar 경로, SparseDrive calibration, route fallback, shape/coordinate/timing 계약은 구현 책임이다.
 
 이 문서의 범위는 rosbag open-loop evaluator다. /waypoints만 발행하며 controller나 safety supervisor를 포함하지 않으므로 실차 주행 배포 설계는 아니다.
 
@@ -399,4 +399,4 @@ DiagnosticArray는 fixed CSV schema가 아니므로 쓰지 않는다. InferenceM
 
 `openloop_inference.launch`만 분리 실행하거나 raw `roslaunch`/`rosbag` 인자를 직접 제어해야 할 때는 [Open-loop 운영 절차](openloop_validator.md#고급-직접-launch)의 고급 절차를 따른다. 직접 launch는 모델 환경을 생성하거나 검증하지 않는다.
 
-통합 launch는 `/use_sim_time=true`를 설정하며 기본 CSV 위치는 프로젝트의 `records/openloop/`다. 별도의 timing topic은 없으며 `/inference_metric`의 각 메시지가 정확히 한 CSV row가 된다. SparseDrive V2의 shipped null calibration은 model/worker 생성 전에 거부된다.
+통합 launch는 `/use_sim_time=true`를 설정하며 기본 CSV 위치는 프로젝트의 `records/openloop/`다. 별도의 timing topic은 없으며 `/inference_metric`의 각 메시지가 정확히 한 CSV row가 된다. SparseDrive V2의 calibration은 model/worker 생성 전에 검증되며, 불완전한 custom profile은 거부된다.

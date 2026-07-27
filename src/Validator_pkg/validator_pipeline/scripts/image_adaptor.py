@@ -234,39 +234,49 @@ def camera_vehicle_to_optical_rotation(calibration):
     """Return MORAI vehicle-to-camera-optical rotation.
 
     MORAI vehicle coordinates are x-forward, y-left, z-up. Camera optical
-    coordinates are x-right, y-down, z-forward.
+    coordinates are x-right, y-down, z-forward. The pitch-then-yaw order is
+    fixed by the recorded MORAI camera-frame transforms for this sensor rig.
     """
     roll = math.radians(calibration["roll"])
     pitch = math.radians(calibration["pitch"])
     yaw = math.radians(calibration["yaw"])
 
-    forward = np.array(
+    rotation_y = np.array(
         [
-            math.cos(pitch) * math.cos(yaw),
-            math.cos(pitch) * math.sin(yaw),
-            -math.sin(pitch),
+            [math.cos(pitch), 0.0, math.sin(pitch)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(pitch), 0.0, math.cos(pitch)],
         ],
         dtype=np.float64,
     )
-    right = np.array(
-        [math.sin(yaw), -math.cos(yaw), 0.0],
+    rotation_z = np.array(
+        [
+            [math.cos(yaw), -math.sin(yaw), 0.0],
+            [math.sin(yaw), math.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
         dtype=np.float64,
     )
-    down = np.cross(forward, right)
-
-    if roll != 0.0:
-        original_right = right.copy()
-        original_down = down.copy()
-        right = (
-            math.cos(roll) * original_right
-            + math.sin(roll) * original_down
-        )
-        down = (
-            -math.sin(roll) * original_right
-            + math.cos(roll) * original_down
-        )
-
-    return np.stack([right, down, forward], axis=0)
+    optical_to_vehicle = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    optical_roll = np.array(
+        [
+            [math.cos(roll), -math.sin(roll), 0.0],
+            [math.sin(roll), math.cos(roll), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    camera_to_vehicle = (
+        rotation_y @ rotation_z @ optical_to_vehicle @ optical_roll
+    )
+    return camera_to_vehicle.T
 
 
 def load_sparsedrive_calibration(config_path):

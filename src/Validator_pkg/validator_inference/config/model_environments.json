@@ -57,9 +57,9 @@
     "diffusiondrive_v2": {
       "python_version": "3.9.25",
       "requirements_input": "requirements/diffusiondrive_v2.in",
-      "requirements_input_sha256": "27a062c6528dd9d0ae38188de8a4ecbd8359c5c3cc53a97e3353c0aeb9510e40",
+      "requirements_input_sha256": "01c5c41c45230f89e4ff3ead009d3a61a91a5d4e2e5c81237fe272807d42fd70",
       "requirements_lock": "requirements/diffusiondrive_v2.lock",
-      "requirements_lock_sha256": "8146bc9b35d7a0709798951de99f433f376491dddf6006fea0a4f94bedefaa13",
+      "requirements_lock_sha256": "4ccff6e77c1ceeb61e6f8f1164020749cd3b32b8a8848299848aed7f14133c74",
       "indexes": [
         "https://download.pytorch.org/whl/cu118",
         "https://pypi.org/simple"

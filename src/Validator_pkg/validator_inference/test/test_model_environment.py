@@ -1593,9 +1593,11 @@ def test_requirement_inputs_pin_model_specific_runtime_contracts(
         "torchmetrics==0.11.*",
     } <= inputs["tfv6"]
     assert "protobuf==4.25.3" in inputs["diffusiondrive_v2"]
-    assert any(line.startswith("diffusers==") for line in inputs["diffusiondrive_v2"])
+    assert "torch==2.0.1+cu118" in inputs["diffusiondrive_v2"]
+    assert "diffusers==0.35.2" in inputs["diffusiondrive_v2"]
     assert any(line.startswith("einops==") for line in inputs["diffusiondrive_v2"])
     assert "protobuf==3.20.*" in inputs["sparsedrive_v2"]
+    assert not any(line.startswith("diffusers==") for line in inputs["sparsedrive_v2"])
 
 
 def test_interfuser_input_documents_pinned_upstream_and_runtime_scope(

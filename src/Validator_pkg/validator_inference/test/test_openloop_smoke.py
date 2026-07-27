@@ -1,6 +1,7 @@
 """오픈루프 추론 launch와 경량 종단간 계약을 검사한다."""
 
 import csv
+import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import time
@@ -178,13 +179,22 @@ def test_fake_model_smoke_writes_completed_csv_and_lidar_path(tmp_path):
         assert all(pose.header.frame_id == "Lidar3D-4" for pose in path.poses)
 
 
-def test_shipped_sparse_null_calibration_fails_before_worker_construction(monkeypatch):
+def test_sparse_null_calibration_fails_before_worker_construction(
+    monkeypatch, tmp_path
+):
     node = _load_script("inference_engine_node.py")
     worker_calls = []
+    payload = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    sparse = next(item for item in payload["profiles"] if item["id"] == "sparsedrive_v2")
+    sparse["static_runtime_inputs"]["camera_calibration"]["cameras"][0][
+        "K_original_3x3"
+    ] = None
+    incomplete_profile = tmp_path / "profile.json"
+    incomplete_profile.write_text(json.dumps(payload), encoding="utf-8")
     parameters = {
         "/use_sim_time": True,
         "~model_id": "sparsedrive_v2",
-        "~profile_file": str(PROFILE_FILE),
+        "~profile_file": str(incomplete_profile),
         "~run_id": "sparse-smoke",
     }
 
@@ -192,6 +202,11 @@ def test_shipped_sparse_null_calibration_fails_before_worker_construction(monkey
         node.rospy,
         "get_param",
         lambda name, default=None: parameters.get(name, default),
+    )
+    monkeypatch.setattr(
+        node,
+        "_default_profile_file",
+        lambda: str(PROFILE_FILE),
     )
     monkeypatch.setattr(node, "InferenceWorker", lambda *args: worker_calls.append(args))
 

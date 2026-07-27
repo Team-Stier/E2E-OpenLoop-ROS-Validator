@@ -311,9 +311,12 @@ def _checkpoint_url(profile: Dict[str, Any], asset: Dict[str, Any]) -> Optional[
 
 
 def _download_atomic(
-    url: str, destination: Path, downloader: Callable[[str, str | Path], Any]
+    url: str,
+    destination: Path,
+    downloader: Callable[[str, str | Path], Any],
+    expected_sha256: Optional[str],
 ) -> None:
-    """asset을 임시 파일로 내려받아 검증 전 불완전 파일 노출을 막는다.
+    """asset을 임시 파일로 내려받아 hash 검증 후에만 게시한다.
 
     입력: URL, 최종 destination, 주입 가능한 downloader.
     부작용: 성공 시 destination을 atomic replace하고 실패 임시 파일을 제거한다.
@@ -326,12 +329,38 @@ def _download_atomic(
     handle.close()
     try:
         downloader(url, temporary)
-        if not temporary.is_file():
+        try:
+            metadata = temporary.lstat()
+        except OSError as error:
+            raise AssetError(
+                f"download did not create temporary asset for {destination}"
+            ) from error
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise AssetError(f"download did not create temporary asset for {destination}")
+        if expected_sha256 is not None:
+            if (
+                not isinstance(expected_sha256, str)
+                or len(expected_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_sha256
+                )
+            ):
+                raise AssetError(
+                    f"invalid declared SHA-256 for downloaded asset {destination}"
+                )
+            observed_sha256 = sha256_file(temporary)
+            if observed_sha256 != expected_sha256:
+                raise AssetError(
+                    f"downloaded asset SHA-256 mismatch for {destination}: "
+                    f"expected {expected_sha256}, observed {observed_sha256}"
+                )
         os.replace(str(temporary), str(destination))
     finally:
-        if temporary.exists():
+        try:
             temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _publish_generated_bytes(destination: Path, payload: bytes) -> None:
@@ -842,8 +871,29 @@ def fetch_runtime_assets(
 
     for asset in profile.get("runtime_assets", []):
         destination = _resolve(asset["path"], root)
-        if destination.is_file():
-            continue
+        expected_sha256 = asset.get("sha256")
+        try:
+            destination_metadata = destination.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise AssetError(
+                f"cannot inspect runtime asset destination {destination}"
+            ) from error
+        else:
+            if (
+                not stat.S_ISREG(destination_metadata.st_mode)
+                or destination_metadata.st_nlink != 1
+            ):
+                raise AssetError(
+                    f"runtime asset destination is not a regular single-link file: "
+                    f"{destination}"
+                )
+            if (
+                expected_sha256 is None
+                or sha256_file(destination) == expected_sha256
+            ):
+                continue
         repository_path = asset.get("source_repository_path")
         if repository_path:
             source = (checkout / repository_path).resolve()
@@ -853,8 +903,21 @@ def fetch_runtime_assets(
                 )
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = destination.with_name(f".{destination.name}.part")
-            shutil.copyfile(source, temporary)
-            os.replace(str(temporary), str(destination))
+            try:
+                shutil.copyfile(source, temporary)
+                if (
+                    expected_sha256 is not None
+                    and sha256_file(temporary) != expected_sha256
+                ):
+                    raise AssetError(
+                        f"source asset SHA-256 mismatch for {destination}"
+                    )
+                os.replace(str(temporary), str(destination))
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
             continue
         url = _checkpoint_url(profile, asset)
         if not url:
@@ -862,7 +925,12 @@ def fetch_runtime_assets(
                 f"model {model_id} asset {asset['path']} has no source_url, "
                 "checkpoint source_path, or source_repository_path"
             )
-        _download_atomic(url, destination, downloader)
+        _download_atomic(
+            url,
+            destination,
+            downloader,
+            expected_sha256,
+        )
 
     metadata = verify_runtime_assets(profile, project_root=root)
     return write_asset_manifest(profile, metadata, project_root=root)

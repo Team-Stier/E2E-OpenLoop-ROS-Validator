@@ -144,7 +144,13 @@
       "runtime_assets": [
         {"role": "checkpoint_config", "path": "models/tfv6/noradar_resnet34/config.json", "source_path": "noradar_resnet34/config.json", "sha256": null},
         {"role": "ensemble_weight", "path": "models/tfv6/noradar_resnet34/model_0030_1.pth", "source_path": "noradar_resnet34/model_0030_1.pth", "sha256": null},
-        {"role": "ensemble_weight", "path": "models/tfv6/noradar_resnet34/model_0030_2.pth", "source_path": "noradar_resnet34/model_0030_2.pth", "sha256": null}
+        {"role": "ensemble_weight", "path": "models/tfv6/noradar_resnet34/model_0030_2.pth", "source_path": "noradar_resnet34/model_0030_2.pth", "sha256": null},
+        {"role": "carla_agents_package", "path": "models/sources/lead/3rd_party/CARLA_0915/PythonAPI/carla/agents/__init__.py", "source_url": "https://raw.githubusercontent.com/carla-simulator/carla/d7b45c1e159e6d13296f7a3a4e8b13e6c2d62c18/PythonAPI/carla/agents/__init__.py", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"role": "carla_agents_navigation_package", "path": "models/sources/lead/3rd_party/CARLA_0915/PythonAPI/carla/agents/navigation/__init__.py", "source_url": "https://raw.githubusercontent.com/carla-simulator/carla/d7b45c1e159e6d13296f7a3a4e8b13e6c2d62c18/PythonAPI/carla/agents/navigation/__init__.py", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"role": "carla_agents_local_planner", "path": "models/sources/lead/3rd_party/CARLA_0915/PythonAPI/carla/agents/navigation/local_planner.py", "source_url": "https://raw.githubusercontent.com/carla-simulator/carla/d7b45c1e159e6d13296f7a3a4e8b13e6c2d62c18/PythonAPI/carla/agents/navigation/local_planner.py", "sha256": "7a5db9112b0d107038765abfb87b2d7a418b98e4d2c0aa92a4aade53c95b319f"},
+        {"role": "carla_agents_controller", "path": "models/sources/lead/3rd_party/CARLA_0915/PythonAPI/carla/agents/navigation/controller.py", "source_url": "https://raw.githubusercontent.com/carla-simulator/carla/d7b45c1e159e6d13296f7a3a4e8b13e6c2d62c18/PythonAPI/carla/agents/navigation/controller.py", "sha256": "f95f427a5ad5ba50a96f6971df72a5f3ec078c8457b0ba2a12558396e8b5c402"},
+        {"role": "carla_agents_tools_package", "path": "models/sources/lead/3rd_party/CARLA_0915/PythonAPI/carla/agents/tools/__init__.py", "source_url": "https://raw.githubusercontent.com/carla-simulator/carla/d7b45c1e159e6d13296f7a3a4e8b13e6c2d62c18/PythonAPI/carla/agents/tools/__init__.py", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"role": "carla_agents_misc", "path": "models/sources/lead/3rd_party/CARLA_0915/PythonAPI/carla/agents/tools/misc.py", "source_url": "https://raw.githubusercontent.com/carla-simulator/carla/d7b45c1e159e6d13296f7a3a4e8b13e6c2d62c18/PythonAPI/carla/agents/tools/misc.py", "sha256": "7e453c513c742a1ff3c8f3604fe55adafac2c682753093262e7f402e9ec1b72b"}
       ],
       "buffer_requirements": {
         "latest_inputs": ["camera_main", "driving_feature", "route_target_point", "route_target_point_previous", "route_target_point_next"],
@@ -222,7 +228,42 @@
         {"role": "velocity_vocabulary", "path": "models/sparsedrive_v2/navsim_v2/velocity_256.npy", "source_path": "velocity_256.npy", "sha256": "acfaa8699401a20283c2744f7ea4beb4f8c734f3a3f145ca0366a3ba6abae2ee"},
         {"role": "trajectory_vocabulary", "path": "models/sparsedrive_v2/navsim_v2/trajectory_1024_256.npz", "source_path": "trajectory_1024_256.npz", "sha256": "94868f922fcd7ac3a027057476ddf630948c908053fec483d8936e84b2ad8683"}
       ],
-      "static_runtime_inputs": {"camera_calibration": {"source": "profile_inline", "lidar_frame_id": "Lidar3D-4", "projection_contract": "For each camera fill K_original_3x3, distortion_model, distortion_coefficients, and T_lidar_from_camera_4x4. At runtime compute T_camera_from_lidar = inverse(T_lidar_from_camera), then lidar2img = A_resize_crop * K_original * T_camera_from_lidar[:3,:]. The pinned SparseDrive source records distortion metadata but does not undistort images or consume those coefficients in its selected inference path.", "cameras": [{"name": "front", "frame_id": "Camera-1", "image_size_px": [1280, 720], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "left", "frame_id": "Camera-2", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}, {"name": "right", "frame_id": "Camera-3", "image_size_px": [640, 480], "K_original_3x3": null, "distortion_model": null, "distortion_coefficients": null, "T_lidar_from_camera_4x4": null}]}},
+      "static_runtime_inputs": {
+        "camera_calibration": {
+          "source": "profile_inline",
+          "lidar_frame_id": "Lidar3D-4",
+          "projection_contract": "K_original_3x3 is derived from the MORAI image size, horizontal cameraFOV, and principalPoint. T_lidar_from_camera_4x4 maps camera optical coordinates (x-right, y-down, z-forward) into Lidar3D-4 coordinates. At runtime compute T_camera_from_lidar = inverse(T_lidar_from_camera), then lidar2img = A_resize_crop * K_original * T_camera_from_lidar[:3,:]. The pinned SparseDrive source records distortion metadata but does not undistort images or consume those coefficients in its selected inference path.",
+          "cameras": [
+            {
+              "name": "front",
+              "frame_id": "Camera-1",
+              "image_size_px": [1280, 720],
+              "K_original_3x3": [640.0, 0.0, 640.0, 0.0, 640.0, 360.0, 0.0, 0.0, 1.0],
+              "distortion_model": "plumb_bob",
+              "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+              "T_lidar_from_camera_4x4": [0.0, -0.03489949670250096, 0.9993908270190957, -0.1, -1.0, 0.0, 0.0, 0.0, 0.0, -0.9993908270190957, -0.03489949670250096, -0.3, 0.0, 0.0, 0.0, 1.0]
+            },
+            {
+              "name": "left",
+              "frame_id": "Camera-2",
+              "image_size_px": [640, 480],
+              "K_original_3x3": [149.21845060959956, 0.0, 320.0, 0.0, 149.21845060959956, 240.0, 0.0, 0.0, 1.0],
+              "distortion_model": "plumb_bob",
+              "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+              "T_lidar_from_camera_4x4": [0.9254165783983233, -0.17364817766693033, 0.33682408883346526, -0.85, -0.3420201433256688, 0.0, 0.9396926207859083, 0.65, -0.1631759111665348, -0.984807753012208, -0.05939117461388472, -0.3, 0.0, 0.0, 0.0, 1.0]
+            },
+            {
+              "name": "right",
+              "frame_id": "Camera-3",
+              "image_size_px": [640, 480],
+              "K_original_3x3": [149.21845060959956, 0.0, 320.0, 0.0, 149.21845060959956, 240.0, 0.0, 0.0, 1.0],
+              "distortion_model": "plumb_bob",
+              "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+              "T_lidar_from_camera_4x4": [-0.9254165783983233, -0.17364817766693033, 0.33682408883346543, -0.85, -0.342020143325669, 0.0, -0.9396926207859083, -0.65, 0.1631759111665348, -0.984807753012208, -0.05939117461388475, -0.3, 0.0, 0.0, 0.0, 1.0]
+            }
+          ]
+        }
+      },
       "buffer_requirements": {"latest_inputs": ["camera_left", "camera_main", "camera_right", "driving_feature"], "history_inputs": []},
       "required_inputs": [
         {"key": "camera_left", "topic": "/image/sparsedrive_v2/left", "ros_type": "sensor_msgs/Image", "preprocess_contract": "cam_l0 RGB, resize 1920x1080-equivalent to 512x288, center crop (0,32,512,288), final 256x512, mean=[123.675,116.28,103.53], std=[58.395,57.12,57.375]."},
@@ -231,8 +272,8 @@
         {"key": "driving_feature", "topic": "/driving_feature", "ros_type": "validator_msgs/DrivingFeature", "preprocess_contract": "status_feature = driving_command[4] + ego_velocity[2] + ego_acceleration[2], plus camera_calibrations. OptFeeder loads calibration at startup; selected-model preprocessing applies the same resize/crop matrix to lidar2img before forward."}
       ],
       "output": {"coordinate_frame": "NAVSIM ego-relative SE2", "ros_frame_id": "Lidar3D-4", "coordinate_conversion": "x_ros=x_navsim, y_ros=y_navsim before static base-to-lidar transform", "waypoint_count": 8, "time_horizon_s": 4.0, "interval_s": 0.5},
-      "readiness": {"state": "blocked_until_inline_camera_calibration_is_complete", "blocking_inputs": ["static_runtime_inputs.camera_calibration"], "never_skip_for_stale": true},
-      "integration_gaps": ["The only user-supplied runtime data is the complete inline calibration object. The bag does not contain CameraInfo/intrinsic/distortion, so this object cannot be fabricated faithfully."]
+      "readiness": {"state": "ready_after_runtime_assets", "never_skip_for_stale": true},
+      "integration_gaps": ["Inline calibration uses MORAI 0716demo.json cameraFOV-based pinhole intrinsics and sensor positions, with camera-to-LiDAR rotations disambiguated by the bag's recorded /tf transforms and validated against synchronized LiDAR/image projection. The JSON focalLengthpixel values disagree with cameraFOV and are intentionally not used; zero lensDistortion is normalized to plumb_bob [0,0,0,0,0]."]
     }
   ]
 }

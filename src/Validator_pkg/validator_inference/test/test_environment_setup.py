@@ -1603,6 +1603,15 @@ def _complete_sparse_calibration(profile_path: Path) -> None:
     profile_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _clear_sparse_calibration(profile_path: Path) -> None:
+    """완성된 repository profile에서도 incomplete-calibration 실패 fixture를 만든다."""
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    sparse = next(item for item in payload["profiles"] if item["id"] == "sparsedrive_v2")
+    cameras = sparse["static_runtime_inputs"]["camera_calibration"]["cameras"]
+    cameras[0]["K_original_3x3"] = []
+    profile_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _preflight_project(tmp_path: Path, *, complete_sparse: bool = True) -> Path:
     """권위 manifest, lock, input과 profile을 가진 최소 project tree를 만든다."""
     root = tmp_path / "project"
@@ -1639,6 +1648,8 @@ def _preflight_project(tmp_path: Path, *, complete_sparse: bool = True) -> Path:
     )
     if complete_sparse:
         _complete_sparse_calibration(profile_path)
+    else:
+        _clear_sparse_calibration(profile_path)
     return root
 
 
@@ -1699,6 +1710,517 @@ def _assert_probe_call_contract(runner: _RecordingPreflightRunner) -> None:
             "text": True,
             "timeout": 10.0,
         }
+
+
+def _write_fake_cuda_toolchain(cuda_root: Path) -> None:
+    """로컬 CUDA 선택/installer 테스트에 필요한 최소 relocation tree를 만든다."""
+    _write_executable(cuda_root / "bin" / "nvcc")
+    include = cuda_root / "targets" / "x86_64-linux" / "include"
+    library = cuda_root / "targets" / "x86_64-linux" / "lib"
+    include.mkdir(parents=True)
+    library.mkdir(parents=True)
+    (include / "cuda_runtime.h").write_text("/* fake cuda runtime */\n", encoding="utf-8")
+    (library / "libcudart.so.11.8.89").write_bytes(b"fake cudart")
+    (cuda_root / "include").symlink_to(Path("targets/x86_64-linux/include"))
+    (cuda_root / "lib64").symlink_to(Path("targets/x86_64-linux/lib"))
+    (library / "libcudart.so").symlink_to("libcudart.so.11.8.89")
+
+
+def _write_complete_fake_cuda_toolchain(cuda_root: Path) -> None:
+    """production Sparse closure가 요구하는 vendor header까지 포함한다."""
+    _write_fake_cuda_toolchain(cuda_root)
+    include = cuda_root / "targets" / "x86_64-linux" / "include"
+    for header in ("cusparse.h", "cublas_v2.h", "cusolverDn.h"):
+        (include / header).write_text(
+            f"/* fake {header} */\n", encoding="utf-8"
+        )
+
+
+def _fake_cuda_tree_sha256(tmp_path: Path, *, complete: bool = False) -> str:
+    """결정적인 fake relocation tree의 신뢰 anchor를 만든다."""
+    cuda_root = tmp_path / "expected-cuda-tree"
+    writer = (
+        _write_complete_fake_cuda_toolchain
+        if complete
+        else _write_fake_cuda_toolchain
+    )
+    writer(cuda_root)
+    observed = environment_setup._cuda_toolchain_tree_sha256(cuda_root)
+    shutil.rmtree(cuda_root)
+    return observed
+
+
+def test_sparse_preflight_uses_project_local_cuda_without_cuda_home(tmp_path: Path):
+    """기본 Sparse 경로는 별도 CUDA_HOME 없이 project-local Toolkit을 선택한다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, environment = _preflight_host(tmp_path)
+    local_cuda = root / ".toolchains" / "cuda-11.8"
+    _write_complete_fake_cuda_toolchain(local_cuda)
+    (local_cuda / ".openloop-toolchain.json").write_bytes(
+        environment_setup._cuda_toolchain_manifest_bytes(
+            environment_setup._CUDA_11_8_SPARSE_PACKAGES
+        )
+    )
+    expected_tree_sha256 = environment_setup._cuda_toolchain_tree_sha256(
+        local_cuda
+    )
+    environment.pop("CUDA_HOME")
+    dependencies = dataclasses.replace(
+        dependencies,
+        cuda_root=None,
+        nvcc_path=None,
+        cuda_tree_sha256=expected_tree_sha256,
+    )
+
+    preflight_environment(
+        root, "sparsedrive_v2", runner=runner, dependencies=dependencies
+    )
+
+    assert tuple(Path(call[0][0]).name for call in runner.calls) == (
+        "uv",
+        "nvcc",
+        "gcc",
+        "g++",
+    )
+    assert runner.calls[1][0][0] == str(local_cuda / "bin" / "nvcc")
+
+
+def test_sparse_project_cuda_ignores_inherited_system_cuda_home(tmp_path: Path):
+    """project-local build는 상속된 legacy CUDA_HOME을 실행 환경에 쓰지 않는다."""
+    root = _preflight_project(tmp_path)
+    dependencies, runner, environment = _preflight_host(tmp_path)
+    local_cuda = root / ".toolchains" / "cuda-11.8"
+    _write_complete_fake_cuda_toolchain(local_cuda)
+    (local_cuda / ".openloop-toolchain.json").write_bytes(
+        environment_setup._cuda_toolchain_manifest_bytes(
+            environment_setup._CUDA_11_8_SPARSE_PACKAGES
+        )
+    )
+    expected_tree_sha256 = environment_setup._cuda_toolchain_tree_sha256(
+        local_cuda
+    )
+    environment["CUDA_HOME"] = "/usr/local/cuda-11.8"
+    dependencies = dataclasses.replace(
+        dependencies,
+        cuda_root=None,
+        nvcc_path=None,
+        cuda_tree_sha256=expected_tree_sha256,
+    )
+
+    preflight_environment(
+        root, "sparsedrive_v2", runner=runner, dependencies=dependencies
+    )
+
+    assert runner.calls[1][0][0] == str(local_cuda / "bin" / "nvcc")
+
+
+def test_local_cuda_installer_publishes_only_exact_downloads_atomically(
+    tmp_path: Path,
+):
+    """고정 SHA/size package만 relocation tree로 추출하고 manifest와 함께 게시한다."""
+    payload = b"exact NVIDIA package payload"
+    package = environment_setup._CudaDebPackage(
+        filename="cuda-test_11.8.0-1_amd64.deb",
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    cuda_root = tmp_path / "project" / ".toolchains" / "cuda-11.8"
+    cuda_root.parent.parent.mkdir()
+    expected_tree_sha256 = _fake_cuda_tree_sha256(tmp_path)
+    downloads: list[tuple[str, Path]] = []
+    extracts: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def downloader(
+        url: str, destination: str | Path, expected_size: int
+    ):
+        path = Path(destination)
+        assert expected_size == len(payload)
+        downloads.append((url, path))
+        path.write_bytes(payload)
+
+    def runner(argv: list[str] | tuple[str, ...], **kwargs: Any):
+        command = tuple(argv)
+        extracts.append((command, dict(kwargs)))
+        assert command[0] == "/usr/bin/dpkg-deb"
+        assert command[1] == "--extract"
+        extraction_root = Path(command[3])
+        _write_fake_cuda_toolchain(
+            extraction_root / "usr" / "local" / "cuda-11.8"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    installed = environment_setup._prepare_local_cuda_toolchain(
+        cuda_root,
+        packages=(package,),
+        expected_tree_sha256=expected_tree_sha256,
+        downloader=downloader,
+        runner=runner,
+    )
+
+    assert installed == cuda_root
+    assert downloads == [
+        (
+            environment_setup._CUDA_REPOSITORY_URL + package.filename,
+            downloads[0][1],
+        )
+    ]
+    assert downloads[0][1].name == package.filename
+    assert not downloads[0][1].exists()
+    assert extracts[0][0][2].endswith(package.filename)
+    assert extracts[0][1] == {
+        "check": True,
+        "shell": False,
+        "capture_output": True,
+        "text": True,
+        "timeout": 60.0,
+    }
+    manifest = json.loads(
+        (cuda_root / ".openloop-toolchain.json").read_text(encoding="utf-8")
+    )
+    assert manifest == {
+        "packages": [
+            {
+                "filename": package.filename,
+                "sha256": package.sha256,
+                "size": package.size,
+            }
+        ],
+        "repository": environment_setup._CUDA_REPOSITORY_URL,
+        "schema": 1,
+    }
+    assert (cuda_root / "bin" / "nvcc").is_file()
+    assert not any(
+        path.is_dir() and path.name.startswith(".cuda-11.8.")
+        for path in cuda_root.parent.iterdir()
+    )
+
+    environment_setup._prepare_local_cuda_toolchain(
+        cuda_root,
+        packages=(package,),
+        expected_tree_sha256=expected_tree_sha256,
+        downloader=lambda *_args: pytest.fail("valid toolchain must be reused"),
+        runner=lambda *_args, **_kwargs: pytest.fail("valid toolchain must be reused"),
+    )
+
+
+def test_local_cuda_installer_bounds_downloader_by_declared_size(tmp_path: Path):
+    """installer는 downloader가 선언 bytes를 넘겨 읽지 않도록 exact size를 전달한다."""
+    payload = b"exact NVIDIA package payload"
+    package = environment_setup._CudaDebPackage(
+        filename="cuda-test_11.8.0-1_amd64.deb",
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    cuda_root = tmp_path / "project" / ".toolchains" / "cuda-11.8"
+    cuda_root.parent.parent.mkdir()
+    expected_tree_sha256 = _fake_cuda_tree_sha256(tmp_path)
+    calls: list[tuple[str, Path, int]] = []
+
+    def downloader(url: str, destination: str | Path, expected_size: int):
+        path = Path(destination)
+        calls.append((url, path, expected_size))
+        path.write_bytes(payload)
+
+    def runner(argv: list[str] | tuple[str, ...], **_kwargs: Any):
+        extraction_root = Path(tuple(argv)[3])
+        _write_fake_cuda_toolchain(
+            extraction_root / "usr" / "local" / "cuda-11.8"
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    environment_setup._prepare_local_cuda_toolchain(
+        cuda_root,
+        packages=(package,),
+        expected_tree_sha256=expected_tree_sha256,
+        downloader=downloader,
+        runner=runner,
+    )
+
+    assert [(url, path.name, size) for url, path, size in calls] == [
+        (
+            environment_setup._CUDA_REPOSITORY_URL + package.filename,
+            package.filename,
+            package.size,
+        )
+    ]
+
+
+def test_cuda_downloader_stops_at_expected_size_plus_one(tmp_path: Path):
+    """HTTP body가 길어도 declared bytes + 1만 읽고 partial file을 제거한다."""
+    expected = b"expected"
+    response_data = bytearray(expected + b"unbounded trailing bytes")
+    read_sizes: list[int] = []
+    observed_timeouts: list[float] = []
+
+    class Response:
+        status = 200
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            read_sizes.append(size)
+            block = bytes(response_data[:size])
+            del response_data[:size]
+            return block
+
+    def opener(_url: str, *, timeout: float):
+        observed_timeouts.append(timeout)
+        return Response()
+
+    destination = tmp_path / "cuda-test.deb"
+    with pytest.raises(EnvironmentSetupError, match="size mismatch"):
+        environment_setup._download_exact_cuda_package(
+            environment_setup._CUDA_REPOSITORY_URL + destination.name,
+            destination,
+            len(expected),
+            opener=opener,
+        )
+
+    assert observed_timeouts == [
+        environment_setup._CUDA_DOWNLOAD_SOCKET_TIMEOUT_SECONDS
+    ]
+    assert sum(read_sizes) == len(expected) + 1
+    assert not destination.exists()
+
+
+def test_local_cuda_installer_rejects_hash_mismatch_before_extract(tmp_path: Path):
+    """다운로드가 선언 SHA와 다르면 dpkg-deb 실행이나 final root를 남기지 않는다."""
+    expected = b"expected payload"
+    package = environment_setup._CudaDebPackage(
+        filename="cuda-test_11.8.0-1_amd64.deb",
+        size=len(expected),
+        sha256=hashlib.sha256(expected).hexdigest(),
+    )
+    cuda_root = tmp_path / "project" / ".toolchains" / "cuda-11.8"
+    cuda_root.parent.parent.mkdir()
+    expected_tree_sha256 = _fake_cuda_tree_sha256(tmp_path)
+    extracts: list[Any] = []
+
+    with pytest.raises(EnvironmentSetupError, match="SHA-256") as caught:
+        environment_setup._prepare_local_cuda_toolchain(
+            cuda_root,
+            packages=(package,),
+            expected_tree_sha256=expected_tree_sha256,
+            downloader=lambda _url, destination, _expected_size: Path(
+                destination
+            ).write_bytes(b"tampered payload"),
+            runner=lambda *args, **kwargs: extracts.append((args, kwargs)),
+        )
+
+    assert caught.value.action == "cuda_toolchain"
+    assert extracts == []
+    assert not cuda_root.exists()
+    if cuda_root.parent.exists():
+            assert not any(
+                path.is_dir() and path.name.startswith(".cuda-11.8.")
+                for path in cuda_root.parent.iterdir()
+            )
+
+
+def test_local_cuda_validation_rejects_mutated_published_tree(tmp_path: Path):
+    """게시 후 Toolkit file 하나라도 바뀌면 exact package tree로 재사용하지 않는다."""
+    payload = b"exact NVIDIA package payload"
+    package = environment_setup._CudaDebPackage(
+        filename="cuda-test_11.8.0-1_amd64.deb",
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    cuda_root = tmp_path / "project" / ".toolchains" / "cuda-11.8"
+    _write_fake_cuda_toolchain(cuda_root)
+    expected_tree_sha256 = environment_setup._cuda_toolchain_tree_sha256(
+        cuda_root
+    )
+    (cuda_root / ".openloop-toolchain.json").write_bytes(
+        environment_setup._cuda_toolchain_manifest_bytes((package,))
+    )
+
+    environment_setup._validate_local_cuda_toolchain(
+        cuda_root,
+        (package,),
+        expected_tree_sha256=expected_tree_sha256,
+    )
+    nvcc = cuda_root / "bin" / "nvcc"
+    nvcc.write_bytes(nvcc.read_bytes() + b"\n# mutated after publish\n")
+
+    with pytest.raises(EnvironmentSetupError, match="tree SHA-256"):
+        environment_setup._validate_local_cuda_toolchain(
+            cuda_root,
+            (package,),
+            expected_tree_sha256=expected_tree_sha256,
+        )
+
+
+def test_cuda_package_closure_includes_exact_pytorch_cuda_context_headers():
+    """Torch 2.0.1 CUDAContext의 세 vendor header를 exact NVIDIA dev deb로 공급한다."""
+    observed = {
+        package.filename: (package.size, package.sha256)
+        for package in environment_setup._CUDA_11_8_SPARSE_PACKAGES
+    }
+
+    assert {
+        name: observed[name]
+        for name in (
+            "libcublas-dev-11-8_11.11.3.6-1_amd64.deb",
+            "libcusolver-dev-11-8_11.4.1.48-1_amd64.deb",
+            "libcusparse-dev-11-8_11.7.5.86-1_amd64.deb",
+        )
+    } == {
+        "libcublas-dev-11-8_11.11.3.6-1_amd64.deb": (
+            269143880,
+            "84616862f8d45a9042bd6ea584440e2b6a6f5615c267ad2d25ab63f2a51d2428",
+        ),
+        "libcusolver-dev-11-8_11.4.1.48-1_amd64.deb": (
+            35689776,
+            "96933fb6d9bde2024ff1c2aa66d80858dbc828da918a975ee8afa827001f2a80",
+        ),
+        "libcusparse-dev-11-8_11.7.5.86-1_amd64.deb": (
+            116198960,
+            "3a61b6d3094cda2842cea5af6317531f39ec588b5d11c6a5d880def6f5f2e08d",
+        ),
+    }
+    assert (
+        sum(
+            package.size
+            for package in environment_setup._CUDA_11_8_SPARSE_PACKAGES
+        )
+        == 467070662
+    )
+
+
+@pytest.mark.parametrize("missing", ("cusparse.h", "cublas_v2.h", "cusolverDn.h"))
+def test_sparse_cuda_toolchain_requires_cuda_context_vendor_headers(
+    tmp_path: Path, missing: str
+):
+    """완료 manifest만 있어도 CUDAContext vendor header가 빠진 tree는 재사용하지 않는다."""
+    cuda_root = tmp_path / "project" / ".toolchains" / "cuda-11.8"
+    _write_fake_cuda_toolchain(cuda_root)
+    (cuda_root / ".openloop-toolchain.json").write_bytes(
+        environment_setup._cuda_toolchain_manifest_bytes(
+            environment_setup._CUDA_11_8_SPARSE_PACKAGES
+        )
+    )
+    include = cuda_root / "targets" / "x86_64-linux" / "include"
+    expected_tree_sha256 = _fake_cuda_tree_sha256(tmp_path, complete=True)
+    for header in ("cusparse.h", "cublas_v2.h", "cusolverDn.h"):
+        if header != missing:
+            (include / header).write_text(
+                f"/* fake {header} */\n", encoding="utf-8"
+            )
+
+    with pytest.raises(EnvironmentSetupError, match=missing):
+        environment_setup._validate_local_cuda_toolchain(
+            cuda_root,
+            environment_setup._CUDA_11_8_SPARSE_PACKAGES,
+            expected_tree_sha256=expected_tree_sha256,
+        )
+
+    (include / missing).write_text(f"/* fake {missing} */\n", encoding="utf-8")
+    environment_setup._validate_local_cuda_toolchain(
+        cuda_root,
+        environment_setup._CUDA_11_8_SPARSE_PACKAGES,
+        expected_tree_sha256=expected_tree_sha256,
+    )
+
+
+def test_local_cuda_installer_atomically_upgrades_exact_previous_manifest(
+    tmp_path: Path,
+):
+    """known old closure만 새 tree로 교체하고 old 파일을 final에 섞지 않는다."""
+    old_payload = b"old package"
+    new_payload = b"new package"
+    old_package = environment_setup._CudaDebPackage(
+        "cuda-old_11.8.0-1_amd64.deb",
+        len(old_payload),
+        hashlib.sha256(old_payload).hexdigest(),
+    )
+    new_package = environment_setup._CudaDebPackage(
+        "cuda-new_11.8.0-1_amd64.deb",
+        len(new_payload),
+        hashlib.sha256(new_payload).hexdigest(),
+    )
+    cuda_root = tmp_path / "project" / ".toolchains" / "cuda-11.8"
+    cuda_root.parent.parent.mkdir()
+    expected_tree_sha256 = _fake_cuda_tree_sha256(tmp_path)
+    _write_fake_cuda_toolchain(cuda_root)
+    (cuda_root / ".openloop-toolchain.json").write_bytes(
+        environment_setup._cuda_toolchain_manifest_bytes((old_package,))
+    )
+    (cuda_root / "old-only.txt").write_text("old\n", encoding="utf-8")
+
+    def downloader(
+        _url: str, destination: str | Path, expected_size: int
+    ):
+        assert expected_size == len(new_payload)
+        Path(destination).write_bytes(new_payload)
+
+    def runner(argv: list[str] | tuple[str, ...], **_kwargs: Any):
+        extraction_root = Path(tuple(argv)[3])
+        _write_fake_cuda_toolchain(
+            extraction_root / "usr" / "local" / "cuda-11.8"
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    environment_setup._prepare_local_cuda_toolchain(
+        cuda_root,
+        packages=(new_package,),
+        expected_tree_sha256=expected_tree_sha256,
+        upgrade_from=((old_package,),),
+        downloader=downloader,
+        runner=runner,
+    )
+
+    assert not (cuda_root / "old-only.txt").exists()
+    assert (cuda_root / ".openloop-toolchain.json").read_bytes() == (
+        environment_setup._cuda_toolchain_manifest_bytes((new_package,))
+    )
+    assert not any(
+        entry.is_dir() and entry.name.startswith(".cuda-11.8.")
+        for entry in cuda_root.parent.iterdir()
+    )
+
+
+def test_local_cuda_upgrade_failure_preserves_exact_previous_tree(tmp_path: Path):
+    """새 closure 준비 실패는 인증된 old root의 inode와 bytes를 그대로 보존한다."""
+    old_payload = b"old package"
+    new_payload = b"new package"
+    old_package = environment_setup._CudaDebPackage(
+        "cuda-old_11.8.0-1_amd64.deb",
+        len(old_payload),
+        hashlib.sha256(old_payload).hexdigest(),
+    )
+    new_package = environment_setup._CudaDebPackage(
+        "cuda-new_11.8.0-1_amd64.deb",
+        len(new_payload),
+        hashlib.sha256(new_payload).hexdigest(),
+    )
+    cuda_root = tmp_path / "project" / ".toolchains" / "cuda-11.8"
+    cuda_root.parent.parent.mkdir()
+    expected_tree_sha256 = _fake_cuda_tree_sha256(tmp_path)
+    _write_fake_cuda_toolchain(cuda_root)
+    old_manifest = environment_setup._cuda_toolchain_manifest_bytes((old_package,))
+    (cuda_root / ".openloop-toolchain.json").write_bytes(old_manifest)
+    sentinel = cuda_root / "old-only.txt"
+    sentinel.write_text("old\n", encoding="utf-8")
+    before = (cuda_root.lstat().st_ino, sentinel.lstat().st_ino)
+
+    with pytest.raises(EnvironmentSetupError, match="cannot download"):
+        environment_setup._prepare_local_cuda_toolchain(
+            cuda_root,
+            packages=(new_package,),
+            expected_tree_sha256=expected_tree_sha256,
+            upgrade_from=((old_package,),),
+            downloader=lambda *_args: (_ for _ in ()).throw(OSError("offline")),
+            runner=lambda *_args, **_kwargs: pytest.fail("must not extract"),
+        )
+
+    assert (cuda_root.lstat().st_ino, sentinel.lstat().st_ino) == before
+    assert sentinel.read_text(encoding="utf-8") == "old\n"
+    assert (cuda_root / ".openloop-toolchain.json").read_bytes() == old_manifest
 
 
 def test_preflight_public_result_is_frozen_and_read_only(tmp_path: Path):
@@ -3064,19 +3586,22 @@ def _setup_fixture(
                 original_select(manifest, selected), cuda_policy="recommended"
             ),
         )
-    if strip_asset_hashes:
-        original_load = preflight_dependencies.load_profile
+    original_load = preflight_dependencies.load_profile
 
-        def load_without_asset_hashes(path: Path, selected: str):
-            profile = original_load(path, selected)
-            data = json.loads(json.dumps(profile.data))
-            for declaration in data["runtime_assets"]:
+    def load_with_fixture_asset_hashes(path: Path, selected: str):
+        profile = original_load(path, selected)
+        data = json.loads(json.dumps(profile.data))
+        for declaration in data["runtime_assets"]:
+            if strip_asset_hashes:
                 declaration["sha256"] = None
-            return dataclasses.replace(profile, data=data)
+            elif declaration["role"].startswith("carla_agents_"):
+                payload = ("asset:" + declaration["role"]).encode("ascii")
+                declaration["sha256"] = _bytes_sha256(payload)
+        return dataclasses.replace(profile, data=data)
 
-        preflight_dependencies = dataclasses.replace(
-            preflight_dependencies, load_profile=load_without_asset_hashes
-        )
+    preflight_dependencies = dataclasses.replace(
+        preflight_dependencies, load_profile=load_with_fixture_asset_hashes
+    )
 
     manifest = preflight_dependencies.load_manifest(
         root
@@ -3549,6 +4074,9 @@ def test_setup_sparse_runs_exact_declared_extension_action(tmp_path: Path):
     assert "deformable_aggregation_ext" in import_command[2]
     assert "deformable_aggregation_with_depth_ext" in import_command[2]
     assert "sys.path.insert" in import_command[2]
+    assert import_command[2].index("import torch") < import_command[2].index(
+        "importlib.import_module"
+    )
     assert str(build_kwargs["cwd"]) in import_command
     required_imports = _setup_call(runner, "required_imports")
     assert required_imports[1]["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(
@@ -3557,6 +4085,54 @@ def test_setup_sparse_runs_exact_declared_extension_action(tmp_path: Path):
     assert [phase for _, _, phase in runner.calls].index("sparse_build") < [
         phase for _, _, phase in runner.calls
     ].index("sparse_imports")
+
+
+def test_setup_sparse_prepares_and_builds_with_project_local_cuda(tmp_path: Path):
+    """setup은 GPU probe 뒤 local Toolkit을 준비하고 같은 CUDA_HOME으로 build한다."""
+    root, dependencies, runner, _ = _setup_fixture(
+        tmp_path, model_id="sparsedrive_v2", strip_asset_hashes=True
+    )
+    original = dependencies.preflight_dependencies
+    prepared: list[Path] = []
+    gpu_probes: list[str] = []
+    expected_tree_sha256 = _fake_cuda_tree_sha256(tmp_path, complete=True)
+
+    def prepare(cuda_root: Path) -> Path:
+        assert gpu_probes == ["checked"]
+        prepared.append(cuda_root)
+        _write_complete_fake_cuda_toolchain(cuda_root)
+        (cuda_root / ".openloop-toolchain.json").write_bytes(
+            environment_setup._cuda_toolchain_manifest_bytes(
+                environment_setup._CUDA_11_8_SPARSE_PACKAGES
+            )
+        )
+        return cuda_root
+
+    preflight_dependencies = dataclasses.replace(
+        original,
+        gpu_available=lambda: gpu_probes.append("checked") is None,
+        getenv=lambda name: (
+            None if name == "CUDA_HOME" else original.getenv(name)
+        ),
+        cuda_root=None,
+        nvcc_path=None,
+        cuda_tree_sha256=expected_tree_sha256,
+    )
+    dependencies = dataclasses.replace(
+        dependencies,
+        preflight_dependencies=preflight_dependencies,
+        cuda_toolchain_preparer=prepare,
+    )
+
+    setup_environment(root, "sparsedrive_v2", runner=runner, dependencies=dependencies)
+
+    local_cuda = root / ".toolchains" / "cuda-11.8"
+    assert prepared == [local_cuda]
+    build_kwargs = _setup_call(runner, "sparse_build")[1]
+    assert build_kwargs["env"]["CUDA_HOME"] == str(local_cuda)
+    assert build_kwargs["env"]["PATH"].split(os.pathsep)[0] == str(
+        local_cuda / "bin"
+    )
 
 
 def test_setup_postinstall_cuda_failure_never_writes_state_or_switches_current(
@@ -5652,6 +6228,13 @@ def test_runtime_probe_rejects_foreign_native_loaded_through_candidate_pth(
     overlay.mkdir()
     catkin_python = root / "devel" / "lib" / "python3" / "dist-packages"
     catkin_python.mkdir(parents=True)
+    audit_package = catkin_python / "validator_inference"
+    audit_package.mkdir()
+    (audit_package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(
+        Path(environment_setup.__file__).with_name("ros_compatibility.py"),
+        audit_package / "ros_compatibility.py",
+    )
     child_environment = environment_setup._build_candidate_child_environment(
         preflight, candidate, catkin_python
     )

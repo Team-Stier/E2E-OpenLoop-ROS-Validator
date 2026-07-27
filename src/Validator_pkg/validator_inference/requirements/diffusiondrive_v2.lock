@@ -722,9 +722,9 @@ defusedxml==0.7.1 \
     --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
     # via nbconvert
     # from https://pypi.org/simple
-diffusers==0.36.0 \
-    --hash=sha256:525d42abc74bfc3b2db594999961295c054b48ef40a11724dacf50e6abd1af98 \
-    --hash=sha256:a9cde8721b415bde6a678f2d02abb85396487e1b0e0d2b4abb462d14a9825ab0
+diffusers==0.35.2 \
+    --hash=sha256:30ecd552303edfcfe1724573c3918a8462ee3ab4d529bdbd4c0045f763affded \
+    --hash=sha256:d50d5e74fdd6dcf55e5c1d304bc52cc7c2659abd1752740d736d7b54078b4db5
     # via -r src/Validator_pkg/validator_inference/requirements/diffusiondrive_v2.in
     # from https://pypi.org/simple
 distro==1.9.0 \
@@ -1197,7 +1197,6 @@ httpx==0.28.1 \
     --hash=sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc \
     --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
     # via
-    #   diffusers
     #   huggingface-hub
     #   jupyterlab
     # from https://pypi.org/simple

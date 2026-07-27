@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from typing import Any, Callable, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 import xmlrpc.client
@@ -80,6 +81,8 @@ _NATIVE_SUFFIXES = tuple(importlib.machinery.EXTENSION_SUFFIXES) + (
 )
 _VERSIONED_PYTHON = re.compile(r"python([0-9]+)\.([0-9]+)\Z")
 _XMLRPC_CLEANUP_ALARM_SECONDS = 0.05
+_TORCH_GENERATED_REMOTE_MODULE = "_remote_module_non_scriptable"
+_MAX_ATTESTED_GENERATED_SOURCE_BYTES = 1024 * 1024
 
 
 class RosCompatibilityError(RuntimeError):
@@ -1231,21 +1234,200 @@ class _PeerState:
             }
 
 
+def _is_attested_torch_generated_module(
+    name: str, module: object, origin: object
+) -> bool:
+    """현재 Torch가 owner-only tempdir에 만든 exact RPC template인지 확인한다."""
+    if (
+        name != _TORCH_GENERATED_REMOTE_MODULE
+        or not isinstance(module, types.ModuleType)
+        or not isinstance(origin, str)
+    ):
+        return False
+    instantiator = sys.modules.get("torch.distributed.nn.jit.instantiator")
+    remote_module = sys.modules.get("torch.distributed.nn.api.remote_module")
+    if (
+        not isinstance(instantiator, types.ModuleType)
+        or not isinstance(remote_module, types.ModuleType)
+        or getattr(remote_module, "instantiator", None) is not instantiator
+        or getattr(
+            remote_module, "_NON_SCRIPTABLE_REMOTE_MODULE_MODULE", None
+        )
+        is not module
+        or sys.modules.get(name) is not module
+        or getattr(module, "__name__", None) != name
+        or getattr(instantiator, "_FILE_PREFIX", None) != "_remote_module_"
+    ):
+        return False
+
+    specification = getattr(module, "__spec__", None)
+    loader = getattr(module, "__loader__", None)
+    temporary = getattr(instantiator, "_TEMP_DIR", None)
+    directory_value = getattr(
+        instantiator, "INSTANTIATED_TEMPLATE_DIR_PATH", None
+    )
+    if (
+        specification is None
+        or loader is None
+        or getattr(specification, "loader", None) is not loader
+        or not isinstance(directory_value, str)
+        or getattr(temporary, "name", None) != directory_value
+        or getattr(specification, "name", None) != name
+        or getattr(specification, "origin", None) != origin
+        or getattr(loader, "path", None) != origin
+    ):
+        return False
+
+    path = Path(origin)
+    directory = Path(directory_value)
+    if (
+        not path.is_absolute()
+        or not directory.is_absolute()
+        or path != directory / f"{name}.py"
+        or str(directory) not in sys.path
+    ):
+        return False
+    try:
+        directory_metadata = directory.lstat()
+        path_metadata = path.lstat()
+        path_mode = stat.S_IMODE(path_metadata.st_mode)
+        if (
+            directory.resolve(strict=True) != directory
+            or path.resolve(strict=True) != path
+            or not stat.S_ISDIR(directory_metadata.st_mode)
+            or not stat.S_ISREG(path_metadata.st_mode)
+            or directory_metadata.st_uid != os.geteuid()
+            or path_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+            or path_mode & ~0o644
+            or path_mode & 0o600 != 0o600
+            or path_metadata.st_nlink != 1
+        ):
+            return False
+        template_factory = getattr(
+            instantiator, "get_remote_module_template", None
+        )
+        if not callable(template_factory):
+            return False
+        template = template_factory(True)
+        if not isinstance(template, str):
+            return False
+        expected = template.format(
+            assign_module_interface_cls="module_interface_cls = None",
+            args="*args",
+            kwargs="**kwargs",
+            arg_types="*args, **kwargs",
+            arrow_and_return_type="",
+            arrow_and_future_return_type="",
+            jit_script_decorator="",
+        ).encode("utf-8")
+        if (
+            len(expected) > _MAX_ATTESTED_GENERATED_SOURCE_BYTES
+            or path_metadata.st_size != len(expected)
+        ):
+            return False
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            return False
+        close_on_exec = getattr(os, "O_CLOEXEC", 0)
+        directory_descriptor = os.open(
+            str(directory),
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | no_follow
+            | close_on_exec,
+        )
+        try:
+            opened_directory = os.fstat(directory_descriptor)
+            if (
+                opened_directory.st_dev != directory_metadata.st_dev
+                or opened_directory.st_ino != directory_metadata.st_ino
+                or opened_directory.st_mode != directory_metadata.st_mode
+                or opened_directory.st_uid != directory_metadata.st_uid
+            ):
+                return False
+            source_descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | no_follow
+                | close_on_exec,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                opened_source = os.fstat(source_descriptor)
+                if (
+                    opened_source.st_dev != path_metadata.st_dev
+                    or opened_source.st_ino != path_metadata.st_ino
+                    or opened_source.st_mode != path_metadata.st_mode
+                    or opened_source.st_uid != path_metadata.st_uid
+                    or opened_source.st_nlink != 1
+                    or opened_source.st_size != len(expected)
+                ):
+                    return False
+                observed = bytearray()
+                while len(observed) <= len(expected):
+                    block = os.read(
+                        source_descriptor,
+                        min(64 * 1024, len(expected) + 1 - len(observed)),
+                    )
+                    if not block:
+                        break
+                    observed.extend(block)
+                final_source = os.fstat(source_descriptor)
+                final_directory = os.fstat(directory_descriptor)
+                if (
+                    final_source.st_dev != opened_source.st_dev
+                    or final_source.st_ino != opened_source.st_ino
+                    or final_source.st_mode != opened_source.st_mode
+                    or final_source.st_size != opened_source.st_size
+                    or final_source.st_mtime_ns != opened_source.st_mtime_ns
+                    or final_directory.st_dev != opened_directory.st_dev
+                    or final_directory.st_ino != opened_directory.st_ino
+                    or final_directory.st_mode != opened_directory.st_mode
+                ):
+                    return False
+                return bytes(observed) == expected
+            finally:
+                os.close(source_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except (
+        MemoryError,
+        OSError,
+        UnicodeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
 def _loaded_module_origins() -> dict[str, object]:
-    """현재 process의 모든 file·built-in·frozen module origin을 JSON 값으로 모은다."""
+    """현재 process의 file origin을 모으되 검증된 Torch 생성물은 분리한다."""
     origins: dict[str, object] = {}
     for name, module in sorted(sys.modules.items()):
         if module is None:
             continue
-        origin = getattr(module, "__file__", None)
+        try:
+            module_namespace = vars(module)
+        except TypeError:
+            continue
+        origin = module_namespace.get("__file__")
         if origin is None:
-            specification = getattr(module, "__spec__", None)
-            origin = getattr(specification, "origin", None)
+            specification = module_namespace.get("__spec__")
+            try:
+                origin = vars(specification).get("origin")
+            except TypeError:
+                origin = None
         if origin is None:
             continue
         if isinstance(origin, Path):
             origin = str(origin)
         if isinstance(origin, str):
+            if _is_attested_torch_generated_module(name, module, origin):
+                continue
             origins[name] = origin
     return origins
 

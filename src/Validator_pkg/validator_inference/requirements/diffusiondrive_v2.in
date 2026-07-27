@@ -4,8 +4,8 @@
 # The upstream Git dependency is expressed as the immutable nuPlan archive so
 # uv can hash it. Upstream docs/install.md names diffusers and einops without
 # versions; these exact pins make that additional runtime contract reproducible.
-# diffusers 0.36.0 is the newest Python 3.9-compatible release before the
-# environment contract's fixed exclude-newer timestamp.
+# diffusers 0.35.2 is the newest tested release that imports with the upstream
+# torch 2.0.1 pin; 0.36.0 accesses torch.xpu, which torch 2.0.1 does not expose.
 
 PyYAML==6.0.3
 rospkg==1.6.0
@@ -61,5 +61,5 @@ protobuf==4.25.3
 
 notebook
 timm
-diffusers==0.36.0
+diffusers==0.35.2
 einops==0.8.1

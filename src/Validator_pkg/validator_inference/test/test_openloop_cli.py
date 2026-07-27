@@ -532,3 +532,4 @@ def test_root_shim_clean_checkout_preserves_cli_argument_boundaries(tmp_path: Pa
 def test_local_model_environments_are_ignored():
     lines = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "/.venvs/" in lines
+    assert "/.toolchains/" in lines

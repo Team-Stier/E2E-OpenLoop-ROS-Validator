@@ -272,7 +272,7 @@ lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
 
 ## 3. Open-loop 실행
 
-아래 세 명령으로 `interfuser` 환경을 만들고 validator와 RViz를 시작한 뒤, 다른 terminal에서 기본 bag을 재생한다.
+아래는 InterFuser 예시다. 첫 명령으로 모델 환경을 만들고 validator와 RViz를 시작한 뒤, 다른 terminal에서 기본 bag을 재생한다. `interfuser` 대신 `tfv6`, `diffusiondrive_v2`, `sparsedrive_v2`를 넣어도 같은 절차로 실행된다.
 
 ```bash
 ./openloop setup interfuser
@@ -282,14 +282,14 @@ lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
 
 `setup`은 모델별 고정 Python/CUDA dependency를 `.venvs/<model>/builds/`에 만들고 검증이 끝난 build만 `current`로 선택한다. `run`과 모델 shorthand는 환경을 설치하거나 변경하지 않는다. 전체 hash 무결성 검사와 이전 build 정리는 각각 다음 명령을 사용한다.
 
-지원 host는 Ubuntu 20.04 x86_64, ROS Noetic, `uv 0.11.14`이다. 모델별 required CUDA/toolchain 조건은 setup 시작 단계에서 검사한다.
+지원 host는 Ubuntu 20.04 x86_64, ROS Noetic, `uv 0.11.14`이다. SparseDrive V2 setup은 해시가 고정된 최소 CUDA 11.8 compiler를 프로젝트의 `.toolchains/`에 자동 준비하므로 별도 `sudo` 설치나 `CUDA_HOME` 설정이 필요 없다.
 
 ```bash
 ./openloop verify interfuser
 ./openloop prune interfuser
 ```
 
-네 모델의 환경 정의와 setup/preflight 경로를 제공하지만, 현재 실제 설치와 bag acceptance 범위는 InterFuser다. InterFuser checkpoint는 공식 배포본으로 가장하지 않고 Drivora 호환 mirror의 `third-party compatibility artifact`로 hash와 provenance를 고정한다. 자세한 준비 조건, 직접 launch, 오류 복구 절차는 [Open-loop 운영 절차](docs/openloop_validator.md)를 참고한다.
+네 모델 모두 source, runtime asset, dependency lock, 실제 model load까지 setup/verify 대상이다. InterFuser checkpoint는 공식 배포본으로 가장하지 않고 Drivora 호환 mirror의 `third-party compatibility artifact`로 hash와 provenance를 고정한다. 자세한 준비 조건, 직접 launch, 오류 복구 절차는 [Open-loop 운영 절차](docs/openloop_validator.md)를 참고한다.
 
 고급 사용자가 launch 인자를 직접 제어할 때는 setup을 먼저 완료하고 절대 환경 root를 전달한다.
 

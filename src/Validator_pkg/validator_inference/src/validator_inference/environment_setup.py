@@ -25,6 +25,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
@@ -36,6 +37,7 @@ from typing import (
     Sequence,
     Tuple,
 )
+from urllib.request import urlopen
 
 from validator_inference.model_environment import (
     ENVIRONMENT_STATE_FILENAME,
@@ -109,6 +111,16 @@ _COMPILER_VERSION_OUTPUT = re.compile(
 _VERSIONED_PYTHON_EXECUTABLE = re.compile(r"python([0-9]+)\.([0-9]+)\Z")
 _SPARSE_COMPILER_MIN_MAJOR = 6
 _SPARSE_COMPILER_MAX_MAJOR = 11
+_CUDA_TOOLCHAIN_ACTION = "cuda_toolchain"
+_MAX_CUDA_DEB_BYTES = 512 * 1024 * 1024
+_MAX_CUDA_TOOLCHAIN_TREE_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_CUDA_TOOLCHAIN_TREE_ENTRIES = 100_000
+_CUDA_DOWNLOAD_SOCKET_TIMEOUT_SECONDS = 30.0
+_CUDA_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 600.0
+_CUDA_REPOSITORY_URL = (
+    "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/"
+)
+_CUDA_TOOLCHAIN_MANIFEST = ".openloop-toolchain.json"
 _ASSETS_ACTION = "assets"
 _INTERFUSER_CHECKPOINT_PATH = Path(
     "models/interfuser/official_carla/interfuser.pth.tar"
@@ -151,20 +163,111 @@ _TARGET_INFERENCE_IMPORTS = (
     "validator_inference.models.select",
 )
 _MODULE_ORIGIN_REPORT_CODE = (
-    "module_origins = {}\n"
-    "for loaded_name, loaded_module in sorted(sys.modules.items()):\n"
-    "    if loaded_module is None:\n"
-    "        continue\n"
-    "    loaded_origin = getattr(loaded_module, '__file__', None)\n"
-    "    if loaded_origin is None:\n"
-    "        loaded_origin = getattr(\n"
-    "            getattr(loaded_module, '__spec__', None), 'origin', None\n"
-    "        )\n"
-    "    if isinstance(loaded_origin, pathlib.Path):\n"
-    "        loaded_origin = str(loaded_origin)\n"
-    "    if isinstance(loaded_origin, str):\n"
-    "        module_origins[loaded_name] = loaded_origin\n"
+    "from validator_inference.ros_compatibility "
+    "import _loaded_module_origins\n"
+    "module_origins = _loaded_module_origins()\n"
 )
+
+
+@dataclass(frozen=True)
+class _CudaDebPackage:
+    """공식 CUDA repository에서 exact bytes로 고정한 한 compiler package다."""
+
+    filename: str
+    size: int
+    sha256: str
+
+
+# NVIDIA ubuntu2004/x86_64 Packages.gz의 초기 CUDA 11.8 compiler closure.
+_CUDA_11_8_COMPILER_PACKAGES_V1 = (
+    _CudaDebPackage(
+        "cuda-toolkit-config-common_11.8.89-1_all.deb",
+        16376,
+        "5c0fb52f54ab4b83214ce9b1be80d0621a1f5261dfcd35f5f2507acc0985105c",
+    ),
+    _CudaDebPackage(
+        "cuda-toolkit-11-config-common_11.8.89-1_all.deb",
+        16388,
+        "5e9fb74cd879ead8d642471095b1733bfc5ebd209fafa18183435b4568d54cf2",
+    ),
+    _CudaDebPackage(
+        "cuda-toolkit-11-8-config-common_11.8.89-1_all.deb",
+        16328,
+        "7e4729d58d9fdf4dfc3cdb5447ab3e495fb777df7f6b183213ce80a507535076",
+    ),
+    _CudaDebPackage(
+        "cuda-cccl-11-8_11.8.89-1_amd64.deb",
+        1040292,
+        "38dc61ecf5059b8b22dc7cae2e5aa1f09263b8b9295eb225f69b3d4d76778c53",
+    ),
+    _CudaDebPackage(
+        "cuda-cudart-11-8_11.8.89-1_amd64.deb",
+        165258,
+        "4f603955b63d228e980f14f32dbdabcfa154f4b9659dcc222b746a6c4f450239",
+    ),
+    _CudaDebPackage(
+        "cuda-driver-dev-11-8_11.8.89-1_amd64.deb",
+        27252,
+        "ee491628df1b08a633d7ca580d11d6aad48bd95af8e5ddb5c382d19ce1fc3596",
+    ),
+    _CudaDebPackage(
+        "cuda-cudart-dev-11-8_11.8.89-1_amd64.deb",
+        820026,
+        "c3ad62dbe3e80a7ba09fb9a69e5819abb274bb398fdcffbd7c7d8fa583dd700d",
+    ),
+    _CudaDebPackage(
+        "cuda-nvcc-11-8_11.8.89-1_amd64.deb",
+        43522508,
+        "f72fcab60e94ae2ffbf7c24bedde5329fd7f3ca8fd07b6a5e92fd85759ecabdf",
+    ),
+    _CudaDebPackage(
+        "cuda-cuobjdump-11-8_11.8.86-1_amd64.deb",
+        164562,
+        "e7c8fbfd2d0f515ddf9b98aac9ac43da9c126ee3d0ab9f14789e86f4cd654655",
+    ),
+    _CudaDebPackage(
+        "cuda-cuxxfilt-11-8_11.8.86-1_amd64.deb",
+        188534,
+        "5b5130f758b92ad03e617cd353752997aa33538c80fb6aa6de106e12c8fad808",
+    ),
+    _CudaDebPackage(
+        "cuda-nvprune-11-8_11.8.86-1_amd64.deb",
+        58092,
+        "d7239b3d94f0daacecc049e33ebc92b7bf8611cf90fcb19e99b7279ee1f712f4",
+    ),
+    _CudaDebPackage(
+        "cuda-compiler-11-8_11.8.0-1_amd64.deb",
+        2430,
+        "4b4581a57177eb2d92ec092c492625236e6fb81bcad1ca2cf53462dd1264cdae",
+    ),
+)
+
+_CUDA_11_8_SPARSE_PACKAGES = _CUDA_11_8_COMPILER_PACKAGES_V1 + (
+    _CudaDebPackage(
+        "libcublas-dev-11-8_11.11.3.6-1_amd64.deb",
+        269143880,
+        "84616862f8d45a9042bd6ea584440e2b6a6f5615c267ad2d25ab63f2a51d2428",
+    ),
+    _CudaDebPackage(
+        "libcusolver-dev-11-8_11.4.1.48-1_amd64.deb",
+        35689776,
+        "96933fb6d9bde2024ff1c2aa66d80858dbc828da918a975ee8afa827001f2a80",
+    ),
+    _CudaDebPackage(
+        "libcusparse-dev-11-8_11.7.5.86-1_amd64.deb",
+        116198960,
+        "3a61b6d3094cda2842cea5af6317531f39ec588b5d11c6a5d880def6f5f2e08d",
+    ),
+)
+_CUDA_11_8_SPARSE_TREE_SHA256 = (
+    "311a26a24b1a9a9e4f90b36831267d2ebef87657e365a1a8841874407e91c869"
+)
+
+_CUDA_VENDOR_HEADERS_BY_PACKAGE = {
+    "libcublas-dev-11-8_11.11.3.6-1_amd64.deb": "cublas_v2.h",
+    "libcusolver-dev-11-8_11.4.1.48-1_amd64.deb": "cusolverDn.h",
+    "libcusparse-dev-11-8_11.7.5.86-1_amd64.deb": "cusparse.h",
+}
 
 
 def _read_host_os_release() -> Mapping[str, str]:
@@ -304,8 +407,9 @@ class EnvironmentPreflightDependencies:
     )
     ros_root: Path = Path("/opt/ros/noetic")
     ros_python_root: Path = Path("/opt/ros/noetic/lib/python3/dist-packages")
-    cuda_root: Path = Path("/usr/local/cuda-11.8")
-    nvcc_path: Path = Path("/usr/local/cuda-11.8/bin/nvcc")
+    cuda_root: Optional[Path] = None
+    nvcc_path: Optional[Path] = None
+    cuda_tree_sha256: Optional[str] = None
     gcc_path: Path = Path("/usr/bin/gcc")
     gxx_path: Path = Path("/usr/bin/g++")
 
@@ -344,6 +448,9 @@ class EnvironmentSetupDependencies:
         default_factory=lambda: _utc_second_timestamp
     )
     ros_smoke: Optional[Callable[[Path, Mapping[str, str]], None]] = None
+    cuda_toolchain_preparer: Callable[[Path], Path] = field(
+        default_factory=lambda: _prepare_local_cuda_toolchain
+    )
 
 
 @dataclass(frozen=True)
@@ -608,6 +715,701 @@ def _ensure_real_directory(path: Path, action: str, context: str) -> None:
     _require_real_directory(path, action, context)
 
 
+def _cuda_toolchain_manifest_bytes(
+    packages: Sequence[_CudaDebPackage],
+) -> bytes:
+    """고정 package closure를 canonical local-toolchain manifest bytes로 만든다."""
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for package in packages:
+        if (
+            not isinstance(package, _CudaDebPackage)
+            or not package.filename.endswith(".deb")
+            or Path(package.filename).name != package.filename
+            or any(ord(character) < 32 for character in package.filename)
+            or package.filename in seen
+            or type(package.size) is not int
+            or not 0 < package.size <= _MAX_CUDA_DEB_BYTES
+            or _SHA256.fullmatch(package.sha256) is None
+        ):
+            _raise(_CUDA_TOOLCHAIN_ACTION, "CUDA package declaration is invalid")
+        seen.add(package.filename)
+        records.append(
+            {
+                "filename": package.filename,
+                "sha256": package.sha256,
+                "size": package.size,
+            }
+        )
+    if not records:
+        _raise(_CUDA_TOOLCHAIN_ACTION, "CUDA package closure must not be empty")
+    return (
+        json.dumps(
+            {
+                "packages": records,
+                "repository": _CUDA_REPOSITORY_URL,
+                "schema": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _sha256_cuda_package(path: Path, expected_size: int) -> str:
+    """large CUDA deb를 exact size의 같은 regular fd에서 streaming hash한다."""
+    with _open_regular_file(
+        path, _CUDA_TOOLCHAIN_ACTION, f"CUDA package {path.name}"
+    ) as (descriptor, metadata):
+        if metadata.st_size != expected_size:
+            _raise(
+                _CUDA_TOOLCHAIN_ACTION,
+                f"CUDA package size mismatch: {path.name}",
+            )
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            while total < expected_size:
+                block = os.read(
+                    descriptor, min(_READ_BLOCK_SIZE, expected_size - total)
+                )
+                if not block:
+                    break
+                total += len(block)
+                digest.update(block)
+        except (MemoryError, OSError) as exc:
+            raise EnvironmentSetupError(
+                _CUDA_TOOLCHAIN_ACTION,
+                f"cannot hash CUDA package: {path.name}",
+            ) from exc
+        if total != expected_size or os.read(descriptor, 1):
+            _raise(
+                _CUDA_TOOLCHAIN_ACTION,
+                f"CUDA package size mismatch: {path.name}",
+            )
+    return digest.hexdigest()
+
+
+def _download_exact_cuda_package(
+    url: str,
+    destination: str | Path,
+    expected_size: int,
+    *,
+    opener: Callable[..., Any] = urlopen,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """CUDA deb를 socket/wall timeout과 exact byte cap 아래에서 저장한다."""
+    if (
+        not isinstance(url, str)
+        or not url.startswith(_CUDA_REPOSITORY_URL)
+        or type(expected_size) is not int
+        or not 0 < expected_size <= _MAX_CUDA_DEB_BYTES
+    ):
+        _raise(_CUDA_TOOLCHAIN_ACTION, "CUDA download declaration is invalid")
+    path = _canonical_absolute_posix_path(
+        destination, "CUDA package destination", _CUDA_TOOLCHAIN_ACTION
+    )
+    descriptor: Optional[int] = None
+    completed = False
+    started = monotonic()
+    try:
+        with opener(
+            url, timeout=_CUDA_DOWNLOAD_SOCKET_TIMEOUT_SECONDS
+        ) as response:
+            status = getattr(response, "status", None)
+            if status not in {None, 200}:
+                _raise(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    f"CUDA package download returned HTTP {status}",
+                )
+            headers = getattr(response, "headers", None)
+            content_length = (
+                headers.get("Content-Length") if headers is not None else None
+            )
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except (TypeError, ValueError) as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "CUDA package Content-Length is invalid",
+                    ) from exc
+                if declared_length != expected_size:
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "CUDA package Content-Length mismatch",
+                    )
+
+            no_follow = getattr(os, "O_NOFOLLOW", 0)
+            if not no_follow:
+                _raise(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    "CUDA package download requires O_NOFOLLOW support",
+                )
+            descriptor = os.open(
+                str(path),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | no_follow
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            total = 0
+            while total < expected_size:
+                if monotonic() - started > _CUDA_DOWNLOAD_TOTAL_TIMEOUT_SECONDS:
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "CUDA package download timed out",
+                    )
+                block = response.read(
+                    min(_READ_BLOCK_SIZE, expected_size - total)
+                )
+                if not block:
+                    break
+                if not isinstance(block, bytes):
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "CUDA package download returned non-bytes data",
+                    )
+                view = memoryview(block)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        _raise(
+                            _CUDA_TOOLCHAIN_ACTION,
+                            "CUDA package download write failed",
+                        )
+                    view = view[written:]
+                total += len(block)
+            extra = response.read(1)
+            if total != expected_size or extra:
+                _raise(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    "CUDA package download size mismatch",
+                )
+            os.fsync(descriptor)
+            completed = True
+    except EnvironmentSetupError:
+        raise
+    except (MemoryError, OSError, TimeoutError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _CUDA_TOOLCHAIN_ACTION,
+            f"cannot download CUDA package: {url}",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if not completed:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def _cuda_toolchain_tree_sha256(cuda_root: Path) -> str:
+    """relocated CUDA tree 전체를 path/type/mode/content 기준으로 hash한다."""
+    root = _canonical_absolute_posix_path(
+        cuda_root, "local CUDA Toolkit root", _CUDA_TOOLCHAIN_ACTION
+    )
+    _require_real_directory(
+        root, _CUDA_TOOLCHAIN_ACTION, "local CUDA 11.8 Toolkit"
+    )
+    digest = hashlib.sha256(b"openloop-cuda-toolchain-tree-v1\0")
+    entry_count = 0
+    regular_bytes = 0
+
+    def update_record(
+        kind: bytes,
+        relative: Path,
+        mode: int,
+        payload_size: int = 0,
+    ) -> None:
+        """한 tree entry의 경계가 명확한 metadata를 누적한다."""
+        try:
+            encoded_path = relative.as_posix().encode("utf-8")
+        except UnicodeError as exc:
+            raise EnvironmentSetupError(
+                _CUDA_TOOLCHAIN_ACTION,
+                f"CUDA tree path is not UTF-8 encodable: {relative!s}",
+            ) from exc
+        digest.update(kind)
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(stat.S_IMODE(mode).to_bytes(4, "big"))
+        digest.update(payload_size.to_bytes(8, "big"))
+
+    def visit(directory: Path, relative_directory: Path) -> None:
+        """symlink를 따라가지 않고 directory entry를 정렬 순회한다."""
+        nonlocal entry_count, regular_bytes
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: os.fsencode(item.name))
+        except (MemoryError, OSError) as exc:
+            raise EnvironmentSetupError(
+                _CUDA_TOOLCHAIN_ACTION,
+                f"cannot enumerate local CUDA tree: {directory}",
+            ) from exc
+        for entry in entries:
+            relative = relative_directory / entry.name
+            if relative == Path(_CUDA_TOOLCHAIN_MANIFEST):
+                continue
+            entry_count += 1
+            if entry_count > _MAX_CUDA_TOOLCHAIN_TREE_ENTRIES:
+                _raise(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    "local CUDA tree entry limit exceeded",
+                )
+            path = directory / entry.name
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    f"cannot inspect local CUDA tree entry: {path}",
+                ) from exc
+
+            if stat.S_ISDIR(metadata.st_mode):
+                update_record(b"D", relative, metadata.st_mode)
+                visit(path, relative)
+                try:
+                    final_metadata = path.lstat()
+                except OSError as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"local CUDA directory changed during hashing: {path}",
+                    ) from exc
+                if (
+                    final_metadata.st_dev != metadata.st_dev
+                    or final_metadata.st_ino != metadata.st_ino
+                    or final_metadata.st_mode != metadata.st_mode
+                ):
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"local CUDA directory changed during hashing: {path}",
+                    )
+                continue
+
+            if stat.S_ISLNK(metadata.st_mode):
+                try:
+                    target = os.fsencode(os.readlink(path))
+                    final_metadata = path.lstat()
+                except (MemoryError, OSError) as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"cannot read local CUDA symlink: {path}",
+                    ) from exc
+                if (
+                    final_metadata.st_dev != metadata.st_dev
+                    or final_metadata.st_ino != metadata.st_ino
+                    or final_metadata.st_mode != metadata.st_mode
+                    or final_metadata.st_mtime_ns != metadata.st_mtime_ns
+                ):
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"local CUDA symlink changed during hashing: {path}",
+                    )
+                update_record(b"L", relative, metadata.st_mode, len(target))
+                digest.update(target)
+                continue
+
+            if not stat.S_ISREG(metadata.st_mode):
+                _raise(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    f"local CUDA tree contains a special file: {path}",
+                )
+            with _open_regular_file(
+                path, _CUDA_TOOLCHAIN_ACTION, f"local CUDA file {relative!s}"
+            ) as (descriptor, opened):
+                if (
+                    opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or opened.st_nlink != 1
+                ):
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"local CUDA file changed or has aliases: {path}",
+                    )
+                regular_bytes += opened.st_size
+                if regular_bytes > _MAX_CUDA_TOOLCHAIN_TREE_BYTES:
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "local CUDA tree byte limit exceeded",
+                    )
+                update_record(b"F", relative, opened.st_mode, opened.st_size)
+                remaining = opened.st_size
+                try:
+                    while remaining:
+                        block = os.read(
+                            descriptor, min(_READ_BLOCK_SIZE, remaining)
+                        )
+                        if not block:
+                            break
+                        digest.update(block)
+                        remaining -= len(block)
+                    extra = os.read(descriptor, 1)
+                    final_metadata = os.fstat(descriptor)
+                except (MemoryError, OSError) as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"cannot hash local CUDA file: {path}",
+                    ) from exc
+                if (
+                    remaining
+                    or extra
+                    or final_metadata.st_size != opened.st_size
+                    or final_metadata.st_mode != opened.st_mode
+                    or final_metadata.st_mtime_ns != opened.st_mtime_ns
+                ):
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"local CUDA file changed during hashing: {path}",
+                    )
+
+    visit(root, Path())
+    return digest.hexdigest()
+
+
+def _require_relocated_cuda_file(
+    cuda_root: Path, relative_path: Path, context: str, *, executable: bool = False
+) -> Path:
+    """relocated CUDA symlink가 root 안의 regular file에만 도달하는지 확인한다."""
+    candidate = cuda_root / relative_path
+    try:
+        resolved_root = cuda_root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+        inside = os.path.commonpath((str(resolved_root), str(resolved))) == str(
+            resolved_root
+        )
+        metadata = resolved.stat()
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise EnvironmentSetupError(
+            _CUDA_TOOLCHAIN_ACTION, f"{context} is missing or unreadable: {candidate}"
+        ) from exc
+    if not inside or not stat.S_ISREG(metadata.st_mode):
+        _raise(
+            _CUDA_TOOLCHAIN_ACTION,
+            f"{context} must resolve to a regular file inside {cuda_root}",
+        )
+    if executable and not os.access(resolved, os.X_OK):
+        _raise(_CUDA_TOOLCHAIN_ACTION, f"{context} is not executable: {candidate}")
+    return candidate
+
+
+def _validate_local_cuda_toolchain(
+    cuda_root: Path,
+    packages: Sequence[_CudaDebPackage],
+    *,
+    expected_tree_sha256: str,
+) -> None:
+    """manifest와 compiler/header/runtime library가 완전한 local tree인지 검증한다."""
+    if _SHA256.fullmatch(expected_tree_sha256) is None:
+        _raise(
+            _CUDA_TOOLCHAIN_ACTION,
+            "local CUDA tree SHA-256 declaration is invalid",
+        )
+    _require_real_directory(
+        cuda_root, _CUDA_TOOLCHAIN_ACTION, "local CUDA 11.8 Toolkit"
+    )
+    expected_manifest = _cuda_toolchain_manifest_bytes(packages)
+    observed_manifest = _read_bounded_regular_file(
+        cuda_root / _CUDA_TOOLCHAIN_MANIFEST,
+        64 * 1024,
+        _CUDA_TOOLCHAIN_ACTION,
+        "local CUDA toolchain manifest",
+    )
+    if observed_manifest != expected_manifest:
+        _raise(_CUDA_TOOLCHAIN_ACTION, "local CUDA toolchain manifest mismatch")
+    _require_relocated_cuda_file(
+        cuda_root, Path("bin/nvcc"), "local CUDA nvcc", executable=True
+    )
+    _require_relocated_cuda_file(
+        cuda_root, Path("include/cuda_runtime.h"), "local CUDA runtime header"
+    )
+    _require_relocated_cuda_file(
+        cuda_root, Path("lib64/libcudart.so"), "local CUDA runtime library"
+    )
+    package_filenames = {package.filename for package in packages}
+    for package_filename, header in _CUDA_VENDOR_HEADERS_BY_PACKAGE.items():
+        if package_filename in package_filenames:
+            _require_relocated_cuda_file(
+                cuda_root,
+                Path("include") / header,
+                f"local CUDA header {header}",
+            )
+    observed_tree_sha256 = _cuda_toolchain_tree_sha256(cuda_root)
+    if observed_tree_sha256 != expected_tree_sha256:
+        _raise(_CUDA_TOOLCHAIN_ACTION, "local CUDA tree SHA-256 mismatch")
+
+
+@contextmanager
+def _local_cuda_toolchain_lock(toolchains_root: Path) -> Iterator[None]:
+    """project-local CUDA download/extract/publish를 process 간 직렬화한다."""
+    lock_path = toolchains_root / ".cuda-11.8.lock"
+    _reject_existing_symlink_chain(
+        lock_path, _CUDA_TOOLCHAIN_ACTION, "local CUDA lock"
+    )
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        _raise(_CUDA_TOOLCHAIN_ACTION, "local CUDA lock requires O_NOFOLLOW support")
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            str(lock_path),
+            os.O_RDWR
+            | os.O_CREAT
+            | no_follow
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            _raise(
+                _CUDA_TOOLCHAIN_ACTION,
+                "local CUDA lock must be a regular single-link file",
+            )
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        path_metadata = lock_path.lstat()
+        opened_metadata = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(path_metadata.st_mode)
+            or path_metadata.st_dev != opened_metadata.st_dev
+            or path_metadata.st_ino != opened_metadata.st_ino
+        ):
+            _raise(_CUDA_TOOLCHAIN_ACTION, "local CUDA lock changed during acquisition")
+        yield
+    except EnvironmentSetupError:
+        raise
+    except OSError as exc:
+        raise EnvironmentSetupError(
+            _CUDA_TOOLCHAIN_ACTION, f"cannot lock local CUDA toolchain: {lock_path}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _prepare_local_cuda_toolchain(
+    cuda_root: Path,
+    *,
+    packages: Sequence[_CudaDebPackage] = _CUDA_11_8_SPARSE_PACKAGES,
+    expected_tree_sha256: str = _CUDA_11_8_SPARSE_TREE_SHA256,
+    upgrade_from: Sequence[Sequence[_CudaDebPackage]] = (
+        _CUDA_11_8_COMPILER_PACKAGES_V1,
+    ),
+    downloader: Callable[[str, str | Path, int], Any] = (
+        _download_exact_cuda_package
+    ),
+    runner: Callable[..., Any] = subprocess.run,
+) -> Path:
+    """exact NVIDIA deb closure를 내려받아 project-local CUDA root로 atomic 게시한다."""
+    root = _canonical_absolute_posix_path(
+        cuda_root, "local CUDA Toolkit root", _CUDA_TOOLCHAIN_ACTION
+    )
+    if root.name != "cuda-11.8" or root.parent.name != ".toolchains":
+        _raise(
+            _CUDA_TOOLCHAIN_ACTION,
+            "local CUDA Toolkit must be .toolchains/cuda-11.8",
+        )
+    project_root = root.parent.parent
+    _require_real_directory(
+        project_root, _CUDA_TOOLCHAIN_ACTION, "local CUDA project root"
+    )
+    _ensure_real_directory(root.parent, _CUDA_TOOLCHAIN_ACTION, ".toolchains")
+    expected_manifest = _cuda_toolchain_manifest_bytes(packages)
+    if _SHA256.fullmatch(expected_tree_sha256) is None:
+        _raise(
+            _CUDA_TOOLCHAIN_ACTION,
+            "local CUDA tree SHA-256 declaration is invalid",
+        )
+    legacy_closures = tuple(tuple(closure) for closure in upgrade_from)
+    for closure in legacy_closures:
+        _cuda_toolchain_manifest_bytes(closure)
+
+    with _local_cuda_toolchain_lock(root.parent):
+        upgrade_required = False
+        try:
+            root.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise EnvironmentSetupError(
+                _CUDA_TOOLCHAIN_ACTION,
+                f"cannot inspect local CUDA Toolkit: {root}",
+            ) from exc
+        else:
+            try:
+                _validate_local_cuda_toolchain(
+                    root,
+                    packages,
+                    expected_tree_sha256=expected_tree_sha256,
+                )
+            except EnvironmentSetupError as current_error:
+                for legacy_packages in legacy_closures:
+                    try:
+                        observed_legacy_tree = _cuda_toolchain_tree_sha256(root)
+                        _validate_local_cuda_toolchain(
+                            root,
+                            legacy_packages,
+                            expected_tree_sha256=observed_legacy_tree,
+                        )
+                    except EnvironmentSetupError:
+                        continue
+                    upgrade_required = True
+                    break
+                if not upgrade_required:
+                    raise current_error
+            else:
+                return root
+
+        staging = Path(
+            tempfile.mkdtemp(prefix=".cuda-11.8.", dir=str(root.parent))
+        )
+        downloads = staging / "downloads"
+        extraction_root = staging / "extract"
+        downloads.mkdir()
+        extraction_root.mkdir()
+        try:
+            for package in packages:
+                destination = downloads / package.filename
+                try:
+                    downloader(
+                        _CUDA_REPOSITORY_URL + package.filename,
+                        destination,
+                        package.size,
+                    )
+                except Exception as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"cannot download CUDA package: {package.filename}",
+                    ) from exc
+                try:
+                    metadata = destination.lstat()
+                except OSError as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"CUDA package download is missing: {package.filename}",
+                    ) from exc
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_size != package.size
+                ):
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"CUDA package size mismatch: {package.filename}",
+                    )
+                observed = _sha256_cuda_package(destination, package.size)
+                if observed != package.sha256:
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        f"CUDA package SHA-256 mismatch: {package.filename}",
+                    )
+                _run_setup_command(
+                    runner,
+                    (
+                        "/usr/bin/dpkg-deb",
+                        "--extract",
+                        str(destination),
+                        str(extraction_root),
+                    ),
+                    _CUDA_TOOLCHAIN_ACTION,
+                    capture_output=True,
+                    timeout=60.0,
+                )
+
+            extracted = extraction_root / "usr" / "local" / "cuda-11.8"
+            _require_real_directory(
+                extracted, _CUDA_TOOLCHAIN_ACTION, "extracted CUDA 11.8 Toolkit"
+            )
+            manifest_path = extracted / _CUDA_TOOLCHAIN_MANIFEST
+            try:
+                with manifest_path.open("xb") as manifest:
+                    manifest.write(expected_manifest)
+                    manifest.flush()
+                    os.fsync(manifest.fileno())
+            except OSError as exc:
+                raise EnvironmentSetupError(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    "cannot write local CUDA toolchain manifest",
+                ) from exc
+            _validate_local_cuda_toolchain(
+                extracted,
+                packages,
+                expected_tree_sha256=expected_tree_sha256,
+            )
+            previous = staging / "previous-cuda-11.8"
+            failed = staging / "failed-cuda-11.8"
+            moved_previous = False
+            published = False
+            try:
+                if upgrade_required:
+                    os.rename(str(root), str(previous))
+                    moved_previous = True
+                os.rename(str(extracted), str(root))
+                published = True
+                _fsync_directory(
+                    root.parent, _CUDA_TOOLCHAIN_ACTION, ".toolchains"
+                )
+                _validate_local_cuda_toolchain(
+                    root,
+                    packages,
+                    expected_tree_sha256=expected_tree_sha256,
+                )
+            except BaseException as publish_error:
+                try:
+                    if published:
+                        os.rename(str(root), str(failed))
+                    if moved_previous:
+                        os.rename(str(previous), str(root))
+                    _fsync_directory(
+                        root.parent, _CUDA_TOOLCHAIN_ACTION, ".toolchains"
+                    )
+                except OSError as recovery_error:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "cannot restore previous local CUDA Toolkit after "
+                        "publish failure",
+                    ) from recovery_error
+                if isinstance(publish_error, EnvironmentSetupError):
+                    raise
+                raise EnvironmentSetupError(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    f"cannot publish local CUDA Toolkit: {root}",
+                ) from publish_error
+            if moved_previous:
+                try:
+                    shutil.rmtree(previous)
+                except OSError as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "cannot remove previous local CUDA Toolkit after upgrade",
+                    ) from exc
+                _fsync_directory(
+                    root.parent, _CUDA_TOOLCHAIN_ACTION, ".toolchains"
+                )
+            return root
+        finally:
+            try:
+                shutil.rmtree(staging)
+            except OSError:
+                pass
+
+
 def _require_preflight_regular_file(path: Path, context: str) -> None:
     """preflight 입력이 symlink가 아닌 기존 regular file인지 확인한다."""
     with _open_regular_file(path, _HOST_PREFLIGHT_ACTION, context):
@@ -803,9 +1605,46 @@ def _parse_compiler_version(output: str, context: str) -> tuple[int, int, int]:
     return tuple(int(component or 0) for component in match.groups())  # type: ignore[return-value]
 
 
+def _resolve_sparse_cuda_dependencies(
+    project_root: Path,
+    model_id: str,
+    dependencies: EnvironmentPreflightDependencies,
+) -> tuple[EnvironmentPreflightDependencies, bool]:
+    """unset CUDA paths를 project-local 11.8 root로 함께 해석한다."""
+    if model_id != "sparsedrive_v2":
+        return dependencies, False
+    if dependencies.cuda_root is None and dependencies.nvcc_path is None:
+        cuda_root = project_root / ".toolchains" / "cuda-11.8"
+        return (
+            replace(
+                dependencies,
+                cuda_root=cuda_root,
+                nvcc_path=cuda_root / "bin" / "nvcc",
+                cuda_tree_sha256=(
+                    dependencies.cuda_tree_sha256
+                    or _CUDA_11_8_SPARSE_TREE_SHA256
+                ),
+            ),
+            True,
+        )
+    if dependencies.cuda_root is None or dependencies.nvcc_path is None:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            "cuda_root and nvcc_path must both be set or both be unset",
+        )
+    if dependencies.cuda_tree_sha256 is not None:
+        _raise(
+            _HOST_PREFLIGHT_ACTION,
+            "cuda_tree_sha256 is only valid for project-local CUDA",
+        )
+    return dependencies, False
+
+
 def _validate_sparse_host(
     dependencies: EnvironmentPreflightDependencies,
     runner: Callable[..., Any],
+    *,
+    ignore_inherited_cuda_home: bool = False,
 ) -> None:
     """SparseDrive extension에 필요한 exact Toolkit, nvcc와 compiler를 검증한다."""
     cuda_root = _canonical_absolute_posix_path(
@@ -817,10 +1656,13 @@ def _validate_sparse_host(
         raise EnvironmentSetupError(
             _HOST_PREFLIGHT_ACTION, "cannot read CUDA_HOME"
         ) from exc
-    if cuda_home != str(cuda_root):
+    if (
+        not ignore_inherited_cuda_home
+        and cuda_home not in {None, str(cuda_root)}
+    ):
         _raise(
             _HOST_PREFLIGHT_ACTION,
-            f"CUDA_HOME must be exactly {cuda_root}",
+            f"CUDA_HOME must be unset or exactly {cuda_root}",
         )
     _require_real_directory(
         cuda_root, _HOST_PREFLIGHT_ACTION, "CUDA Toolkit 11.8"
@@ -878,6 +1720,7 @@ def preflight_environment(
     runner: Callable[..., Any] = subprocess.run,
     *,
     dependencies: Optional[EnvironmentPreflightDependencies] = None,
+    cuda_toolchain_preparer: Optional[Callable[[Path], Path]] = None,
 ) -> EnvironmentPreflight:
     """setup mutation 전에 project, host, ROS와 model prerequisite를 검증한다."""
     selected_dependencies = dependencies or EnvironmentPreflightDependencies()
@@ -890,6 +1733,9 @@ def preflight_environment(
         project_root, "project root", _HOST_PREFLIGHT_ACTION
     )
     _require_real_directory(root, _HOST_PREFLIGHT_ACTION, "project root")
+    selected_dependencies, uses_project_cuda = _resolve_sparse_cuda_dependencies(
+        root, model_id, selected_dependencies
+    )
     package_root = root / "src" / "Validator_pkg" / "validator_inference"
     profile_path = root / "src" / "Validator_pkg" / "config" / "profile.json"
     manifest_path = package_root / "config" / "model_environments.json"
@@ -967,7 +1813,43 @@ def preflight_environment(
             f"{model_id} declares cuda_policy=recommended"
         )
     if definition.cuda_policy == "extension_required":
-        _validate_sparse_host(selected_dependencies, runner)
+        if uses_project_cuda:
+            requested_root = _canonical_absolute_posix_path(
+                selected_dependencies.cuda_root,
+                "local CUDA Toolkit root",
+                _HOST_PREFLIGHT_ACTION,
+            )
+            expected_tree_sha256 = selected_dependencies.cuda_tree_sha256
+            if expected_tree_sha256 is None:
+                _raise(
+                    _CUDA_TOOLCHAIN_ACTION,
+                    "project-local CUDA tree SHA-256 is missing",
+                )
+            if cuda_toolchain_preparer is not None:
+                try:
+                    prepared_root = cuda_toolchain_preparer(requested_root)
+                except EnvironmentSetupError:
+                    raise
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    raise EnvironmentSetupError(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "local CUDA toolchain preparation failed",
+                    ) from exc
+                if prepared_root != requested_root:
+                    _raise(
+                        _CUDA_TOOLCHAIN_ACTION,
+                        "local CUDA toolchain preparer returned an unexpected path",
+                    )
+            _validate_local_cuda_toolchain(
+                requested_root,
+                _CUDA_11_8_SPARSE_PACKAGES,
+                expected_tree_sha256=expected_tree_sha256,
+            )
+        _validate_sparse_host(
+            selected_dependencies,
+            runner,
+            ignore_inherited_cuda_home=uses_project_cuda,
+        )
 
     return EnvironmentPreflight(
         root=root,
@@ -5280,13 +6162,25 @@ def _run_sparse_setup_action(
     _require_real_directory(ops, "sparse_extensions", "SparseDrive ops")
     build_directory = ops / "build"
     build_environment = _candidate_install_environment(candidate_python.parent.parent)
+    cuda_root = dependencies.preflight_dependencies.cuda_root
+    gcc_path = dependencies.preflight_dependencies.gcc_path
+    gxx_path = dependencies.preflight_dependencies.gxx_path
+    if (
+        cuda_root is None
+        or gcc_path is None
+        or gxx_path is None
+    ):
+        _raise("sparse_extensions", "validated SparseDrive toolchain paths are missing")
+    existing_path = build_environment.get("PATH", "")
     build_environment.update(
         {
-            "CUDA_HOME": str(dependencies.preflight_dependencies.cuda_root),
+            "CUDA_HOME": str(cuda_root),
             "FORCE_CUDA": "1",
             "TORCH_CUDA_ARCH_LIST": "8.6",
-            "CC": str(dependencies.preflight_dependencies.gcc_path),
-            "CXX": str(dependencies.preflight_dependencies.gxx_path),
+            "CC": str(gcc_path),
+            "CXX": str(gxx_path),
+            "PATH": str(cuda_root / "bin")
+            + (os.pathsep + existing_path if existing_path else ""),
         }
     )
     transaction.begin_build()
@@ -5310,6 +6204,7 @@ def _run_sparse_setup_action(
         _remove_created_sparse_build_tree(build_directory, build_descriptor)
     import_code = (
         "import importlib, json, pathlib, sys; "
+        "import torch; "
         "root = pathlib.Path(sys.argv[1]).resolve(); "
         "sys.path.insert(0, str(root)); "
         f"names = {_SPARSE_EXTENSION_MODULES!r}; "
@@ -6066,6 +6961,18 @@ def setup_environment(
         model_id,
         runner=runner,
         dependencies=selected_dependencies.preflight_dependencies,
+        cuda_toolchain_preparer=selected_dependencies.cuda_toolchain_preparer,
+    )
+    resolved_preflight_dependencies, _uses_project_cuda = (
+        _resolve_sparse_cuda_dependencies(
+            preflight.root,
+            model_id,
+            selected_dependencies.preflight_dependencies,
+        )
+    )
+    selected_dependencies = replace(
+        selected_dependencies,
+        preflight_dependencies=resolved_preflight_dependencies,
     )
     with model_operation_lock(preflight.paths):
         catkin_python = _build_catkin_messages(

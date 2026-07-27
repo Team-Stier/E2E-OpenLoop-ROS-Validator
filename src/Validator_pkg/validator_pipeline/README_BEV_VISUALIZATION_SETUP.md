@@ -381,7 +381,7 @@ Inference layer의 `/waypoints`는 `Lidar3D-4` frame으로 발행된다. BEV Vis
 ./openloop bag
 ```
 
-다른 모델은 해당 모델 환경 준비가 완료된 경우에만 `interfuser`를 해당 model ID로 바꾼다. SparseDrive V2를 선택하는 경우 `src/Validator_pkg/config/profile.json`의 front/left/right inline calibration(`K_original_3x3`, distortion metadata, `T_lidar_from_camera_4x4`)을 모두 채워야 한다. Bag에 `CameraInfo`가 없으므로 비어 있는 값을 임의로 만들지 않는다.
+다른 모델은 해당 모델 환경 준비가 완료된 경우에만 `interfuser`를 해당 model ID로 바꾼다. SparseDrive V2의 front/left/right inline calibration은 shipped profile에 포함되어 있다. Bag에는 `CameraInfo`가 없지만, 저장된 MORAI sensor JSON의 image size/FOV/principal point와 bag `/tf`를 함께 사용해 값을 확정했으므로 별도로 채울 항목은 없다.
 
 ### 고급 직접 launch
 

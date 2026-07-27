@@ -314,6 +314,49 @@ def test_fetch_dispatches_download_atomically_and_writes_manifest(tmp_path):
     assert manifest == tmp_path / "models/interfuser/asset-manifest.json"
 
 
+def test_fetch_hash_mismatch_is_not_published_and_retry_recovers(tmp_path):
+    """잘못된 HTTP body는 final에 남기지 않고 다음 setup이 다시 받을 수 있다."""
+    upstream = tmp_path / "upstream"
+    commit = _git_repo(upstream)
+    expected = b"exact helper"
+    profile = {
+        "id": "tfv6",
+        "source": {"repository": upstream.as_uri(), "commit": commit},
+        "runtime_assets": [
+            {
+                "role": "carla_helper",
+                "path": "models/sources/lead/3rd_party/helper.py",
+                "source_url": "file:///fixture/helper.py",
+                "sha256": hashlib.sha256(expected).hexdigest(),
+            }
+        ],
+    }
+    target = tmp_path / "models/sources/lead/3rd_party/helper.py"
+
+    with pytest.raises(AssetError, match="SHA-256 mismatch"):
+        fetch_runtime_assets(
+            profile,
+            model_id="tfv6",
+            project_root=tmp_path,
+            downloader=lambda _url, destination: Path(destination).write_bytes(
+                b"wrong HTTP 200 body"
+            ),
+        )
+
+    assert not target.exists()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"poisoned by an earlier setup")
+    fetch_runtime_assets(
+        profile,
+        model_id="tfv6",
+        project_root=tmp_path,
+        downloader=lambda _url, destination: Path(destination).write_bytes(
+            expected
+        ),
+    )
+    assert target.read_bytes() == expected
+
+
 def test_load_is_lazy_but_missing_source_failure_names_model_and_checkout(tmp_path):
     model = build_selected_model(
         _selected(

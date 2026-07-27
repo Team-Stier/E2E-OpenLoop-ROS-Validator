@@ -1,18 +1,23 @@
 """모델 interpreter와 ROS Noetic 사이의 경로·통신 계약을 검사한다."""
 
 import json
+import importlib.machinery
+import importlib.util
 import os
 import re
 import runpy
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+import types
 import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -31,6 +36,7 @@ from validator_inference.ros_compatibility import (
     RuntimePathPolicy,
     _build_message_fixtures,
     _extract_message_fields,
+    _loaded_module_origins,
     _policy_from_environment,
     _process_group_alive,
     _reserve_local_port,
@@ -136,6 +142,149 @@ def test_validate_loaded_module_origins_accepts_only_declared_runtime_roots():
         },
         policy,
     )
+
+
+def _install_fake_torch_generated_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """실제 Torch invariant를 모사한 owner-only generated module을 설치한다."""
+    name = "_remote_module_non_scriptable"
+    directory = tmp_path / "torch-generated"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    origin = directory / f"{name}.py"
+    template = (
+        "{assign_module_interface_cls}\n"
+        "{arg_types}\n"
+        "{arrow_and_return_type}\n"
+        "{arrow_and_future_return_type}\n"
+        "{args}\n"
+        "{kwargs}\n"
+        "{jit_script_decorator}\n"
+    )
+    expected = template.format(
+        assign_module_interface_cls="module_interface_cls = None",
+        args="*args",
+        kwargs="**kwargs",
+        arg_types="*args, **kwargs",
+        arrow_and_return_type="",
+        arrow_and_future_return_type="",
+        jit_script_decorator="",
+    )
+    origin.write_text(expected, encoding="utf-8")
+    origin.chmod(0o600)
+
+    generated = types.ModuleType(name)
+    loader = importlib.machinery.SourceFileLoader(name, str(origin))
+    specification = importlib.util.spec_from_loader(name, loader)
+    assert specification is not None
+    generated.__file__ = str(origin)
+    generated.__loader__ = loader
+    generated.__spec__ = specification
+
+    instantiator = types.ModuleType("torch.distributed.nn.jit.instantiator")
+    instantiator._FILE_PREFIX = "_remote_module_"
+    instantiator._TEMP_DIR = SimpleNamespace(name=str(directory))
+    instantiator.INSTANTIATED_TEMPLATE_DIR_PATH = str(directory)
+    instantiator.get_remote_module_template = lambda enabled: (
+        template if enabled is True else ""
+    )
+    remote_module = types.ModuleType("torch.distributed.nn.api.remote_module")
+    remote_module.instantiator = instantiator
+    remote_module._NON_SCRIPTABLE_REMOTE_MODULE_MODULE = generated
+
+    monkeypatch.setitem(sys.modules, name, generated)
+    monkeypatch.setitem(
+        sys.modules, "torch.distributed.nn.jit.instantiator", instantiator
+    )
+    monkeypatch.setitem(
+        sys.modules, "torch.distributed.nn.api.remote_module", remote_module
+    )
+    monkeypatch.syspath_prepend(str(directory))
+    return generated, remote_module, origin
+
+
+def test_loaded_module_origins_attests_exact_torch_generated_remote_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """살아 있는 pinned Torch template와 일치한 단일 임시 module만 분리한다."""
+    _install_fake_torch_generated_module(tmp_path, monkeypatch)
+
+    origins = _loaded_module_origins()
+
+    assert "_remote_module_non_scriptable" not in origins
+
+
+def test_loaded_module_origins_accepts_torch_file_from_standard_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """owner-only Torch tempdir 안의 일반 umask 022 source mode를 허용한다."""
+    _, _, origin = _install_fake_torch_generated_module(tmp_path, monkeypatch)
+    origin.chmod(0o644)
+
+    origins = _loaded_module_origins()
+
+    assert "_remote_module_non_scriptable" not in origins
+
+
+def test_loaded_module_origins_does_not_execute_dynamic_file_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """torch.classes 같은 namespace proxy의 __getattr__ 경로를 origin으로 오인하지 않는다."""
+    class DynamicModule(types.ModuleType):
+        def __getattr__(self, name):
+            if name == "__file__":
+                return str(tmp_path / "_classes.py")
+            raise AttributeError(name)
+
+    proxy = DynamicModule("torch.classes")
+    monkeypatch.setitem(sys.modules, "torch.classes", proxy)
+
+    origins = _loaded_module_origins()
+
+    assert "torch.classes" not in origins
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("identity", "source", "spec", "loader", "permissions"),
+)
+def test_loaded_module_origins_keeps_unattested_torch_temp_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+):
+    """이름이 같아도 Torch identity·bytes·path·권한 하나가 다르면 감사에서 뺄 수 없다."""
+    generated, remote_module, origin = _install_fake_torch_generated_module(
+        tmp_path, monkeypatch
+    )
+    if mutation == "identity":
+        remote_module._NON_SCRIPTABLE_REMOTE_MODULE_MODULE = types.ModuleType(
+            "_remote_module_non_scriptable"
+        )
+    elif mutation == "source":
+        origin.write_text("FOREIGN = True\n", encoding="utf-8")
+    elif mutation == "spec":
+        generated.__spec__.origin = str(origin.with_name("foreign.py"))
+    elif mutation == "loader":
+        generated.__loader__.path = str(origin.with_name("foreign.py"))
+    else:
+        origin.chmod(0o666)
+
+    origins = _loaded_module_origins()
+
+    assert origins["_remote_module_non_scriptable"] == str(origin)
+
+
+def test_validate_loaded_module_origins_still_rejects_named_torch_temp_file(
+    tmp_path: Path,
+):
+    """collector attestation 없이 같은 Torch 이름만 제시한 /tmp file은 허용하지 않는다."""
+    origin = tmp_path / "_remote_module_non_scriptable.py"
+    origin.write_text("FOREIGN = True\n", encoding="utf-8")
+
+    with pytest.raises(RosCompatibilityError, match="allowed runtime root"):
+        validate_loaded_module_origins(
+            {"_remote_module_non_scriptable": origin}, _path_policy()
+        )
 
 
 def test_validate_loaded_module_origins_accepts_only_exact_attested_source_native():
