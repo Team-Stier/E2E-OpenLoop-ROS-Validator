@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   std_msgs
   tf2_msgs
+  visualization_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -110,7 +111,7 @@ find_package(catkin REQUIRED COMPONENTS
 catkin_package(
 #  INCLUDE_DIRS include
 #  LIBRARIES Validator_pkg
-  CATKIN_DEPENDS cv_bridge message_filters morai_msgs nav_msgs rospy sensor_msgs std_msgs tf2_msgs
+  CATKIN_DEPENDS cv_bridge message_filters morai_msgs nav_msgs rospy sensor_msgs std_msgs tf2_msgs visualization_msgs
 #  DEPENDS system_lib
 )
 
@@ -208,7 +209,7 @@ include_directories(
 # endif()
 
 ## Add folders to be run by python nosetests
-# catkin_add_nosetests(test)
+catkin_add_nosetests(test)
 
 catkin_install_python(PROGRAMS
   scripts/image_adaptor.py
@@ -217,6 +218,7 @@ catkin_install_python(PROGRAMS
   scripts/left_bev_processor.py
   scripts/right_bev_processor.py
   scripts/lidar_bev_processor.py
+  scripts/lidar_attitude_debugger.py
   scripts/bev_overlay_viewer.py
   scripts/bev_visualizer.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

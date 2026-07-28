@@ -1,0 +1,31 @@
+<launch>
+  <arg name="show_rviz" default="true" />
+  <arg
+    name="config_path"
+    default="$(find Validator_pkg)/config/0716demo.json"
+  />
+  <arg
+    name="debug_config"
+    default="$(find Validator_pkg)/config/lidar_attitude_debug.yaml"
+  />
+
+  <node
+    pkg="Validator_pkg"
+    type="lidar_attitude_debugger.py"
+    name="lidar_attitude_debugger"
+    output="screen"
+    required="true"
+  >
+    <rosparam command="load" file="$(arg debug_config)" />
+    <param name="config_path" value="$(arg config_path)" />
+  </node>
+
+  <node
+    if="$(arg show_rviz)"
+    pkg="rviz"
+    type="rviz"
+    name="lidar_attitude_debug_rviz"
+    args="-d $(find Validator_pkg)/rviz/lidar_attitude_debug.rviz"
+    output="screen"
+  />
+</launch>
