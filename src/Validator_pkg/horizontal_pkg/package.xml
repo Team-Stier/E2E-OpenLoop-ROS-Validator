@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>horizontal_pkg</name>
+  <version>0.1.0</version>
+  <description>Offline IMU orientation analysis for LiDAR horizontalization.</description>
+
+  <maintainer email="stier@todo.todo">stier</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>rosbag</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_export_depend>rosbag</build_export_depend>
+  <build_export_depend>sensor_msgs</build_export_depend>
+  <exec_depend>rosbag</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+
+  <test_depend>python3-nose</test_depend>
+
+  <export/>
+</package>
