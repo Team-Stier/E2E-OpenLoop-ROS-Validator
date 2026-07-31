@@ -1,9 +1,12 @@
 """Extract roll and pitch from IMU orientation quaternions in a ROS bag."""
 
+import argparse
 import csv
 import math
 import os
 from pathlib import Path
+import statistics
+import sys
 import tempfile
 from dataclasses import dataclass
 
@@ -246,3 +249,158 @@ def write_csv_atomic(rows, output_path):
             except FileNotFoundError:
                 pass
         raise
+
+
+def analyze_bag(bag_path, imu_topic="/imu", bag_factory=None):
+    """Read one IMU topic and return consolidated orientation samples."""
+    bag_path = Path(bag_path)
+    if bag_factory is None:
+        if not bag_path.is_file():
+            raise AnalyzerError("bag file does not exist: {}".format(bag_path))
+        try:
+            import rosbag
+        except ImportError as error:
+            raise AnalyzerError(
+                "ROS Noetic rosbag is not available in this Python environment"
+            ) from error
+        bag_factory = rosbag.Bag
+
+    samples = []
+    try:
+        with bag_factory(str(bag_path), "r") as bag:
+            for _topic, message, record_time in bag.read_messages(
+                topics=[imu_topic]
+            ):
+                message_type = getattr(message, "_type", None)
+                if message_type != "sensor_msgs/Imu":
+                    raise AnalyzerError(
+                        "topic {} must contain sensor_msgs/Imu, got {}".format(
+                            imu_topic,
+                            message_type or type(message).__name__,
+                        )
+                    )
+                try:
+                    header = message.header
+                    orientation = message.orientation
+                    samples.append(
+                        RawOrientationSample(
+                            header_stamp_ns=int(header.stamp.to_nsec()),
+                            bag_record_stamp_ns=int(record_time.to_nsec()),
+                            seq=int(header.seq),
+                            frame_id=str(header.frame_id),
+                            qx=float(orientation.x),
+                            qy=float(orientation.y),
+                            qz=float(orientation.z),
+                            qw=float(orientation.w),
+                        )
+                    )
+                except (AttributeError, TypeError, ValueError) as error:
+                    raise AnalyzerError(
+                        "topic {} message does not satisfy sensor_msgs/Imu contract"
+                        .format(imu_topic)
+                    ) from error
+    except AnalyzerError:
+        raise
+    except Exception as error:
+        raise AnalyzerError(
+            "failed to read bag {}: {}".format(bag_path, error)
+        ) from error
+
+    if not samples:
+        raise AnalyzerError(
+            "topic {} was not found in {}".format(imu_topic, bag_path)
+        )
+    return consolidate_samples(samples)
+
+
+def format_summary(result, bag_path, imu_topic, output_path):
+    """Format deterministic counts and angle ranges for one completed run."""
+    rows = result.rows
+    stats = result.stats
+    roll_degrees = [math.degrees(row.roll_rad) for row in rows]
+    pitch_degrees = [math.degrees(row.pitch_rad) for row in rows]
+    duration_seconds = (
+        rows[-1].raw.header_stamp_ns - rows[0].raw.header_stamp_ns
+    ) / 1e9
+
+    lines = [
+        "bag={}".format(Path(bag_path)),
+        "imu_topic={}".format(imu_topic),
+        "output_csv={}".format(Path(output_path)),
+        "total_messages={}".format(stats.total_messages),
+        "unique_rows={}".format(len(rows)),
+        "duplicate_replacements={}".format(stats.duplicate_replacements),
+        "timestamp_reversals={}".format(stats.timestamp_reversals),
+        "zero_stamp_count={}".format(stats.zero_stamp_count),
+        "invalid_quaternion_count={}".format(
+            stats.invalid_quaternion_count
+        ),
+        "normalization_warning_count={}".format(
+            stats.normalization_warning_count
+        ),
+        "frame_ids={}".format(",".join(stats.frame_ids)),
+        "duration_s={:.6f}".format(duration_seconds),
+        "roll_deg min={:.6f} median={:.6f} max={:.6f}".format(
+            min(roll_degrees),
+            statistics.median(roll_degrees),
+            max(roll_degrees),
+        ),
+        "pitch_deg min={:.6f} median={:.6f} max={:.6f}".format(
+            min(pitch_degrees),
+            statistics.median(pitch_degrees),
+            max(pitch_degrees),
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _argument_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract roll and pitch from sensor_msgs/Imu orientation in a "
+            "ROS1 bag."
+        )
+    )
+    parser.add_argument("--bag", required=True, help="input ROS1 bag path")
+    parser.add_argument(
+        "--output-csv",
+        required=True,
+        help="destination CSV path",
+    )
+    parser.add_argument(
+        "--imu-topic",
+        default="/imu",
+        help="sensor_msgs/Imu topic (default: /imu)",
+    )
+    return parser
+
+
+def main(argv=None, bag_factory=None):
+    """Run the offline analyzer and return a process exit code."""
+    arguments = _argument_parser().parse_args(argv)
+    bag_path = Path(arguments.bag)
+    output_path = Path(arguments.output_csv)
+    try:
+        result = analyze_bag(
+            bag_path,
+            arguments.imu_topic,
+            bag_factory=bag_factory,
+        )
+        write_csv_atomic(result.rows, output_path)
+    except (AnalyzerError, OSError) as error:
+        print("error: {}".format(error), file=sys.stderr)
+        return 2
+
+    print(
+        format_summary(
+            result,
+            bag_path,
+            arguments.imu_topic,
+            output_path,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

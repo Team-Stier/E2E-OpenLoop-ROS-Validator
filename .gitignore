@@ -12,6 +12,7 @@ rosbag/*.bag
 
 # open-loop evaluation records
 records/openloop/*.csv
+records/horizontal/*.csv
 
 # Downloaded model weights and their auxiliary binary assets
 /models/*

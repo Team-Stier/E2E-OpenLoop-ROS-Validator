@@ -59,7 +59,7 @@ After a Catkin build and overlay source, the analyzer will run as a Python
 module:
 
 ```bash
-python3 -m horizontal_pkg.imu_orientation_analyzer \
+/usr/bin/python3 -m horizontal_pkg.imu_orientation_analyzer \
   --bag /absolute/path/to/input.bag \
   --output-csv /absolute/path/to/imu_roll_pitch.csv
 ```

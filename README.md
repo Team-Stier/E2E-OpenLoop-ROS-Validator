@@ -34,6 +34,7 @@ E2E-OpenLoop-ROS-Validator/
 │   ├── MORAI-ROS_morai_msgs
 │   └── Validator_pkg/                 # Catkin package group (package.xml 없음)
 │       ├── config/profile.json         # 세 layer가 공유하는 model contract
+│       ├── horizontal_pkg/             # offline IMU roll/pitch analyzer
 │       ├── validator_inference/        # ROS package: validator_inference
 │       ├── validator_msgs/             # ROS package: validator_msgs
 │       └── validator_pipeline/         # ROS package: Validator_pkg
@@ -42,8 +43,28 @@ E2E-OpenLoop-ROS-Validator/
 └── records/
     └── openloop/  # 평가별 inference_YYYYMMDDTHHMMSS+0900_{model_id}.csv
 ```
-`src/Validator_pkg` 자체는 package manifest를 두지 않는 그룹 디렉터리다. Catkin은 안의 세 sibling package를 각각 발견하며, preprocessing/visualization launch의 ROS package 이름은 기존 호환을 위해 `Validator_pkg`를 유지한다.
+`src/Validator_pkg` 자체는 package manifest를 두지 않는 그룹 디렉터리다. Catkin은 안의 네 sibling package를 각각 발견하며, preprocessing/visualization launch의 ROS package 이름은 기존 호환을 위해 `Validator_pkg`를 유지한다.
 `rosbag/`에 [2026-07-16-17-13-14.bag](https://drive.google.com/drive/folders/1IBFk-q1ZYYRfLVi6TD8P2BgOuWAzudab?usp=share_link)저장.
+
+### Offline IMU roll/pitch 분석
+
+`horizontal_pkg`는 rosbag의 `/imu` `orientation` quaternion을 원본
+`header.stamp` 기준 roll/pitch로 변환해 CSV로 저장한다. ROS 토픽을
+구독하거나 발행하지 않으며, LiDAR PointCloud와 모델 입력도 변경하지 않는다.
+
+```bash
+source /opt/ros/noetic/setup.bash
+catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3
+source devel/setup.bash
+/usr/bin/python3 -m horizontal_pkg.imu_orientation_analyzer \
+  --bag /home/stier/Rosbag/s01-sensor-domain__morai__map-kcity__wx-clear__tod-day__scenario-000__20260731T181003KST.bag \
+  --output-csv records/horizontal/imu_roll_pitch.csv
+```
+
+CSV에는 quaternion 원본값, roll/pitch radian·degree, sensor stamp와 bag
+record stamp가 기록된다. 이 결과는 IMU orientation을 확인하는 offline
+baseline이며, 아직 PointCloud 보상 방향이나 센서 좌표계를 검증한 결과는
+아니다.
 
 ## 2. Architecture
 ```mermaid

@@ -7,6 +7,8 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from contextlib import redirect_stderr, redirect_stdout
+import io
 
 from horizontal_pkg import imu_orientation_analyzer as analyzer
 
@@ -237,6 +239,171 @@ class CsvExportTest(SampleConsolidationTest):
 
             self.assertEqual(output.read_text(encoding="utf-8"), "previous\n")
             self.assertEqual(set(output.parent.iterdir()), files_before)
+
+
+class FakeTime:
+    def __init__(self, nanoseconds):
+        self.nanoseconds = nanoseconds
+
+    def to_nsec(self):
+        return self.nanoseconds
+
+
+class FakeHeader:
+    def __init__(self, stamp_ns, seq, frame_id="IMU-1"):
+        self.stamp = FakeTime(stamp_ns)
+        self.seq = seq
+        self.frame_id = frame_id
+
+
+class FakeOrientation:
+    def __init__(self, x=0.0, y=0.0, z=0.0, w=1.0):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.w = w
+
+
+class FakeImu:
+    _type = "sensor_msgs/Imu"
+
+    def __init__(self, stamp_ns, seq, frame_id="IMU-1"):
+        self.header = FakeHeader(stamp_ns, seq, frame_id)
+        self.orientation = FakeOrientation()
+
+
+class FakeWrongMessage(FakeImu):
+    _type = "geometry_msgs/PoseStamped"
+
+
+def bag_factory_for(records):
+    class FakeBag:
+        def __init__(self, _path, _mode):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _error_type, _error, _traceback):
+            return False
+
+        def read_messages(self, topics):
+            for topic, message, record_time in records:
+                if topic in topics:
+                    yield topic, message, record_time
+
+    return FakeBag
+
+
+class RosbagAnalysisTest(unittest.TestCase):
+    def analyze(self, records, topic="/imu"):
+        analyze_bag = getattr(analyzer, "analyze_bag", None)
+        self.assertIsNotNone(analyze_bag, "analyze_bag is not implemented")
+        return analyze_bag(
+            Path("input.bag"),
+            topic,
+            bag_factory=bag_factory_for(records),
+        )
+
+    def test_two_imu_messages_become_two_rows(self):
+        result = self.analyze(
+            [
+                ("/imu", FakeImu(10, 1), FakeTime(100)),
+                ("/imu", FakeImu(20, 2), FakeTime(200)),
+            ]
+        )
+
+        self.assertEqual(result.stats.total_messages, 2)
+        self.assertEqual(len(result.rows), 2)
+        self.assertEqual(result.rows[1].raw.bag_record_stamp_ns, 200)
+
+    def test_missing_topic_names_topic_and_bag(self):
+        with self.assertRaisesRegex(
+            analyzer.AnalyzerError,
+            r"topic /imu was not found in input\.bag",
+        ):
+            self.analyze([])
+
+    def test_incompatible_message_names_required_type(self):
+        with self.assertRaisesRegex(
+            analyzer.AnalyzerError,
+            "sensor_msgs/Imu",
+        ):
+            self.analyze(
+                [("/imu", FakeWrongMessage(10, 1), FakeTime(100))]
+            )
+
+    def test_summary_contains_counts_frames_and_angle_ranges(self):
+        result = self.analyze(
+            [
+                ("/imu", FakeImu(10, 1), FakeTime(100)),
+                ("/imu", FakeImu(20, 2), FakeTime(200)),
+            ]
+        )
+        format_summary = getattr(analyzer, "format_summary", None)
+        self.assertIsNotNone(
+            format_summary,
+            "format_summary is not implemented",
+        )
+
+        summary = format_summary(
+            result,
+            Path("input.bag"),
+            "/imu",
+            Path("output.csv"),
+        )
+
+        self.assertIn("total_messages=2", summary)
+        self.assertIn("unique_rows=2", summary)
+        self.assertIn("frame_ids=IMU-1", summary)
+        self.assertIn("roll_deg min=0.000000 median=0.000000 max=0.000000", summary)
+        self.assertIn("pitch_deg min=0.000000 median=0.000000 max=0.000000", summary)
+
+
+class CommandLineTest(unittest.TestCase):
+    def test_missing_bag_returns_two_and_prints_error(self):
+        main = getattr(analyzer, "main", None)
+        self.assertIsNotNone(main, "main is not implemented")
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.bag"
+            output = Path(directory) / "output.csv"
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "--bag",
+                        str(missing),
+                        "--output-csv",
+                        str(output),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("error:", stderr.getvalue())
+        self.assertIn("missing.bag", stderr.getvalue())
+
+    def test_successful_injected_bag_writes_csv_and_summary(self):
+        main = getattr(analyzer, "main", None)
+        self.assertIsNotNone(main, "main is not implemented")
+        records = [("/imu", FakeImu(10, 1), FakeTime(100))]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output.csv"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--bag",
+                        "input.bag",
+                        "--output-csv",
+                        str(output),
+                    ],
+                    bag_factory=bag_factory_for(records),
+                )
+
+            self.assertTrue(output.is_file())
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("unique_rows=1", stdout.getvalue())
 
 
 if __name__ == "__main__":

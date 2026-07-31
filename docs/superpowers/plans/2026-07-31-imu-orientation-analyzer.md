@@ -250,7 +250,7 @@ Add `records/horizontal/*.csv` to `.gitignore`. Add a README section showing:
 source /opt/ros/noetic/setup.bash
 catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3
 source devel/setup.bash
-python3 -m horizontal_pkg.imu_orientation_analyzer \
+/usr/bin/python3 -m horizontal_pkg.imu_orientation_analyzer \
   --bag /home/stier/Rosbag/s01-sensor-domain__morai__map-kcity__wx-clear__tod-day__scenario-000__20260731T181003KST.bag \
   --output-csv records/horizontal/imu_roll_pitch.csv
 ```
