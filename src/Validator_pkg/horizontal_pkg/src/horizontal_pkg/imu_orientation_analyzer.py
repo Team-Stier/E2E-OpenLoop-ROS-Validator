@@ -1,6 +1,10 @@
 """Extract roll and pitch from IMU orientation quaternions in a ROS bag."""
 
+import csv
 import math
+import os
+from pathlib import Path
+import tempfile
 from dataclasses import dataclass
 
 
@@ -20,6 +24,69 @@ class OrientationAngles:
     roll_rad: float
     pitch_rad: float
     normalization_warning: bool
+
+
+@dataclass(frozen=True)
+class RawOrientationSample:
+    """Raw bag and IMU header data required for one exported sample."""
+
+    header_stamp_ns: int
+    bag_record_stamp_ns: int
+    seq: int
+    frame_id: str
+    qx: float
+    qy: float
+    qz: float
+    qw: float
+
+
+@dataclass(frozen=True)
+class OrientationRow:
+    """Validated orientation values for one unique source timestamp."""
+
+    raw: RawOrientationSample
+    quaternion_norm: float
+    roll_rad: float
+    pitch_rad: float
+
+
+@dataclass(frozen=True)
+class AnalysisStats:
+    """Input-quality counters collected while consolidating IMU samples."""
+
+    total_messages: int
+    duplicate_replacements: int
+    timestamp_reversals: int
+    zero_stamp_count: int
+    invalid_quaternion_count: int
+    normalization_warning_count: int
+    frame_ids: tuple
+
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    """Chronological IMU rows and their source-quality counters."""
+
+    rows: tuple
+    stats: AnalysisStats
+
+
+CSV_FIELDS = (
+    "header_stamp_ns",
+    "elapsed_s",
+    "bag_record_stamp_ns",
+    "seq",
+    "frame_id",
+    "qx",
+    "qy",
+    "qz",
+    "qw",
+    "quaternion_norm",
+    "roll_rad",
+    "pitch_rad",
+    "roll_deg",
+    "pitch_deg",
+)
 
 
 def quaternion_to_roll_pitch(x, y, z, w):
@@ -53,3 +120,129 @@ def quaternion_to_roll_pitch(x, y, z, w):
         pitch_rad=pitch,
         normalization_warning=abs(norm - 1.0) > 1e-3,
     )
+
+
+def consolidate_samples(samples):
+    """Validate and consolidate IMU samples by original source timestamp."""
+    rows_by_stamp = {}
+    total_messages = 0
+    duplicate_replacements = 0
+    timestamp_reversals = 0
+    zero_stamp_count = 0
+    invalid_quaternion_count = 0
+    normalization_warning_count = 0
+    frame_ids = set()
+    previous_nonzero_stamp = None
+
+    for sample in samples:
+        total_messages += 1
+        stamp = int(sample.header_stamp_ns)
+        frame_ids.add(str(sample.frame_id))
+
+        if stamp == 0:
+            zero_stamp_count += 1
+            continue
+
+        if (
+            previous_nonzero_stamp is not None
+            and stamp < previous_nonzero_stamp
+        ):
+            timestamp_reversals += 1
+        previous_nonzero_stamp = stamp
+
+        try:
+            angles = quaternion_to_roll_pitch(
+                sample.qx,
+                sample.qy,
+                sample.qz,
+                sample.qw,
+            )
+        except InvalidQuaternionError:
+            invalid_quaternion_count += 1
+            continue
+
+        if angles.normalization_warning:
+            normalization_warning_count += 1
+        if stamp in rows_by_stamp:
+            duplicate_replacements += 1
+        rows_by_stamp[stamp] = OrientationRow(
+            raw=sample,
+            quaternion_norm=angles.quaternion_norm,
+            roll_rad=angles.roll_rad,
+            pitch_rad=angles.pitch_rad,
+        )
+
+    rows = tuple(rows_by_stamp[stamp] for stamp in sorted(rows_by_stamp))
+    if not rows:
+        raise AnalyzerError("no valid IMU orientation samples")
+
+    return AnalysisResult(
+        rows=rows,
+        stats=AnalysisStats(
+            total_messages=total_messages,
+            duplicate_replacements=duplicate_replacements,
+            timestamp_reversals=timestamp_reversals,
+            zero_stamp_count=zero_stamp_count,
+            invalid_quaternion_count=invalid_quaternion_count,
+            normalization_warning_count=normalization_warning_count,
+            frame_ids=tuple(sorted(frame_ids)),
+        ),
+    )
+
+
+def _csv_row(row, first_stamp_ns):
+    """Return one stable CSV mapping without losing nanosecond precision."""
+    raw = row.raw
+    return {
+        "header_stamp_ns": raw.header_stamp_ns,
+        "elapsed_s": repr((raw.header_stamp_ns - first_stamp_ns) / 1e9),
+        "bag_record_stamp_ns": raw.bag_record_stamp_ns,
+        "seq": raw.seq,
+        "frame_id": raw.frame_id,
+        "qx": repr(float(raw.qx)),
+        "qy": repr(float(raw.qy)),
+        "qz": repr(float(raw.qz)),
+        "qw": repr(float(raw.qw)),
+        "quaternion_norm": repr(row.quaternion_norm),
+        "roll_rad": repr(row.roll_rad),
+        "pitch_rad": repr(row.pitch_rad),
+        "roll_deg": repr(math.degrees(row.roll_rad)),
+        "pitch_deg": repr(math.degrees(row.pitch_rad)),
+    }
+
+
+def write_csv_atomic(rows, output_path):
+    """Atomically replace a CSV only after every orientation row is written."""
+    rows = tuple(rows)
+    if not rows:
+        raise AnalyzerError("cannot write an empty orientation CSV")
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=str(destination.parent),
+            prefix=".{}-".format(destination.name),
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            first_stamp_ns = rows[0].raw.header_stamp_ns
+            for row in rows:
+                writer.writerow(_csv_row(row, first_stamp_ns))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(str(temporary_path), str(destination))
+    except BaseException:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise

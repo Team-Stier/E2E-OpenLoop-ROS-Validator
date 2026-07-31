@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 
+import csv
 import math
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 from horizontal_pkg import imu_orientation_analyzer as analyzer
 
@@ -88,6 +93,150 @@ class QuaternionConversionTest(unittest.TestCase):
 
         with self.assertRaises(error_type):
             self.convert(math.nan, 0.0, 0.0, 1.0)
+
+
+class SampleConsolidationTest(unittest.TestCase):
+    def raw_sample(
+        self,
+        header_stamp_ns,
+        bag_record_stamp_ns,
+        seq,
+        frame_id="IMU-1",
+        quaternion=(0.0, 0.0, 0.0, 1.0),
+    ):
+        sample_type = getattr(analyzer, "RawOrientationSample", None)
+        self.assertIsNotNone(
+            sample_type,
+            "RawOrientationSample is not implemented",
+        )
+        return sample_type(
+            header_stamp_ns=header_stamp_ns,
+            bag_record_stamp_ns=bag_record_stamp_ns,
+            seq=seq,
+            frame_id=frame_id,
+            qx=quaternion[0],
+            qy=quaternion[1],
+            qz=quaternion[2],
+            qw=quaternion[3],
+        )
+
+    def example_result(self):
+        consolidate = getattr(analyzer, "consolidate_samples", None)
+        self.assertIsNotNone(
+            consolidate,
+            "consolidate_samples is not implemented",
+        )
+        samples = [
+            self.raw_sample(20, 200, 1),
+            self.raw_sample(10, 210, 2),
+            self.raw_sample(20, 220, 3, frame_id="IMU-new"),
+            self.raw_sample(0, 230, 4),
+            self.raw_sample(30, 240, 5, quaternion=(0.0, 0.0, 0.0, 0.0)),
+        ]
+        return consolidate(samples)
+
+    def test_samples_are_chronological_unique_and_last_duplicate_wins(self):
+        result = self.example_result()
+
+        self.assertEqual(
+            [row.raw.header_stamp_ns for row in result.rows],
+            [10, 20],
+        )
+        self.assertEqual(result.rows[1].raw.seq, 3)
+        self.assertEqual(result.rows[1].raw.frame_id, "IMU-new")
+
+    def test_sample_quality_counters_are_preserved(self):
+        result = self.example_result()
+
+        self.assertEqual(result.stats.total_messages, 5)
+        self.assertEqual(result.stats.duplicate_replacements, 1)
+        self.assertEqual(result.stats.timestamp_reversals, 1)
+        self.assertEqual(result.stats.zero_stamp_count, 1)
+        self.assertEqual(result.stats.invalid_quaternion_count, 1)
+        self.assertEqual(result.stats.normalization_warning_count, 0)
+        self.assertEqual(result.stats.frame_ids, ("IMU-1", "IMU-new"))
+
+    def test_no_valid_samples_is_an_error(self):
+        consolidate = getattr(analyzer, "consolidate_samples", None)
+        self.assertIsNotNone(
+            consolidate,
+            "consolidate_samples is not implemented",
+        )
+        samples = [
+            self.raw_sample(0, 100, 1),
+            self.raw_sample(10, 110, 2, quaternion=(0.0, 0.0, 0.0, 0.0)),
+        ]
+
+        with self.assertRaisesRegex(
+            analyzer.AnalyzerError,
+            "no valid IMU orientation samples",
+        ):
+            consolidate(samples)
+
+
+class CsvExportTest(SampleConsolidationTest):
+    EXPECTED_FIELDS = [
+        "header_stamp_ns",
+        "elapsed_s",
+        "bag_record_stamp_ns",
+        "seq",
+        "frame_id",
+        "qx",
+        "qy",
+        "qz",
+        "qw",
+        "quaternion_norm",
+        "roll_rad",
+        "pitch_rad",
+        "roll_deg",
+        "pitch_deg",
+    ]
+
+    def test_csv_schema_and_elapsed_time_are_exact(self):
+        write_csv = getattr(analyzer, "write_csv_atomic", None)
+        self.assertIsNotNone(
+            write_csv,
+            "write_csv_atomic is not implemented",
+        )
+        result = self.example_result()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nested" / "attitude.csv"
+            write_csv(result.rows, output)
+            with output.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                rows = list(reader)
+
+        self.assertEqual(reader.fieldnames, self.EXPECTED_FIELDS)
+        self.assertEqual(
+            [int(row["header_stamp_ns"]) for row in rows],
+            [10, 20],
+        )
+        self.assertEqual(float(rows[0]["elapsed_s"]), 0.0)
+        self.assertEqual(float(rows[1]["elapsed_s"]), 1e-8)
+
+    def test_failed_replace_preserves_destination_and_removes_temporary_file(self):
+        write_csv = getattr(analyzer, "write_csv_atomic", None)
+        self.assertIsNotNone(
+            write_csv,
+            "write_csv_atomic is not implemented",
+        )
+        result = self.example_result()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "attitude.csv"
+            output.write_text("previous\n", encoding="utf-8")
+            files_before = set(output.parent.iterdir())
+            with mock.patch.object(
+                os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    write_csv(result.rows, output)
+
+            self.assertEqual(output.read_text(encoding="utf-8"), "previous\n")
+            self.assertEqual(set(output.parent.iterdir()), files_before)
 
 
 if __name__ == "__main__":
