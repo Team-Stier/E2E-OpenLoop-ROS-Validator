@@ -48,7 +48,11 @@ class RenderConfig:
 
 @dataclass(frozen=True)
 class AnimationStats:
+    raw_frames: int
+    horizontal_frames: int
     paired_frames: int
+    raw_unmatched_count: int
+    horizontal_unmatched_count: int
     rendered_frames: int
     fps: int
     duration_s: float
@@ -367,11 +371,13 @@ def encode_animation(input_bag, output_mp4, fps=10, max_frames=600, config=Rende
     if int(fps) < 1 or int(max_frames) < 1:
         raise AnimationError("FPS and max frames must be positive")
     if pair_stamps_ns is not None:
-        stamps = tuple(pair_stamps_ns)
+        supplied = tuple(pair_stamps_ns)
+        pairing = summarize_topic_stamps(supplied, supplied)
     else:
-        stamps = collect_pair_stamps(
+        pairing = collect_pair_stamps(
             input_path, raw_topic, horizontal_topic
-        ).paired_stamps_ns
+        )
+    stamps = pairing.paired_stamps_ns
     choices = uniform_indices(len(stamps), min(len(stamps), int(max_frames)))
     selected = tuple(stamps[index] for index in choices)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -390,7 +396,17 @@ def encode_animation(input_bag, output_mp4, fps=10, max_frames=600, config=Rende
             temporary.unlink()
         except FileNotFoundError:
             pass
-    return AnimationStats(len(stamps), rendered, int(fps), rendered / float(fps), size)
+    return AnimationStats(
+        raw_frames=pairing.raw_count,
+        horizontal_frames=pairing.horizontal_count,
+        paired_frames=len(stamps),
+        raw_unmatched_count=pairing.raw_unmatched_count,
+        horizontal_unmatched_count=pairing.horizontal_unmatched_count,
+        rendered_frames=rendered,
+        fps=int(fps),
+        duration_s=rendered / float(fps),
+        output_bytes=size,
+    )
 
 
 def main(argv=None):
@@ -412,7 +428,20 @@ def main(argv=None):
     except AnimationError as error:
         print("error: {}".format(error))
         return 2
-    print("paired={} rendered={} fps={} duration_s={:.1f} bytes={}".format(stats.paired_frames, stats.rendered_frames, stats.fps, stats.duration_s, stats.output_bytes))
+    print(
+        "raw={} horizontal={} paired={} raw_unmatched={} "
+        "horizontal_unmatched={} rendered={} fps={} duration_s={:.1f} bytes={}".format(
+            stats.raw_frames,
+            stats.horizontal_frames,
+            stats.paired_frames,
+            stats.raw_unmatched_count,
+            stats.horizontal_unmatched_count,
+            stats.rendered_frames,
+            stats.fps,
+            stats.duration_s,
+            stats.output_bytes,
+        )
+    )
     return 0
 
 

@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from unittest import mock
 import json
+import io
+from contextlib import redirect_stdout
 
 import numpy as np
 import rosbag
@@ -144,6 +146,27 @@ class AtomicOutputTest(unittest.TestCase):
                 stats = animation.encode_animation("/virtual/input.bag", output, pair_stamps_ns=(1,))
             self.assertEqual(output.read_bytes(), b"video")
             self.assertEqual(stats.rendered_frames, 1)
+            self.assertEqual(stats.raw_unmatched_count, 0)
+            self.assertEqual(stats.horizontal_unmatched_count, 0)
+
+    def test_cli_prints_unmatched_pairing_summary(self):
+        stats = animation.AnimationStats(
+            raw_frames=10,
+            horizontal_frames=9,
+            paired_frames=8,
+            raw_unmatched_count=2,
+            horizontal_unmatched_count=1,
+            rendered_frames=8,
+            fps=10,
+            duration_s=0.8,
+            output_bytes=123,
+        )
+        output = io.StringIO()
+        with mock.patch.object(animation, "encode_animation", return_value=stats), redirect_stdout(output):
+            result = animation.main(["--input-bag", "in.bag", "--output-mp4", "out.mp4"])
+        self.assertEqual(result, 0)
+        self.assertIn("raw_unmatched=2", output.getvalue())
+        self.assertIn("horizontal_unmatched=1", output.getvalue())
 
     def test_ffprobe_checks_dimensions_frames_and_duration(self):
         valid = {"streams": [{"codec_name": "h264", "pix_fmt": "yuv420p", "width": 640, "height": 360, "nb_frames": "3", "duration": "0.3"}]}
