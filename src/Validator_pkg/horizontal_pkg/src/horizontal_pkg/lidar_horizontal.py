@@ -1,9 +1,15 @@
 """Create completely roll/pitch-leveled LiDAR clouds in an offline ROS bag."""
 
+import argparse
 from bisect import bisect_left
 import copy
 from dataclasses import dataclass
 import math
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
 
 import numpy as np
 
@@ -136,6 +142,18 @@ class ImuStats:
     zero_stamp_count: int
     invalid_quaternion_count: int
     normalization_warning_count: int
+
+
+@dataclass(frozen=True)
+class ProcessingStats:
+    """Counters and geometry from one successful bag conversion."""
+
+    imu_stats: ImuStats
+    extrinsics: Extrinsics
+    lidar_input_count: int
+    lidar_written_count: int
+    lidar_skipped_alignment_count: int
+    elapsed_s: float
 
 
 def _normalized_frame(frame):
@@ -364,3 +382,213 @@ def horizontalize_cloud(message, rotation, output_frame):
     output.header.frame_id = str(output_frame)
     output.data = bytes(payload)
     return output
+
+
+def _default_bag_factory(path, mode, compression=None):
+    import rosbag
+
+    if compression is None:
+        return rosbag.Bag(str(path), mode)
+    return rosbag.Bag(str(path), mode, compression=compression)
+
+
+def _temporary_bag_path(destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix=".{}-".format(destination.name),
+        suffix=".bag",
+        dir=str(destination.parent),
+        delete=False,
+    )
+    path = Path(handle.name)
+    handle.close()
+    return path
+
+
+def process_bag(
+    input_bag,
+    output_bag,
+    imu_topic="/imu",
+    lidar_topic="/lidar3D",
+    tf_topic="/tf",
+    output_topic="/lidar3D/horizontal",
+    output_frame="Lidar3D-4-horizontal",
+    cutoff_hz=4.0,
+    max_imu_gap_s=0.10,
+    base_frame="base_link",
+    imu_frame="IMU-1",
+    lidar_frame="Lidar3D-4",
+    bag_factory=None,
+):
+    """Copy a ROS bag and add timestamp-aligned horizontal LiDAR clouds."""
+    started = time.perf_counter()
+    input_path = Path(input_bag).expanduser().resolve(strict=False)
+    output_path = Path(output_bag).expanduser().resolve(strict=False)
+    if input_path == output_path:
+        raise HorizontalizationError("input and output bag paths must differ")
+    if bag_factory is None:
+        if not input_path.is_file():
+            raise HorizontalizationError(
+                "input bag does not exist: {}".format(input_path)
+            )
+        bag_factory = _default_bag_factory
+
+    imu_messages = []
+    tf_messages = []
+    try:
+        with bag_factory(str(input_path), "r") as source:
+            for topic, message, _ in source.read_messages(
+                topics=[imu_topic, tf_topic]
+            ):
+                if topic == imu_topic:
+                    imu_messages.append(message)
+                elif topic == tf_topic:
+                    tf_messages.append(message)
+    except HorizontalizationError:
+        raise
+    except Exception as error:
+        raise HorizontalizationError(
+            "failed to read input bag {}: {}".format(input_path, error)
+        ) from error
+
+    if not imu_messages:
+        raise HorizontalizationError(
+            "input bag is missing IMU topic {}".format(imu_topic)
+        )
+    if not tf_messages:
+        raise HorizontalizationError(
+            "input bag is missing TF topic {}".format(tf_topic)
+        )
+    timeline, imu_stats = prepare_attitude(imu_messages, cutoff_hz)
+    extrinsics = extract_extrinsics(
+        tf_messages,
+        base_frame,
+        imu_frame,
+        lidar_frame,
+    )
+
+    temporary = None
+    lidar_input_count = 0
+    lidar_written_count = 0
+    lidar_skipped_alignment_count = 0
+    try:
+        temporary = _temporary_bag_path(output_path)
+        with bag_factory(str(temporary), "w", compression="lz4") as destination:
+            with bag_factory(str(input_path), "r") as source:
+                for topic, message, record_time in source.read_messages():
+                    destination.write(topic, message, record_time)
+                    if topic != lidar_topic:
+                        continue
+                    lidar_input_count += 1
+                    stamp_ns = int(message.header.stamp.to_nsec())
+                    attitude = timeline.interpolate(stamp_ns, max_imu_gap_s)
+                    if attitude is None:
+                        lidar_skipped_alignment_count += 1
+                        continue
+                    roll_rad, pitch_rad = attitude
+                    rotation = level_rotation(
+                        roll_rad,
+                        pitch_rad,
+                        extrinsics.R_imu_from_lidar,
+                    )
+                    horizontal_cloud = horizontalize_cloud(
+                        message,
+                        rotation,
+                        output_frame,
+                    )
+                    destination.write(output_topic, horizontal_cloud, record_time)
+                    lidar_written_count += 1
+        if lidar_written_count == 0:
+            raise HorizontalizationError(
+                "horizontalization produced zero output LiDAR clouds"
+            )
+        os.replace(str(temporary), str(output_path))
+        temporary = None
+    except HorizontalizationError:
+        raise
+    except Exception as error:
+        raise HorizontalizationError(
+            "failed to write output bag {}: {}".format(output_path, error)
+        ) from error
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    return ProcessingStats(
+        imu_stats=imu_stats,
+        extrinsics=extrinsics,
+        lidar_input_count=lidar_input_count,
+        lidar_written_count=lidar_written_count,
+        lidar_skipped_alignment_count=lidar_skipped_alignment_count,
+        elapsed_s=time.perf_counter() - started,
+    )
+
+
+def build_argument_parser():
+    """Build the offline bag horizontalization parser."""
+    parser = argparse.ArgumentParser(
+        description="Add IMU-leveled LiDAR PointCloud2 messages to a ROS1 bag."
+    )
+    parser.add_argument("--input-bag", required=True)
+    parser.add_argument("--output-bag", required=True)
+    parser.add_argument("--imu-topic", default="/imu")
+    parser.add_argument("--lidar-topic", default="/lidar3D")
+    parser.add_argument("--tf-topic", default="/tf")
+    parser.add_argument("--output-topic", default="/lidar3D/horizontal")
+    parser.add_argument("--output-frame", default="Lidar3D-4-horizontal")
+    parser.add_argument("--cutoff-hz", type=float, default=4.0)
+    parser.add_argument("--max-imu-gap-s", type=float, default=0.10)
+    return parser
+
+
+def main(argv=None, bag_factory=None):
+    """Run the offline horizontalization CLI."""
+    arguments = build_argument_parser().parse_args(argv)
+    try:
+        stats = process_bag(
+            arguments.input_bag,
+            arguments.output_bag,
+            imu_topic=arguments.imu_topic,
+            lidar_topic=arguments.lidar_topic,
+            tf_topic=arguments.tf_topic,
+            output_topic=arguments.output_topic,
+            output_frame=arguments.output_frame,
+            cutoff_hz=arguments.cutoff_hz,
+            max_imu_gap_s=arguments.max_imu_gap_s,
+            bag_factory=bag_factory,
+        )
+    except HorizontalizationError as error:
+        print("error: {}".format(error), file=sys.stderr)
+        return 2
+
+    print(
+        "imu_total={} valid_unique={} duplicates={} invalid={} zero_stamp={}".format(
+            stats.imu_stats.total_messages,
+            stats.imu_stats.valid_unique_messages,
+            stats.imu_stats.duplicate_replacements,
+            stats.imu_stats.invalid_quaternion_count,
+            stats.imu_stats.zero_stamp_count,
+        )
+    )
+    print(
+        "lidar_input={} written={} skipped_alignment={}".format(
+            stats.lidar_input_count,
+            stats.lidar_written_count,
+            stats.lidar_skipped_alignment_count,
+        )
+    )
+    print(
+        "imu_from_lidar_translation_m={}".format(
+            stats.extrinsics.translation_imu_from_lidar_m.tolist()
+        )
+    )
+    print("elapsed_s={:.6f}".format(stats.elapsed_s))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

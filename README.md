@@ -84,6 +84,29 @@ source devel/setup.bash
 결과를 원래 timestamp로 되돌린다. 생성된 이미지는 필터 동작을 확인하는
 문서용 결과이며 LiDAR 수평 보상의 기하 정확도를 증명하지 않는다.
 
+필터링된 IMU roll/pitch 전체로 `/lidar3D`를 완전히 수평화하고, 원본
+메시지를 모두 보존한 새 bag에 `/lidar3D/horizontal` 토픽을 추가할 수
+있다. 센서 위치와 상대 회전은 입력 bag의 `/tf`에서 직접 검증·추출한다.
+
+```bash
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+/usr/bin/python3 -m horizontal_pkg.lidar_horizontal \
+  --input-bag /absolute/path/input.bag \
+  --output-bag /absolute/path/input_horizontal.bag \
+  --imu-topic /imu \
+  --lidar-topic /lidar3D \
+  --tf-topic /tf \
+  --output-topic /lidar3D/horizontal \
+  --output-frame Lidar3D-4-horizontal \
+  --cutoff-hz 4.0 \
+  --max-imu-gap-s 0.10
+```
+
+출력은 LiDAR 원점에서 roll/pitch를 완전히 제거하므로 차량 진동뿐 아니라
+실제 도로 경사도 제거한다. 원본 `/lidar3D`는 그대로 남으며, 파생 토픽의
+BEV 표시와 모델 입력 연결은 별도 검증 후 진행한다.
+
 ## 2. Architecture
 ```mermaid
 flowchart TD

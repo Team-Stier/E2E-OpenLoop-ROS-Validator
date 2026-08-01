@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import math
+import os
+from pathlib import Path
 import struct
+import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
+import rospy
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import Imu, PointCloud2, PointField
+from std_msgs.msg import String
 from tf2_msgs.msg import TFMessage
 
 from horizontal_pkg import lidar_horizontal as horizontal
@@ -364,6 +372,203 @@ class PointCloudTest(unittest.TestCase):
         message.data = message.data[:-1]
         with self.assertRaisesRegex(horizontal.HorizontalizationError, "payload"):
             horizontal.horizontalize_cloud(message, np.eye(3), "horizontal")
+
+
+class FakeBag:
+    def __init__(self, records=None):
+        self.records = list(records or [])
+        self.writes = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, error_type, error, traceback):
+        self.closed = True
+
+    def read_messages(self, topics=None):
+        selected = None if topics is None else set(topics)
+        for record in self.records:
+            if selected is None or record[0] in selected:
+                yield record
+
+    def write(self, topic, message, timestamp):
+        self.writes.append((topic, message, timestamp))
+
+
+class FakeBagFactory:
+    def __init__(self, records):
+        self.records = records
+        self.read_bags = []
+        self.write_bags = []
+        self.calls = []
+
+    def __call__(self, path, mode, compression=None):
+        self.calls.append((path, mode, compression))
+        if mode == "r":
+            bag = FakeBag(self.records)
+            self.read_bags.append(bag)
+            return bag
+        bag = FakeBag()
+        self.write_bags.append(bag)
+        return bag
+
+
+def set_cloud_stamp(message, stamp_ns):
+    message.header.stamp.secs = stamp_ns // 1_000_000_000
+    message.header.stamp.nsecs = stamp_ns % 1_000_000_000
+    return message
+
+
+class BagPipelineTest(unittest.TestCase):
+    def records(self, include_tf=True, aligned=True):
+        records = []
+        if include_tf:
+            for index, message in enumerate(ExtrinsicsTest().messages()):
+                records.append(("/tf", message, rospy.Time.from_sec(0.01 * index)))
+        for index in range(24):
+            stamp_ns = (index + 1) * 25_000_000
+            records.append(
+                (
+                    "/imu",
+                    imu_message(stamp_ns, roll_rad=0.05, pitch_rad=-0.02),
+                    rospy.Time.from_sec(0.1 + index * 0.025),
+                )
+            )
+        lidar_stamp = 300_000_000 if aligned else 2_000_000_000
+        records.append(
+            (
+                "/lidar3D",
+                set_cloud_stamp(cloud_message(), lidar_stamp),
+                rospy.Time.from_sec(1.0),
+            )
+        )
+        records.append(("/other", String(data="preserve"), rospy.Time.from_sec(1.1)))
+        return records
+
+    def test_pipeline_copies_records_and_inserts_horizontal_cloud(self):
+        records = self.records()
+        factory = FakeBagFactory(records)
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "horizontal.bag"
+
+            stats = horizontal.process_bag(
+                "/virtual/input.bag",
+                output_path,
+                bag_factory=factory,
+            )
+
+            writes = factory.write_bags[0].writes
+            self.assertEqual(len(factory.read_bags), 2)
+            self.assertTrue(all(bag.closed for bag in factory.read_bags))
+            self.assertTrue(factory.write_bags[0].closed)
+            self.assertEqual(len(writes), len(records) + 1)
+            raw_index = next(i for i, row in enumerate(writes) if row[0] == "/lidar3D")
+            derived = writes[raw_index + 1]
+            self.assertEqual(derived[0], "/lidar3D/horizontal")
+            self.assertEqual(derived[2], writes[raw_index][2])
+            self.assertEqual(
+                derived[1].header.stamp,
+                writes[raw_index][1].header.stamp,
+            )
+            self.assertEqual(derived[1].header.frame_id, "Lidar3D-4-horizontal")
+            self.assertEqual(stats.lidar_input_count, 1)
+            self.assertEqual(stats.lidar_written_count, 1)
+            self.assertEqual(stats.lidar_skipped_alignment_count, 0)
+            self.assertTrue(output_path.exists())
+            write_calls = [call for call in factory.calls if call[1] == "w"]
+            self.assertEqual(write_calls[0][2], "lz4")
+
+    def test_unaligned_cloud_is_skipped_and_zero_output_fails(self):
+        factory = FakeBagFactory(self.records(aligned=False))
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "horizontal.bag"
+            with self.assertRaisesRegex(horizontal.HorizontalizationError, "zero"):
+                horizontal.process_bag(
+                    "/virtual/input.bag",
+                    output_path,
+                    bag_factory=factory,
+                )
+            self.assertFalse(output_path.exists())
+
+    def test_missing_tf_is_rejected_before_output_open(self):
+        factory = FakeBagFactory(self.records(include_tf=False))
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(horizontal.HorizontalizationError, "TF"):
+                horizontal.process_bag(
+                    "/virtual/input.bag",
+                    Path(directory) / "horizontal.bag",
+                    bag_factory=factory,
+                )
+            self.assertEqual(factory.write_bags, [])
+
+    def test_input_and_output_paths_must_differ(self):
+        factory = FakeBagFactory(self.records())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "same.bag"
+            with self.assertRaisesRegex(horizontal.HorizontalizationError, "differ"):
+                horizontal.process_bag(path, path, bag_factory=factory)
+
+    def test_failed_replace_preserves_destination_and_removes_temporary(self):
+        factory = FakeBagFactory(self.records())
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "horizontal.bag"
+            output_path.write_bytes(b"old")
+            before = set(os.listdir(directory))
+            with mock.patch.object(
+                horizontal.os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaisesRegex(
+                    horizontal.HorizontalizationError,
+                    "failed to write output bag",
+                ):
+                    horizontal.process_bag(
+                        "/virtual/input.bag",
+                        output_path,
+                        bag_factory=factory,
+                    )
+            self.assertEqual(output_path.read_bytes(), b"old")
+            self.assertEqual(set(os.listdir(directory)), before)
+
+
+class CommandLineTest(unittest.TestCase):
+    def test_cli_success_reports_counts_and_extrinsics(self):
+        factory = FakeBagFactory(BagPipelineTest().records())
+        with tempfile.TemporaryDirectory() as directory:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = horizontal.main(
+                    [
+                        "--input-bag",
+                        "/virtual/input.bag",
+                        "--output-bag",
+                        str(Path(directory) / "horizontal.bag"),
+                    ],
+                    bag_factory=factory,
+                )
+            self.assertEqual(exit_code, 0)
+            summary = stdout.getvalue()
+            self.assertIn("lidar_input=1 written=1 skipped_alignment=0", summary)
+            self.assertIn("imu_from_lidar_translation_m=[0.0, 0.0, 0.75]", summary)
+
+    def test_cli_expected_error_returns_two(self):
+        factory = FakeBagFactory(BagPipelineTest().records(include_tf=False))
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with redirect_stderr(stderr):
+                exit_code = horizontal.main(
+                    [
+                        "--input-bag",
+                        "/virtual/input.bag",
+                        "--output-bag",
+                        str(Path(directory) / "horizontal.bag"),
+                    ],
+                    bag_factory=factory,
+                )
+        self.assertEqual(exit_code, 2)
+        self.assertIn("error:", stderr.getvalue())
 
 
 if __name__ == "__main__":

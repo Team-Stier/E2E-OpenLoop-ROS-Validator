@@ -11,14 +11,18 @@
 
   <build_depend>rosbag</build_depend>
   <build_depend>sensor_msgs</build_depend>
+  <build_depend>tf2_msgs</build_depend>
   <build_export_depend>rosbag</build_export_depend>
   <build_export_depend>sensor_msgs</build_export_depend>
+  <build_export_depend>tf2_msgs</build_export_depend>
   <exec_depend>rosbag</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
 
+  <test_depend>geometry_msgs</test_depend>
   <test_depend>python3-matplotlib</test_depend>
   <test_depend>python3-nose</test_depend>
   <test_depend>python3-numpy</test_depend>
