@@ -6,8 +6,10 @@ import struct
 import tempfile
 import unittest
 from unittest import mock
+import json
 
 import numpy as np
+import rosbag
 from sensor_msgs.msg import PointCloud2, PointField
 
 from horizontal_pkg import lidar_comparison_animation as animation
@@ -68,6 +70,14 @@ class SamplingTest(unittest.TestCase):
         with self.assertRaisesRegex(animation.AnimationError, "layout"):
             animation.validate_pair(cloud(), changed)
 
+    def test_pair_summary_counts_unmatched_and_rejects_duplicates(self):
+        summary = animation.summarize_topic_stamps((1, 2, 3), (2, 3, 4))
+        self.assertEqual(summary.paired_stamps_ns, (2, 3))
+        self.assertEqual(summary.raw_unmatched_count, 1)
+        self.assertEqual(summary.horizontal_unmatched_count, 1)
+        with self.assertRaisesRegex(animation.AnimationError, "duplicate"):
+            animation.summarize_topic_stamps((1, 1), (1,))
+
 
 class RenderingTest(unittest.TestCase):
     def test_approved_colors_and_dark_background_are_fixed(self):
@@ -82,6 +92,14 @@ class RenderingTest(unittest.TestCase):
         frame = animation.render_frame(raw, horizontal, "frame 1", config)
         self.assertEqual(frame.shape, (360, 640, 3))
         self.assertEqual(frame.dtype, np.uint8)
+
+    def test_legend_handles_are_forced_opaque(self):
+        handles = [mock.Mock(), mock.Mock()]
+        legend = mock.Mock(legend_handles=handles)
+        legend.get_texts.return_value = []
+        animation._style_legend(legend)
+        for handle in handles:
+            handle.set_alpha.assert_called_once_with(1.0)
 
 
 class AtomicOutputTest(unittest.TestCase):
@@ -113,6 +131,65 @@ class AtomicOutputTest(unittest.TestCase):
                     )
             self.assertEqual(output.read_bytes(), b"existing")
             self.assertEqual(set(Path(directory).iterdir()), before)
+
+    def test_success_atomically_replaces_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "comparison.mp4"
+            output.write_bytes(b"existing")
+            def fake_encode(_input, temporary, *_args):
+                temporary.write_bytes(b"video")
+                return 1
+            with mock.patch.object(animation, "_encode_selected_pairs", side_effect=fake_encode), mock.patch.object(animation, "_validate_video"):
+                stats = animation.encode_animation("/virtual/input.bag", output, pair_stamps_ns=(1,))
+            self.assertEqual(output.read_bytes(), b"video")
+            self.assertEqual(stats.rendered_frames, 1)
+
+    def test_ffprobe_checks_dimensions_frames_and_duration(self):
+        valid = {"streams": [{"codec_name": "h264", "pix_fmt": "yuv420p", "width": 640, "height": 360, "nb_frames": "3", "duration": "0.3"}]}
+        completed = mock.Mock(returncode=0, stdout=json.dumps(valid), stderr="")
+        with mock.patch.object(animation.subprocess, "run", return_value=completed):
+            animation._validate_video(Path("x.mp4"), animation.RenderConfig(width_px=640, height_px=360), 3)
+        invalid = dict(valid)
+        invalid["streams"] = [dict(valid["streams"][0], width=1280)]
+        completed.stdout = json.dumps(invalid)
+        with mock.patch.object(animation.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(animation.AnimationError, "metadata"):
+                animation._validate_video(Path("x.mp4"), animation.RenderConfig(width_px=640, height_px=360), 3)
+
+    def test_missing_ffprobe_is_reported_as_animation_error(self):
+        with mock.patch.object(animation.subprocess, "run", side_effect=FileNotFoundError("ffprobe")):
+            with self.assertRaisesRegex(animation.AnimationError, "ffprobe.*not available"):
+                animation._validate_video(Path("x.mp4"), animation.RenderConfig(), 1)
+
+    def test_missing_ffmpeg_is_reported_as_animation_error(self):
+        with mock.patch.object(animation.subprocess, "Popen", side_effect=FileNotFoundError("ffmpeg")):
+            with self.assertRaisesRegex(animation.AnimationError, "ffmpeg.*not available"):
+                animation._encode_selected_pairs(
+                    "/virtual/input.bag", Path("x.mp4"), (1,),
+                    "/lidar3D", "/lidar3D/horizontal", 10,
+                    animation.RenderConfig(),
+                )
+
+    def test_broken_ffmpeg_pipe_is_cleaned_up(self):
+        process = mock.Mock()
+        process.stdin.closed = False
+        process.stdin.write.side_effect = BrokenPipeError("closed")
+        process.poll.return_value = None
+        bag = mock.MagicMock()
+        bag.__enter__.return_value = bag
+        bag.read_messages.return_value = [
+            ("/lidar3D", cloud(1), None),
+            ("/lidar3D/horizontal", cloud(1, "Lidar3D-4-horizontal", 0.1), None),
+        ]
+        with mock.patch.object(animation.subprocess, "Popen", return_value=process), mock.patch("rosbag.Bag", return_value=bag):
+            with self.assertRaisesRegex(animation.AnimationError, "closed its input"):
+                animation._encode_selected_pairs(
+                    "/virtual/input.bag", Path("x.mp4"), (1,),
+                    "/lidar3D", "/lidar3D/horizontal", 10,
+                    animation.RenderConfig(),
+                )
+        process.kill.assert_called_once()
+        process.wait.assert_called()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 """Render an offline raw-versus-horizontalized LiDAR comparison MP4."""
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
+import json
 import math
 import os
 from pathlib import Path
@@ -51,6 +53,15 @@ class AnimationStats:
     fps: int
     duration_s: float
     output_bytes: int
+
+
+@dataclass(frozen=True)
+class PairingSummary:
+    paired_stamps_ns: tuple
+    raw_count: int
+    horizontal_count: int
+    raw_unmatched_count: int
+    horizontal_unmatched_count: int
 
 
 def _field_map(message):
@@ -159,6 +170,16 @@ def _style_axis(axis, xlabel, ylabel, x_limits, z_limits):
         spine.set_color(GRID_COLOR)
 
 
+def _style_legend(legend):
+    for text in legend.get_texts():
+        text.set_color(TEXT_COLOR)
+    handles = getattr(legend, "legend_handles", None)
+    if handles is None:
+        handles = getattr(legend, "legendHandles", ())
+    for handle in handles:
+        handle.set_alpha(1.0)
+
+
 def render_frame(raw_xyz, horizontal_xyz, metadata, config=RenderConfig()):
     """Render one fixed-geometry side/front overlay as an RGB image."""
     indices = matching_point_indices(raw_xyz, horizontal_xyz, config.max_points)
@@ -180,8 +201,7 @@ def render_frame(raw_xyz, horizontal_xyz, metadata, config=RenderConfig()):
         axis.scatter(raw[:, horizontal_index], raw[:, 2], s=1.1, c=RAW_COLOR, alpha=0.48, linewidths=0, label="Raw /lidar3D")
         axis.scatter(horizontal[:, horizontal_index], horizontal[:, 2], s=1.1, c=HORIZONTAL_COLOR, alpha=0.58, linewidths=0, label="Horizontalized")
         legend = axis.legend(loc="upper right", facecolor="#202631", edgecolor=GRID_COLOR, framealpha=0.95)
-        for text in legend.get_texts():
-            text.set_color(TEXT_COLOR)
+        _style_legend(legend)
     figure.suptitle(str(metadata), color=TEXT_COLOR, fontsize=12)
     figure.tight_layout(rect=(0, 0, 1, 0.95))
     figure.canvas.draw()
@@ -191,20 +211,46 @@ def render_frame(raw_xyz, horizontal_xyz, metadata, config=RenderConfig()):
     return rgb
 
 
+def summarize_topic_stamps(raw_stamps, horizontal_stamps):
+    """Validate timestamp uniqueness and summarize exact topic pairing."""
+    raw = tuple(int(value) for value in raw_stamps)
+    horizontal = tuple(int(value) for value in horizontal_stamps)
+    if any(count > 1 for count in Counter(raw).values()):
+        raise AnimationError("raw LiDAR topic contains duplicate header stamps")
+    if any(count > 1 for count in Counter(horizontal).values()):
+        raise AnimationError("horizontal LiDAR topic contains duplicate header stamps")
+    raw_set = set(raw)
+    horizontal_set = set(horizontal)
+    paired = tuple(sorted(raw_set & horizontal_set))
+    return PairingSummary(
+        paired_stamps_ns=paired,
+        raw_count=len(raw),
+        horizontal_count=len(horizontal),
+        raw_unmatched_count=len(raw_set - horizontal_set),
+        horizontal_unmatched_count=len(horizontal_set - raw_set),
+    )
+
+
 def collect_pair_stamps(input_bag, raw_topic, horizontal_topic):
-    """Collect sorted header stamps present on both required topics."""
+    """Collect and summarize exact header-stamp pairs from both topics."""
     try:
         import rosbag
-        stamps = {raw_topic: set(), horizontal_topic: set()}
+        stamps = {raw_topic: [], horizontal_topic: []}
         with rosbag.Bag(str(input_bag), "r") as bag:
             for topic, message, _ in bag.read_messages(topics=list(stamps)):
-                stamps[topic].add(int(message.header.stamp.to_nsec()))
+                stamps[topic].append(int(message.header.stamp.to_nsec()))
     except Exception as error:
         raise AnimationError("failed to read input bag: {}".format(error)) from error
-    paired = tuple(sorted(stamps[raw_topic] & stamps[horizontal_topic]))
-    if not paired:
+    if not stamps[raw_topic]:
+        raise AnimationError("bag is missing raw LiDAR topic {}".format(raw_topic))
+    if not stamps[horizontal_topic]:
+        raise AnimationError(
+            "bag is missing horizontal LiDAR topic {}".format(horizontal_topic)
+        )
+    summary = summarize_topic_stamps(stamps[raw_topic], stamps[horizontal_topic])
+    if not summary.paired_stamps_ns:
         raise AnimationError("bag contains no timestamp-paired LiDAR frames")
-    return paired
+    return summary
 
 
 def _ffmpeg_command(output_path, config, fps):
@@ -224,55 +270,90 @@ def _encode_selected_pairs(input_bag, temporary, selected_stamps, raw_topic, hor
     selected = set(selected_stamps)
     pending = {}
     rendered = 0
-    process = subprocess.Popen(_ffmpeg_command(temporary, config, fps), stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        with rosbag.Bag(str(input_bag), "r") as bag:
-            for topic, message, _ in bag.read_messages(topics=[raw_topic, horizontal_topic]):
-                stamp = int(message.header.stamp.to_nsec())
-                if stamp not in selected:
-                    continue
-                pair = pending.setdefault(stamp, {})
-                pair[topic] = message
-                if raw_topic not in pair or horizontal_topic not in pair:
-                    continue
-                raw_message = pair[raw_topic]
-                horizontal_message = pair[horizontal_topic]
-                validate_pair(raw_message, horizontal_message)
-                raw_xyz = extract_xyz(raw_message)
-                horizontal_xyz = extract_xyz(horizontal_message)
-                metadata = "Frame {:04d}/{:04d}   stamp {:.3f} s   paired points {:,}".format(
-                    rendered + 1, len(selected_stamps), stamp / 1e9,
-                    len(matching_point_indices(raw_xyz, horizontal_xyz, config.max_points)),
-                )
-                frame = render_frame(raw_xyz, horizontal_xyz, metadata, config)
-                process.stdin.write(frame.tobytes())
-                rendered += 1
-                del pending[stamp]
-        process.stdin.close()
-        stderr = process.stderr.read().decode("utf-8", errors="replace")
-        return_code = process.wait()
-        if return_code != 0:
-            raise AnimationError("ffmpeg failed: {}".format(stderr.strip()))
-    except Exception:
-        if process.stdin and not process.stdin.closed:
+    process = None
+    with tempfile.TemporaryFile() as error_log:
+        try:
+            process = subprocess.Popen(
+                _ffmpeg_command(temporary, config, fps),
+                stdin=subprocess.PIPE,
+                stderr=error_log,
+            )
+            with rosbag.Bag(str(input_bag), "r") as bag:
+                for topic, message, _ in bag.read_messages(topics=[raw_topic, horizontal_topic]):
+                    stamp = int(message.header.stamp.to_nsec())
+                    if stamp not in selected:
+                        continue
+                    pair = pending.setdefault(stamp, {})
+                    pair[topic] = message
+                    if raw_topic not in pair or horizontal_topic not in pair:
+                        continue
+                    raw_message = pair[raw_topic]
+                    horizontal_message = pair[horizontal_topic]
+                    validate_pair(raw_message, horizontal_message)
+                    raw_xyz = extract_xyz(raw_message)
+                    horizontal_xyz = extract_xyz(horizontal_message)
+                    metadata = "Frame {:04d}/{:04d}   stamp {:.3f} s   paired points {:,}".format(
+                        rendered + 1, len(selected_stamps), stamp / 1e9,
+                        len(matching_point_indices(raw_xyz, horizontal_xyz, config.max_points)),
+                    )
+                    frame = render_frame(raw_xyz, horizontal_xyz, metadata, config)
+                    process.stdin.write(frame.tobytes())
+                    rendered += 1
+                    del pending[stamp]
             process.stdin.close()
-        process.kill()
-        process.wait()
-        raise
+            return_code = process.wait()
+            error_log.seek(0)
+            stderr = error_log.read().decode("utf-8", errors="replace")
+            if return_code != 0:
+                raise AnimationError("ffmpeg failed: {}".format(stderr.strip()))
+        except FileNotFoundError as error:
+            raise AnimationError("ffmpeg is not available") from error
+        except BrokenPipeError as error:
+            error_log.seek(0)
+            stderr = error_log.read().decode("utf-8", errors="replace")
+            raise AnimationError(
+                "ffmpeg closed its input: {}".format(stderr.strip())
+            ) from error
+        finally:
+            if process is not None and process.poll() is None:
+                try:
+                    if process.stdin and not process.stdin.closed:
+                        process.stdin.close()
+                except BrokenPipeError:
+                    pass
+                process.kill()
+                process.wait()
     if rendered != len(selected_stamps):
         raise AnimationError("rendered {} of {} selected frame pairs".format(rendered, len(selected_stamps)))
     return rendered
 
 
-def _validate_video(path):
+def _validate_video(path, config, expected_frames):
     command = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,pix_fmt,width,height,nb_frames",
-        "-of", "default=noprint_wrappers=1", str(path),
+        "-show_entries", "stream=codec_name,pix_fmt,width,height,nb_frames,duration",
+        "-of", "json", str(path),
     ]
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 or "codec_name=h264" not in result.stdout or "pix_fmt=yuv420p" not in result.stdout:
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as error:
+        raise AnimationError("ffprobe is not available") from error
+    if result.returncode != 0:
         raise AnimationError("ffprobe validation failed: {}".format(result.stderr.strip()))
+    try:
+        stream = json.loads(result.stdout)["streams"][0]
+        valid = (
+            stream["codec_name"] == "h264"
+            and stream["pix_fmt"] == "yuv420p"
+            and int(stream["width"]) == config.width_px
+            and int(stream["height"]) == config.height_px
+            and int(stream["nb_frames"]) == int(expected_frames)
+            and float(stream["duration"]) > 0.0
+        )
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        valid = False
+    if not valid:
+        raise AnimationError("ffprobe metadata does not match render contract")
 
 
 def encode_animation(input_bag, output_mp4, fps=10, max_frames=600, config=RenderConfig(), raw_topic="/lidar3D", horizontal_topic="/lidar3D/horizontal", pair_stamps_ns=None):
@@ -283,7 +364,12 @@ def encode_animation(input_bag, output_mp4, fps=10, max_frames=600, config=Rende
         raise AnimationError("input bag does not exist: {}".format(input_path))
     if int(fps) < 1 or int(max_frames) < 1:
         raise AnimationError("FPS and max frames must be positive")
-    stamps = tuple(pair_stamps_ns) if pair_stamps_ns is not None else collect_pair_stamps(input_path, raw_topic, horizontal_topic)
+    if pair_stamps_ns is not None:
+        stamps = tuple(pair_stamps_ns)
+    else:
+        stamps = collect_pair_stamps(
+            input_path, raw_topic, horizontal_topic
+        ).paired_stamps_ns
     choices = uniform_indices(len(stamps), min(len(stamps), int(max_frames)))
     selected = tuple(stamps[index] for index in choices)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +378,7 @@ def encode_animation(input_bag, output_mp4, fps=10, max_frames=600, config=Rende
     handle.close()
     try:
         rendered = _encode_selected_pairs(input_path, temporary, selected, raw_topic, horizontal_topic, int(fps), config)
-        _validate_video(temporary)
+        _validate_video(temporary, config, rendered)
         size = temporary.stat().st_size
         if size <= 0:
             raise AnimationError("encoded video is empty")
