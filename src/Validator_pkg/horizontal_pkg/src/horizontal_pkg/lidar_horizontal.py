@@ -266,7 +266,12 @@ def extract_extrinsics(tf_messages, base_frame, imu_frame, lidar_frame):
     )
 
 
-def prepare_attitude(imu_messages, cutoff_hz=4.0):
+def prepare_attitude(
+    imu_messages,
+    cutoff_hz=4.0,
+    max_imu_gap_s=0.10,
+    expected_frame="IMU-1",
+):
     """Validate, consolidate, and zero-phase filter bag IMU roll/pitch."""
     rows = {}
     total = 0
@@ -276,6 +281,15 @@ def prepare_attitude(imu_messages, cutoff_hz=4.0):
     normalization_warnings = 0
     for message in imu_messages:
         total += 1
+        if _normalized_frame(message.header.frame_id) != _normalized_frame(
+            expected_frame
+        ):
+            raise HorizontalizationError(
+                "unexpected IMU frame {!r}; expected {!r}".format(
+                    message.header.frame_id,
+                    expected_frame,
+                )
+            )
         stamp = int(message.header.stamp.to_nsec())
         if stamp == 0:
             zero_stamps += 1
@@ -300,21 +314,44 @@ def prepare_attitude(imu_messages, cutoff_hz=4.0):
     stamps = sorted(rows)
     if not stamps:
         raise HorizontalizationError("no valid IMU orientation samples")
-    roll_deg = [math.degrees(rows[stamp][0]) for stamp in stamps]
-    pitch_deg = [math.degrees(rows[stamp][1]) for stamp in stamps]
-    try:
-        filtered = imu_filtering.filter_orientation(
-            stamps,
-            roll_deg,
-            pitch_deg,
-            cutoff_hz,
+    if not math.isfinite(float(max_imu_gap_s)) or float(max_imu_gap_s) <= 0.0:
+        raise HorizontalizationError("max IMU gap must be positive and finite")
+    limit_ns = float(max_imu_gap_s) * 1e9
+    segments = []
+    start = 0
+    for index in range(1, len(stamps)):
+        if stamps[index] - stamps[index - 1] > limit_ns:
+            segments.append(stamps[start:index])
+            start = index
+    segments.append(stamps[start:])
+    filtered_stamps = []
+    filtered_roll = []
+    filtered_pitch = []
+    for segment in segments:
+        if len(segment) < 16:
+            continue
+        try:
+            filtered = imu_filtering.filter_orientation(
+                segment,
+                [math.degrees(rows[stamp][0]) for stamp in segment],
+                [math.degrees(rows[stamp][1]) for stamp in segment],
+                cutoff_hz,
+            )
+        except imu_filtering.FilteringError as error:
+            raise HorizontalizationError(
+                "IMU filtering failed: {}".format(error)
+            ) from error
+        filtered_stamps.extend(segment)
+        filtered_roll.extend(np.radians(filtered.roll_deg_filtered))
+        filtered_pitch.extend(np.radians(filtered.pitch_deg_filtered))
+    if not filtered_stamps:
+        raise HorizontalizationError(
+            "no IMU segment is long enough for zero-phase filtering"
         )
-    except imu_filtering.FilteringError as error:
-        raise HorizontalizationError("IMU filtering failed: {}".format(error)) from error
     timeline = AttitudeTimeline(
-        stamps_ns=tuple(stamps),
-        roll_rad=tuple(np.radians(filtered.roll_deg_filtered)),
-        pitch_rad=tuple(np.radians(filtered.pitch_deg_filtered)),
+        stamps_ns=tuple(filtered_stamps),
+        roll_rad=tuple(filtered_roll),
+        pitch_rad=tuple(filtered_pitch),
     )
     return timeline, ImuStats(
         total_messages=total,
@@ -327,6 +364,7 @@ def prepare_attitude(imu_messages, cutoff_hz=4.0):
 
 
 def _xyz_fields(message):
+    datatype_sizes = {1: 1, 2: 1, 3: 2, 4: 2, 5: 4, 6: 4, 7: 4, 8: 8}
     fields = {}
     for field in message.fields:
         if field.name in ("x", "y", "z"):
@@ -340,6 +378,22 @@ def _xyz_fields(message):
             raise HorizontalizationError("PointCloud2 XYZ fields must be count-one FLOAT32")
         if field.offset < 0 or field.offset + 4 > message.point_step:
             raise HorizontalizationError("PointCloud2 XYZ field offset is invalid")
+    xyz_ranges = {
+        name: range(field.offset, field.offset + 4)
+        for name, field in fields.items()
+    }
+    for field in message.fields:
+        size = datatype_sizes.get(field.datatype)
+        if size is None or field.count < 1:
+            continue
+        field_bytes = set(range(field.offset, field.offset + size * field.count))
+        for name, xyz_range in xyz_ranges.items():
+            if field.name == name:
+                continue
+            if field_bytes.intersection(xyz_range):
+                raise HorizontalizationError(
+                    "PointCloud2 fields must not overlap XYZ bytes"
+                )
     return fields
 
 
@@ -427,6 +481,10 @@ def process_bag(
     output_path = Path(output_bag).expanduser().resolve(strict=False)
     if input_path == output_path:
         raise HorizontalizationError("input and output bag paths must differ")
+    if output_topic in {imu_topic, lidar_topic, tf_topic}:
+        raise HorizontalizationError(
+            "output topic must differ from IMU, LiDAR, and TF topics"
+        )
     if bag_factory is None:
         if not input_path.is_file():
             raise HorizontalizationError(
@@ -436,15 +494,18 @@ def process_bag(
 
     imu_messages = []
     tf_messages = []
+    output_topic_present = False
     try:
         with bag_factory(str(input_path), "r") as source:
             for topic, message, _ in source.read_messages(
-                topics=[imu_topic, tf_topic]
+                topics=[imu_topic, tf_topic, output_topic]
             ):
                 if topic == imu_topic:
                     imu_messages.append(message)
                 elif topic == tf_topic:
                     tf_messages.append(message)
+                elif topic == output_topic:
+                    output_topic_present = True
     except HorizontalizationError:
         raise
     except Exception as error:
@@ -460,7 +521,16 @@ def process_bag(
         raise HorizontalizationError(
             "input bag is missing TF topic {}".format(tf_topic)
         )
-    timeline, imu_stats = prepare_attitude(imu_messages, cutoff_hz)
+    if output_topic_present:
+        raise HorizontalizationError(
+            "input bag already contains output topic {}".format(output_topic)
+        )
+    timeline, imu_stats = prepare_attitude(
+        imu_messages,
+        cutoff_hz,
+        max_imu_gap_s=max_imu_gap_s,
+        expected_frame=imu_frame,
+    )
     extrinsics = extract_extrinsics(
         tf_messages,
         base_frame,
@@ -476,11 +546,27 @@ def process_bag(
         temporary = _temporary_bag_path(output_path)
         with bag_factory(str(temporary), "w", compression="lz4") as destination:
             with bag_factory(str(input_path), "r") as source:
-                for topic, message, record_time in source.read_messages():
-                    destination.write(topic, message, record_time)
+                for topic, message, record_time, connection_header in source.read_messages(
+                    return_connection_header=True
+                ):
+                    destination.write(
+                        topic,
+                        message,
+                        record_time,
+                        connection_header=connection_header,
+                    )
                     if topic != lidar_topic:
                         continue
                     lidar_input_count += 1
+                    if _normalized_frame(message.header.frame_id) != _normalized_frame(
+                        lidar_frame
+                    ):
+                        raise HorizontalizationError(
+                            "unexpected LiDAR frame {!r}; expected {!r}".format(
+                                message.header.frame_id,
+                                lidar_frame,
+                            )
+                        )
                     stamp_ns = int(message.header.stamp.to_nsec())
                     attitude = timeline.interpolate(stamp_ns, max_imu_gap_s)
                     if attitude is None:

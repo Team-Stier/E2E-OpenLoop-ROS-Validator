@@ -63,6 +63,14 @@ class GeometryTest(unittest.TestCase):
         with self.assertRaisesRegex(horizontal.HorizontalizationError, "rotation"):
             horizontal.level_rotation(0.0, 0.0, invalid)
 
+    def test_combined_attitude_levels_synthetic_plane(self):
+        roll, pitch = 0.12, -0.08
+        rotation = horizontal.level_rotation(roll, pitch, np.eye(3))
+        level_points = np.array([[x, y, 0.0] for x in (-2.0, 0.0, 3.0) for y in (-1.0, 2.0)])
+        tilted_points = level_points @ rotation
+        leveled = tilted_points @ rotation.T
+        np.testing.assert_allclose(leveled[:, 2], 0.0, atol=1e-12)
+
 
 class AttitudeTimelineTest(unittest.TestCase):
     def timeline(self):
@@ -270,6 +278,20 @@ class ImuPreparationTest(unittest.TestCase):
 
         self.assertEqual(stats.zero_stamp_count, 1)
 
+    def test_long_dropout_is_filtered_as_separate_segments(self):
+        first = [imu_message((i + 1) * 25_000_000, roll_rad=0.0) for i in range(20)]
+        second = [imu_message(2_000_000_000 + i * 25_000_000, roll_rad=1.0) for i in range(20)]
+        timeline, _ = horizontal.prepare_attitude(first + second, max_imu_gap_s=0.10)
+        self.assertAlmostEqual(timeline.roll_rad[19], 0.0, places=6)
+        self.assertAlmostEqual(timeline.roll_rad[20], 1.0, places=6)
+        self.assertIsNone(timeline.interpolate(1_000_000_000, 0.10))
+
+    def test_unexpected_imu_frame_is_rejected(self):
+        messages = [imu_message((i + 1) * 25_000_000) for i in range(20)]
+        messages[5].header.frame_id = "other_imu"
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "IMU frame"):
+            horizontal.prepare_attitude(messages, expected_frame="IMU-1")
+
 
 def point_field(name, offset, datatype, count=1):
     return PointField(name=name, offset=offset, datatype=datatype, count=count)
@@ -359,6 +381,12 @@ class PointCloudTest(unittest.TestCase):
         with self.assertRaisesRegex(horizontal.HorizontalizationError, "FLOAT32"):
             horizontal.horizontalize_cloud(message, np.eye(3), "horizontal")
 
+    def test_overlapping_xyz_and_other_field_is_rejected(self):
+        message = cloud_message()
+        message.fields[-1].offset = 10
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "overlap"):
+            horizontal.horizontalize_cloud(message, np.eye(3), "horizontal")
+
     def test_inconsistent_row_step_is_rejected(self):
         with self.assertRaisesRegex(horizontal.HorizontalizationError, "row_step"):
             horizontal.horizontalize_cloud(
@@ -386,14 +414,17 @@ class FakeBag:
     def __exit__(self, error_type, error, traceback):
         self.closed = True
 
-    def read_messages(self, topics=None):
+    def read_messages(self, topics=None, return_connection_header=False):
         selected = None if topics is None else set(topics)
         for record in self.records:
             if selected is None or record[0] in selected:
-                yield record
+                if return_connection_header:
+                    yield record + ({"callerid": "original", "latching": "1"},)
+                else:
+                    yield record
 
-    def write(self, topic, message, timestamp):
-        self.writes.append((topic, message, timestamp))
+    def write(self, topic, message, timestamp, connection_header=None):
+        self.writes.append((topic, message, timestamp, connection_header))
 
 
 class FakeBagFactory:
@@ -467,6 +498,8 @@ class BagPipelineTest(unittest.TestCase):
             derived = writes[raw_index + 1]
             self.assertEqual(derived[0], "/lidar3D/horizontal")
             self.assertEqual(derived[2], writes[raw_index][2])
+            self.assertIsNone(derived[3])
+            self.assertEqual(writes[raw_index][3]["latching"], "1")
             self.assertEqual(
                 derived[1].header.stamp,
                 writes[raw_index][1].header.stamp,
@@ -478,6 +511,22 @@ class BagPipelineTest(unittest.TestCase):
             self.assertTrue(output_path.exists())
             write_calls = [call for call in factory.calls if call[1] == "w"]
             self.assertEqual(write_calls[0][2], "lz4")
+
+    def test_topic_collisions_and_existing_output_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for topic in ("/imu", "/tf", "/lidar3D"):
+                with self.assertRaisesRegex(horizontal.HorizontalizationError, "output topic"):
+                    horizontal.process_bag("/virtual/input.bag", Path(directory) / "x.bag", output_topic=topic, bag_factory=FakeBagFactory(self.records()))
+            records = self.records() + [("/lidar3D/horizontal", cloud_message(), rospy.Time.from_sec(2.0))]
+            with self.assertRaisesRegex(horizontal.HorizontalizationError, "already contains"):
+                horizontal.process_bag("/virtual/input.bag", Path(directory) / "x.bag", bag_factory=FakeBagFactory(records))
+
+    def test_unexpected_lidar_frame_is_rejected(self):
+        records = self.records()
+        next(row[1] for row in records if row[0] == "/lidar3D").header.frame_id = "other_lidar"
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(horizontal.HorizontalizationError, "LiDAR frame"):
+                horizontal.process_bag("/virtual/input.bag", Path(directory) / "x.bag", bag_factory=FakeBagFactory(records))
 
     def test_unaligned_cloud_is_skipped_and_zero_output_fails(self):
         factory = FakeBagFactory(self.records(aligned=False))
