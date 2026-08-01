@@ -66,6 +66,24 @@ record stamp가 기록된다. 이 결과는 IMU orientation을 확인하는 offl
 baseline이며, 아직 PointCloud 보상 방향이나 센서 좌표계를 검증한 결과는
 아니다.
 
+기존 CSV의 원본 열과 timestamp를 보존하면서 roll/pitch에 기본 4 Hz
+2차 Butterworth zero-phase 필터를 적용하고, 원본과 필터 결과를 겹친
+비교 이미지를 생성할 수 있다.
+
+```bash
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+/usr/bin/python3 -m horizontal_pkg.imu_filtering \
+  --input-csv records/horizontal/imu_roll_pitch.csv \
+  --output-csv records/horizontal/imu_roll_pitch_filtered.csv \
+  --output-png src/Validator_pkg/horizontal_pkg/docs/imu_roll_pitch_filtered.png \
+  --cutoff-hz 4.0
+```
+
+필터는 불규칙한 sensor timestamp를 균일 시간축으로 보간한 뒤 적용하고,
+결과를 원래 timestamp로 되돌린다. 생성된 이미지는 필터 동작을 확인하는
+문서용 결과이며 LiDAR 수평 보상의 기하 정확도를 증명하지 않는다.
+
 ## 2. Architecture
 ```mermaid
 flowchart TD

@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 
+import csv
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import math
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -133,6 +140,192 @@ class FilterOrientationTest(unittest.TestCase):
             np.zeros(4),
             np.zeros(4),
         )
+
+
+class CsvPlotTest(unittest.TestCase):
+    fieldnames = (
+        "header_stamp_ns",
+        "elapsed_s",
+        "seq",
+        "roll_deg",
+        "pitch_deg",
+    )
+
+    def write_input(self, path, fieldnames=None, count=160):
+        names = tuple(fieldnames or self.fieldnames)
+        with Path(path).open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=names)
+            writer.writeheader()
+            for index in range(count):
+                elapsed = index * 0.025
+                row = {
+                    "header_stamp_ns": str(
+                        1_785_489_005_000_000_000 + index * 25_000_000
+                    ),
+                    "elapsed_s": repr(elapsed),
+                    "seq": str(9000 + index),
+                    "roll_deg": repr(
+                        math.sin(2.0 * math.pi * 0.7 * elapsed)
+                        + 0.2 * math.sin(2.0 * math.pi * 8.0 * elapsed)
+                    ),
+                    "pitch_deg": repr(
+                        0.5 * math.sin(2.0 * math.pi * 0.5 * elapsed)
+                    ),
+                }
+                writer.writerow({name: row[name] for name in names})
+
+    def test_filter_csv_preserves_source_and_appends_results_and_png(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            output_path = Path(directory) / "filtered.csv"
+            png_path = Path(directory) / "comparison.png"
+            self.write_input(input_path)
+            source_bytes = input_path.read_bytes()
+
+            result = filtering.filter_csv(
+                input_path,
+                output_path,
+                png_path,
+                cutoff_hz=4.0,
+            )
+
+            self.assertEqual(input_path.read_bytes(), source_bytes)
+            with input_path.open(newline="", encoding="utf-8") as stream:
+                source_rows = list(csv.DictReader(stream))
+            with output_path.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                output_fields = tuple(reader.fieldnames)
+                output_rows = list(reader)
+            self.assertEqual(
+                output_fields,
+                self.fieldnames
+                + ("roll_deg_filtered", "pitch_deg_filtered"),
+            )
+            self.assertEqual(len(output_rows), len(source_rows))
+            for source, output in zip(source_rows, output_rows):
+                for field in self.fieldnames:
+                    self.assertEqual(output[field], source[field])
+            self.assertTrue(
+                any(
+                    row["roll_deg_filtered"] != row["roll_deg"]
+                    for row in output_rows
+                )
+            )
+            self.assertEqual(png_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertGreater(png_path.stat().st_size, 1000)
+            self.assertEqual(result.sample_count, 160)
+            self.assertAlmostEqual(result.filter_result.cutoff_hz, 4.0)
+
+    def test_missing_required_column_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            self.write_input(
+                input_path,
+                fieldnames=(
+                    "header_stamp_ns",
+                    "elapsed_s",
+                    "seq",
+                    "roll_deg",
+                ),
+            )
+            with self.assertRaisesRegex(filtering.FilteringError, "pitch_deg"):
+                filtering.filter_csv(
+                    input_path,
+                    Path(directory) / "filtered.csv",
+                    Path(directory) / "comparison.png",
+                )
+
+    def test_input_path_cannot_be_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            self.write_input(input_path)
+            with self.assertRaisesRegex(filtering.FilteringError, "differ"):
+                filtering.filter_csv(
+                    input_path,
+                    input_path,
+                    Path(directory) / "comparison.png",
+                )
+
+    def test_failed_atomic_replace_preserves_old_output_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            output_path = Path(directory) / "filtered.csv"
+            png_path = Path(directory) / "comparison.png"
+            self.write_input(input_path)
+            output_path.write_text("old output\n", encoding="utf-8")
+            names_before = set(os.listdir(directory))
+
+            with mock.patch.object(
+                filtering.os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaisesRegex(
+                    filtering.FilteringError,
+                    "failed to write",
+                ):
+                    filtering.filter_csv(
+                        input_path,
+                        output_path,
+                        png_path,
+                    )
+
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "old output\n",
+            )
+            self.assertEqual(set(os.listdir(directory)), names_before)
+
+
+class CommandLineTest(unittest.TestCase):
+    def test_cli_writes_outputs_and_reports_summary(self):
+        fixture = CsvPlotTest()
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            output_path = Path(directory) / "filtered.csv"
+            png_path = Path(directory) / "comparison.png"
+            fixture.write_input(input_path)
+            stdout = io.StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = filtering.main(
+                    [
+                        "--input-csv",
+                        str(input_path),
+                        "--output-csv",
+                        str(output_path),
+                        "--output-png",
+                        str(png_path),
+                        "--cutoff-hz",
+                        "4.0",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output_path.is_file())
+            self.assertTrue(png_path.is_file())
+            summary = stdout.getvalue()
+            self.assertIn("samples=160", summary)
+            self.assertIn("cutoff_hz=4.000000", summary)
+            self.assertIn("roll_std_deg raw=", summary)
+            self.assertIn("pitch_std_deg raw=", summary)
+
+    def test_cli_expected_error_returns_two(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            exit_code = filtering.main(
+                [
+                    "--input-csv",
+                    "/missing/input.csv",
+                    "--output-csv",
+                    "/tmp/filtered.csv",
+                    "--output-png",
+                    "/tmp/comparison.png",
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("error:", stderr.getvalue())
 
 
 if __name__ == "__main__":
