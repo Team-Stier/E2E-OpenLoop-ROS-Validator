@@ -301,7 +301,7 @@ def test_visualization_geometry_matches_preprocessing_and_path_frame_transform()
     assert transform == {
         "parent_frame_id": "base_link",
         "child_frame_id": "Lidar3D-4",
-        "translation_m": [2.0, 0.0, 1.5],
+        "translation_m": [1.5, 0.0, 1.25],
         "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
     }
 

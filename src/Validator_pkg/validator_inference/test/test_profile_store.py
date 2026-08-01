@@ -18,7 +18,7 @@ def test_selected_profile_has_stable_hashes(profile_path: Path):
     assert selected.data["static_transforms"]["T_base_from_lidar"] == {
         "parent_frame_id": "base_link",
         "child_frame_id": "Lidar3D-4",
-        "translation_m": [2.0, 0.0, 1.5],
+        "translation_m": [1.5, 0.0, 1.25],
         "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
     }
 

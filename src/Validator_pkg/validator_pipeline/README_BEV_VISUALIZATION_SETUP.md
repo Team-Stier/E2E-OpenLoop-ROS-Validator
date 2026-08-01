@@ -108,7 +108,7 @@ lidar_bev_processor
 bev_visualizer
 ```
 
-Visualizer는 서로 다른 Camera/LiDAR BEV 기하를 resize로 맞추는 노드가 아니다. 단, inference의 `/waypoints`는 계약상 `Lidar3D-4` frame으로 발행되므로, `bev_geometry.yaml`에 기록된 `T_base_from_lidar`(평행이동 `[2,0,1.5]`, quaternion `[0,0,0,1]`)를 적용해 waypoint만 `base_link` BEV로 변환한다.
+Visualizer는 서로 다른 Camera/LiDAR BEV 기하를 resize로 맞추는 노드가 아니다. 단, inference의 `/waypoints`는 계약상 `Lidar3D-4` frame으로 발행되므로, `bev_geometry.yaml`에 기록된 `T_base_from_lidar`(평행이동 `[1.5,0,1.25]`, quaternion `[0,0,0,1]`)를 적용해 waypoint만 `base_link` BEV로 변환한다.
 
 ```text
 Preprocessing layer:
@@ -563,7 +563,7 @@ rostopic hz /waypoints
 rostopic echo -n 1 /waypoints/header
 ```
 
-정상 inference 출력의 `/waypoints.header.frame_id`는 `Lidar3D-4`다. visualizer는 inference와 동일한 `profile.json`의 `common_inference_policy.static_transforms.T_base_from_lidar`를 읽는다. parent/child가 각각 `base_link`/`Lidar3D-4`인지, translation이 `[2.0, 0.0, 1.5]`, quaternion이 `[0.0, 0.0, 0.0, 1.0]`인지 확인한다. 다른 frame이 들어오면 묵시한 채 그리지 말고 해당 frame에 맞는 명시적 변환을 profile에 기록해야 한다.
+정상 inference 출력의 `/waypoints.header.frame_id`는 `Lidar3D-4`다. visualizer는 inference와 동일한 `profile.json`의 `common_inference_policy.static_transforms.T_base_from_lidar`를 읽는다. parent/child가 각각 `base_link`/`Lidar3D-4`인지, translation이 `[1.5, 0.0, 1.25]`, quaternion이 `[0.0, 0.0, 0.0, 1.0]`인지 확인한다. 다른 frame이 들어오면 묵시한 채 그리지 말고 해당 frame에 맞는 명시적 변환을 profile에 기록해야 한다.
 
 ---
 
