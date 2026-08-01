@@ -178,6 +178,8 @@ def _style_legend(legend):
         handles = getattr(legend, "legendHandles", ())
     for handle in handles:
         handle.set_alpha(1.0)
+        if hasattr(handle, "set_sizes"):
+            handle.set_sizes([32.0])
 
 
 def render_frame(raw_xyz, horizontal_xyz, metadata, config=RenderConfig()):

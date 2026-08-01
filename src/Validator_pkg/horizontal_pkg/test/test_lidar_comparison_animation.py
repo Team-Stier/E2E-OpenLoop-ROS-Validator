@@ -100,6 +100,7 @@ class RenderingTest(unittest.TestCase):
         animation._style_legend(legend)
         for handle in handles:
             handle.set_alpha.assert_called_once_with(1.0)
+            handle.set_sizes.assert_called_once_with([32.0])
 
 
 class AtomicOutputTest(unittest.TestCase):
