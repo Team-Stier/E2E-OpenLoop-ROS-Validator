@@ -1,10 +1,14 @@
 """Create completely roll/pitch-leveled LiDAR clouds in an offline ROS bag."""
 
 from bisect import bisect_left
+import copy
 from dataclasses import dataclass
 import math
 
 import numpy as np
+
+from horizontal_pkg import imu_filtering
+from horizontal_pkg import imu_orientation_analyzer
 
 
 class HorizontalizationError(RuntimeError):
@@ -102,3 +106,261 @@ class AttitudeTimeline:
             float(self.pitch_rad[index]) - float(self.pitch_rad[index - 1])
         )
         return roll, pitch
+
+
+@dataclass(frozen=True)
+class RigidTransform:
+    """One validated sensor pose expressed in its parent frame."""
+
+    translation_m: np.ndarray
+    quaternion_xyzw: np.ndarray
+
+
+@dataclass(frozen=True)
+class Extrinsics:
+    """Bag-derived IMU/LiDAR extrinsics required for leveling."""
+
+    T_base_from_imu: RigidTransform
+    T_base_from_lidar: RigidTransform
+    translation_imu_from_lidar_m: np.ndarray
+    R_imu_from_lidar: np.ndarray
+
+
+@dataclass(frozen=True)
+class ImuStats:
+    """Quality counters collected while preparing the attitude timeline."""
+
+    total_messages: int
+    valid_unique_messages: int
+    duplicate_replacements: int
+    zero_stamp_count: int
+    invalid_quaternion_count: int
+    normalization_warning_count: int
+
+
+def _normalized_frame(frame):
+    return str(frame).lstrip("/")
+
+
+def _normalized_quaternion(values):
+    quaternion = np.asarray(values, dtype=float)
+    if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
+        raise HorizontalizationError("transform quaternion must be finite")
+    norm = float(np.linalg.norm(quaternion))
+    if norm < 1e-9:
+        raise HorizontalizationError("transform quaternion must be nonzero")
+    quaternion = quaternion / norm
+    if quaternion[3] < 0.0:
+        quaternion = -quaternion
+    return quaternion
+
+
+def _quaternion_matrix(quaternion_xyzw):
+    x, y, z, w = _normalized_quaternion(quaternion_xyzw)
+    return np.array(
+        (
+            (1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)),
+            (2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)),
+            (2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)),
+        ),
+        dtype=float,
+    )
+
+
+def _summarize_transform(samples, child_frame):
+    if not samples:
+        raise HorizontalizationError(
+            "bag TF is missing child frame {}".format(child_frame)
+        )
+    translations = np.asarray([sample[0] for sample in samples], dtype=float)
+    if not np.all(np.isfinite(translations)):
+        raise HorizontalizationError(
+            "{} translation must be finite".format(child_frame)
+        )
+    quaternions = np.asarray(
+        [_normalized_quaternion(sample[1]) for sample in samples],
+        dtype=float,
+    )
+    reference = quaternions[0]
+    quaternions = np.asarray(
+        [value if np.dot(value, reference) >= 0.0 else -value for value in quaternions]
+    )
+    translation = np.median(translations, axis=0)
+    quaternion = _normalized_quaternion(np.median(quaternions, axis=0))
+    translation_spread = np.max(np.linalg.norm(translations - translation, axis=1))
+    if translation_spread > 0.005:
+        raise HorizontalizationError(
+            "{} translation is unstable ({:.6f} m)".format(
+                child_frame,
+                translation_spread,
+            )
+        )
+    dots = np.clip(np.abs(quaternions @ quaternion), 0.0, 1.0)
+    angular_spread_deg = float(np.degrees(np.max(2.0 * np.arccos(dots))))
+    if angular_spread_deg > 0.1:
+        raise HorizontalizationError(
+            "{} rotation is unstable ({:.6f} deg)".format(
+                child_frame,
+                angular_spread_deg,
+            )
+        )
+    return RigidTransform(translation, quaternion)
+
+
+def extract_extrinsics(tf_messages, base_frame, imu_frame, lidar_frame):
+    """Extract stable median sensor transforms from bag TF messages."""
+    base = _normalized_frame(base_frame)
+    targets = {
+        _normalized_frame(imu_frame): [],
+        _normalized_frame(lidar_frame): [],
+    }
+    for message in tf_messages:
+        for transform in message.transforms:
+            parent = _normalized_frame(transform.header.frame_id)
+            child = _normalized_frame(transform.child_frame_id)
+            if parent != base or child not in targets:
+                continue
+            translation = transform.transform.translation
+            rotation = transform.transform.rotation
+            targets[child].append(
+                (
+                    (translation.x, translation.y, translation.z),
+                    (rotation.x, rotation.y, rotation.z, rotation.w),
+                )
+            )
+
+    imu = _summarize_transform(targets[_normalized_frame(imu_frame)], imu_frame)
+    lidar = _summarize_transform(
+        targets[_normalized_frame(lidar_frame)],
+        lidar_frame,
+    )
+    R_base_from_imu = _quaternion_matrix(imu.quaternion_xyzw)
+    R_base_from_lidar = _quaternion_matrix(lidar.quaternion_xyzw)
+    R_imu_from_lidar = R_base_from_imu.T @ R_base_from_lidar
+    translation_imu_from_lidar = R_base_from_imu.T @ (
+        lidar.translation_m - imu.translation_m
+    )
+    return Extrinsics(
+        T_base_from_imu=imu,
+        T_base_from_lidar=lidar,
+        translation_imu_from_lidar_m=translation_imu_from_lidar,
+        R_imu_from_lidar=R_imu_from_lidar,
+    )
+
+
+def prepare_attitude(imu_messages, cutoff_hz=4.0):
+    """Validate, consolidate, and zero-phase filter bag IMU roll/pitch."""
+    rows = {}
+    total = 0
+    duplicates = 0
+    zero_stamps = 0
+    invalid = 0
+    normalization_warnings = 0
+    for message in imu_messages:
+        total += 1
+        stamp = int(message.header.stamp.to_nsec())
+        if stamp == 0:
+            zero_stamps += 1
+            continue
+        orientation = message.orientation
+        try:
+            angles = imu_orientation_analyzer.quaternion_to_roll_pitch(
+                orientation.x,
+                orientation.y,
+                orientation.z,
+                orientation.w,
+            )
+        except imu_orientation_analyzer.InvalidQuaternionError:
+            invalid += 1
+            continue
+        if angles.normalization_warning:
+            normalization_warnings += 1
+        if stamp in rows:
+            duplicates += 1
+        rows[stamp] = (angles.roll_rad, angles.pitch_rad)
+
+    stamps = sorted(rows)
+    if not stamps:
+        raise HorizontalizationError("no valid IMU orientation samples")
+    roll_deg = [math.degrees(rows[stamp][0]) for stamp in stamps]
+    pitch_deg = [math.degrees(rows[stamp][1]) for stamp in stamps]
+    try:
+        filtered = imu_filtering.filter_orientation(
+            stamps,
+            roll_deg,
+            pitch_deg,
+            cutoff_hz,
+        )
+    except imu_filtering.FilteringError as error:
+        raise HorizontalizationError("IMU filtering failed: {}".format(error)) from error
+    timeline = AttitudeTimeline(
+        stamps_ns=tuple(stamps),
+        roll_rad=tuple(np.radians(filtered.roll_deg_filtered)),
+        pitch_rad=tuple(np.radians(filtered.pitch_deg_filtered)),
+    )
+    return timeline, ImuStats(
+        total_messages=total,
+        valid_unique_messages=len(stamps),
+        duplicate_replacements=duplicates,
+        zero_stamp_count=zero_stamps,
+        invalid_quaternion_count=invalid,
+        normalization_warning_count=normalization_warnings,
+    )
+
+
+def _xyz_fields(message):
+    fields = {}
+    for field in message.fields:
+        if field.name in ("x", "y", "z"):
+            if field.name in fields:
+                raise HorizontalizationError("PointCloud2 XYZ fields must be unique")
+            fields[field.name] = field
+    if set(fields) != {"x", "y", "z"}:
+        raise HorizontalizationError("PointCloud2 requires x, y, and z fields")
+    for field in fields.values():
+        if field.datatype != 7 or field.count != 1:
+            raise HorizontalizationError("PointCloud2 XYZ fields must be count-one FLOAT32")
+        if field.offset < 0 or field.offset + 4 > message.point_step:
+            raise HorizontalizationError("PointCloud2 XYZ field offset is invalid")
+    return fields
+
+
+def horizontalize_cloud(message, rotation, output_frame):
+    """Rotate PointCloud2 XYZ in-place on a copied binary payload."""
+    transform = _validated_rotation(rotation)
+    if not str(output_frame):
+        raise HorizontalizationError("output frame must not be empty")
+    if message.height < 1 or message.width < 1 or message.point_step < 1:
+        raise HorizontalizationError("PointCloud2 dimensions and point_step are invalid")
+    if message.row_step < message.point_step * message.width:
+        raise HorizontalizationError("PointCloud2 row_step is inconsistent")
+    if len(message.data) != message.row_step * message.height:
+        raise HorizontalizationError("PointCloud2 payload length is inconsistent")
+    fields = _xyz_fields(message)
+    endian = ">" if message.is_bigendian else "<"
+    dtype = np.dtype(endian + "f4")
+    payload = bytearray(message.data)
+    for row in range(message.height):
+        views = {}
+        for name in ("x", "y", "z"):
+            views[name] = np.ndarray(
+                shape=(message.width,),
+                dtype=dtype,
+                buffer=payload,
+                offset=row * message.row_step + fields[name].offset,
+                strides=(message.point_step,),
+            )
+        points = np.column_stack(
+            (views["x"].copy(), views["y"].copy(), views["z"].copy())
+        )
+        finite = np.all(np.isfinite(points), axis=1)
+        rotated = np.full(points.shape, np.nan, dtype=float)
+        rotated[finite] = points[finite] @ transform.T
+        views["x"][:] = rotated[:, 0]
+        views["y"][:] = rotated[:, 1]
+        views["z"][:] = rotated[:, 2]
+
+    output = copy.deepcopy(message)
+    output.header.frame_id = str(output_frame)
+    output.data = bytes(payload)
+    return output

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 import math
+import struct
 import unittest
 
 import numpy as np
+from geometry_msgs.msg import TransformStamped
+from sensor_msgs.msg import Imu, PointCloud2, PointField
+from tf2_msgs.msg import TFMessage
 
 from horizontal_pkg import lidar_horizontal as horizontal
 
@@ -108,6 +112,258 @@ class AttitudeTimelineTest(unittest.TestCase):
     def test_non_positive_max_gap_is_rejected(self):
         with self.assertRaisesRegex(horizontal.HorizontalizationError, "positive"):
             self.timeline().interpolate(1_050_000_000, 0.0)
+
+
+def transform(parent, child, translation, quaternion=(0.0, 0.0, 0.0, 1.0)):
+    message = TransformStamped()
+    message.header.frame_id = parent
+    message.child_frame_id = child
+    message.transform.translation.x = translation[0]
+    message.transform.translation.y = translation[1]
+    message.transform.translation.z = translation[2]
+    message.transform.rotation.x = quaternion[0]
+    message.transform.rotation.y = quaternion[1]
+    message.transform.rotation.z = quaternion[2]
+    message.transform.rotation.w = quaternion[3]
+    return message
+
+
+class ExtrinsicsTest(unittest.TestCase):
+    def messages(self):
+        messages = []
+        for offset in (-1e-5, 0.0, 1e-5):
+            messages.append(
+                TFMessage(
+                    transforms=[
+                        transform(
+                            "/base_link",
+                            "IMU-1",
+                            (1.5 + offset, 0.0, 0.5),
+                        ),
+                        transform(
+                            "/base_link",
+                            "Lidar3D-4",
+                            (1.5, 0.0, 1.25),
+                        ),
+                    ]
+                )
+            )
+        return messages
+
+    def test_bag_transforms_produce_vertical_sensor_offset(self):
+        result = horizontal.extract_extrinsics(
+            self.messages(),
+            base_frame="base_link",
+            imu_frame="IMU-1",
+            lidar_frame="Lidar3D-4",
+        )
+
+        np.testing.assert_allclose(
+            result.T_base_from_imu.translation_m,
+            [1.5, 0.0, 0.5],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            result.T_base_from_lidar.translation_m,
+            [1.5, 0.0, 1.25],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            result.translation_imu_from_lidar_m,
+            [0.0, 0.0, 0.75],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(result.R_imu_from_lidar, np.eye(3), atol=1e-12)
+
+    def test_missing_sensor_transform_is_rejected(self):
+        messages = [
+            TFMessage(
+                transforms=[transform("/base_link", "IMU-1", (1.5, 0.0, 0.5))]
+            )
+        ]
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "Lidar3D-4"):
+            horizontal.extract_extrinsics(
+                messages,
+                "base_link",
+                "IMU-1",
+                "Lidar3D-4",
+            )
+
+    def test_unstable_translation_is_rejected(self):
+        messages = self.messages()
+        messages.append(
+            TFMessage(
+                transforms=[
+                    transform("/base_link", "IMU-1", (1.6, 0.0, 0.5)),
+                    transform("/base_link", "Lidar3D-4", (1.5, 0.0, 1.25)),
+                ]
+            )
+        )
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "unstable"):
+            horizontal.extract_extrinsics(
+                messages,
+                "base_link",
+                "IMU-1",
+                "Lidar3D-4",
+            )
+
+    def test_non_finite_transform_is_rejected(self):
+        messages = self.messages()
+        messages[0].transforms[0].transform.translation.x = math.nan
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "finite"):
+            horizontal.extract_extrinsics(
+                messages,
+                "base_link",
+                "IMU-1",
+                "Lidar3D-4",
+            )
+
+
+def imu_message(stamp_ns, roll_rad=0.0, pitch_rad=0.0, valid=True):
+    message = Imu()
+    message.header.stamp.secs = stamp_ns // 1_000_000_000
+    message.header.stamp.nsecs = stamp_ns % 1_000_000_000
+    message.header.frame_id = "IMU-1"
+    if valid:
+        cr, sr = math.cos(roll_rad / 2.0), math.sin(roll_rad / 2.0)
+        cp, sp = math.cos(pitch_rad / 2.0), math.sin(pitch_rad / 2.0)
+        message.orientation.x = sr * cp
+        message.orientation.y = cr * sp
+        message.orientation.z = -sr * sp
+        message.orientation.w = cr * cp
+    return message
+
+
+class ImuPreparationTest(unittest.TestCase):
+    def test_duplicate_stamp_keeps_last_and_invalid_is_counted(self):
+        messages = [
+            imu_message((index + 1) * 25_000_000, roll_rad=index * 0.001)
+            for index in range(24)
+        ]
+        messages.append(imu_message(11 * 25_000_000, roll_rad=0.5))
+        messages.append(imu_message(700_000_000, valid=False))
+
+        timeline, stats = horizontal.prepare_attitude(messages, cutoff_hz=4.0)
+
+        self.assertEqual(stats.total_messages, 26)
+        self.assertEqual(stats.valid_unique_messages, 24)
+        self.assertEqual(stats.duplicate_replacements, 1)
+        self.assertEqual(stats.invalid_quaternion_count, 1)
+        self.assertEqual(len(timeline.stamps_ns), 24)
+        self.assertEqual(timeline.stamps_ns[10], 275_000_000)
+
+    def test_zero_stamp_is_rejected_and_counted(self):
+        messages = [
+            imu_message((index + 1) * 25_000_000) for index in range(20)
+        ]
+        messages.append(imu_message(0))
+
+        _, stats = horizontal.prepare_attitude(messages, cutoff_hz=4.0)
+
+        self.assertEqual(stats.zero_stamp_count, 1)
+
+
+def point_field(name, offset, datatype, count=1):
+    return PointField(name=name, offset=offset, datatype=datatype, count=count)
+
+
+def cloud_message(bigendian=False, bad_row_step=False):
+    message = PointCloud2()
+    message.header.frame_id = "Lidar3D-4"
+    message.header.stamp.secs = 12
+    message.header.stamp.nsecs = 34
+    message.height = 2
+    message.width = 2
+    message.fields = [
+        point_field("x", 0, PointField.FLOAT32),
+        point_field("y", 4, PointField.FLOAT32),
+        point_field("z", 8, PointField.FLOAT32),
+        point_field("intensity", 12, PointField.FLOAT32),
+        point_field("ring", 16, PointField.UINT16),
+    ]
+    message.is_bigendian = bigendian
+    message.point_step = 20
+    message.row_step = 39 if bad_row_step else 44
+    message.is_dense = False
+    endian = ">" if bigendian else "<"
+    payload = bytearray(message.row_step * message.height)
+    values = [
+        (1.0, 2.0, 3.0, 10.0, 7),
+        (4.0, 5.0, 6.0, 20.0, 8),
+        (math.nan, 8.0, 9.0, 30.0, 9),
+        (-1.0, -2.0, -3.0, 40.0, 10),
+    ]
+    for index, value in enumerate(values):
+        row, column = divmod(index, message.width)
+        offset = row * message.row_step + column * message.point_step
+        struct.pack_into(endian + "ffffH", payload, offset, *value)
+        payload[offset + 18 : offset + 20] = b"XY"
+    if not bad_row_step:
+        payload[40:44] = b"PAD1"
+        payload[84:88] = b"PAD2"
+    message.data = bytes(payload)
+    return message
+
+
+class PointCloudTest(unittest.TestCase):
+    def test_xyz_rotates_while_layout_and_non_xyz_bytes_are_preserved(self):
+        source = cloud_message()
+        rotation = horizontal.rotation_matrix_xyz(math.pi / 2.0, 0.0)
+
+        output = horizontal.horizontalize_cloud(
+            source,
+            rotation,
+            "Lidar3D-4-horizontal",
+        )
+
+        self.assertEqual(output.header.stamp, source.header.stamp)
+        self.assertEqual(output.header.frame_id, "Lidar3D-4-horizontal")
+        self.assertEqual(output.height, source.height)
+        self.assertEqual(output.width, source.width)
+        self.assertEqual(output.fields, source.fields)
+        self.assertEqual(output.point_step, source.point_step)
+        self.assertEqual(output.row_step, source.row_step)
+        for index, expected in enumerate(
+            ((1.0, -3.0, 2.0), (4.0, -6.0, 5.0), None, (-1.0, 3.0, -2.0))
+        ):
+            row, column = divmod(index, source.width)
+            offset = row * source.row_step + column * source.point_step
+            actual = struct.unpack_from("<fff", output.data, offset)
+            if expected is None:
+                self.assertTrue(all(math.isnan(value) for value in actual))
+            else:
+                np.testing.assert_allclose(actual, expected, atol=1e-6)
+            self.assertEqual(output.data[offset + 12 : offset + 20], source.data[offset + 12 : offset + 20])
+        self.assertEqual(output.data[40:44], b"PAD1")
+        self.assertEqual(output.data[84:88], b"PAD2")
+
+    def test_big_endian_cloud_is_supported(self):
+        output = horizontal.horizontalize_cloud(
+            cloud_message(bigendian=True),
+            np.eye(3),
+            "horizontal",
+        )
+        self.assertEqual(struct.unpack_from(">fff", output.data, 0), (1.0, 2.0, 3.0))
+
+    def test_non_float_xyz_is_rejected(self):
+        message = cloud_message()
+        message.fields[0].datatype = PointField.FLOAT64
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "FLOAT32"):
+            horizontal.horizontalize_cloud(message, np.eye(3), "horizontal")
+
+    def test_inconsistent_row_step_is_rejected(self):
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "row_step"):
+            horizontal.horizontalize_cloud(
+                cloud_message(bad_row_step=True),
+                np.eye(3),
+                "horizontal",
+            )
+
+    def test_payload_length_mismatch_is_rejected(self):
+        message = cloud_message()
+        message.data = message.data[:-1]
+        with self.assertRaisesRegex(horizontal.HorizontalizationError, "payload"):
+            horizontal.horizontalize_cloud(message, np.eye(3), "horizontal")
 
 
 if __name__ == "__main__":
