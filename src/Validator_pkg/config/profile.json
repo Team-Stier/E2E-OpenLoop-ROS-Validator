@@ -26,12 +26,12 @@
       "frame_id": "Lidar3D-4",
       "fields": ["x", "y", "z", "intensity"],
       "median_period_ms": 107.0,
-      "static_base_link_to_lidar_translation_m": [2.0, 0.0, 1.5],
+      "static_base_link_to_lidar_translation_m": [1.5, 0.0, 1.25],
       "static_transform": {
         "name": "T_base_from_lidar",
         "parent_frame_id": "base_link",
         "child_frame_id": "Lidar3D-4",
-        "translation_m": [2.0, 0.0, 1.5],
+        "translation_m": [1.5, 0.0, 1.25],
         "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
       }
     },
@@ -61,7 +61,7 @@
       "T_base_from_lidar": {
         "parent_frame_id": "base_link",
         "child_frame_id": "Lidar3D-4",
-        "translation_m": [2.0, 0.0, 1.5],
+        "translation_m": [1.5, 0.0, 1.25],
         "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
       }
     },

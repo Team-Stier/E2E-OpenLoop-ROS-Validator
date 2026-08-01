@@ -330,7 +330,7 @@ rosrun Validator_pkg bev_overlay_viewer.py
 ### 2.3 visualization layer
 `visualizer`노드로 구성됨.
 lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
-두 BEV는 `base_link` 기준 600 x 500, x=[0,25] m, y=[-15,15] m, 0.05 m/pixel 계약을 공유한다. Inference가 발행하는 `/waypoints`는 `Lidar3D-4` frame이므로 visualizer가 profile의 `T_base_from_lidar`(평행이동 `[2,0,1.5]`, identity quaternion)를 적용해 `base_link` BEV에 표시한다.
+두 BEV는 `base_link` 기준 600 x 500, x=[0,25] m, y=[-15,15] m, 0.05 m/pixel 계약을 공유한다. Inference가 발행하는 `/waypoints`는 `Lidar3D-4` frame이므로 visualizer가 profile의 `T_base_from_lidar`(평행이동 `[1.5,0,1.25]`, identity quaternion)를 적용해 `base_link` BEV에 표시한다.
 
 ## 3. Open-loop 실행
 

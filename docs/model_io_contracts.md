@@ -51,7 +51,7 @@ The LiDAR raster uses x=[-32,64] m, y=[-40,40] m, 4 pixels/m, occupancy clip=5. 
 
 The inference-layer subscriptions for this path are raw `/lidar3D` and `/tf`; `/lidar/tfv6/processed` is an optional five-sweep preprocessing diagnostic and is never a TFv6 model input. Pose lookup uses linear translation interpolation and quaternion SLERP between bracketing `/tf` messages for each of the ten raw sweep stamps.
 
-Fallback route points remain published in `Lidar3D-4`. Before TFv6 forward they are transformed by the recorded `T_base_from_lidar` (`base_link` parent, `Lidar3D-4` child, translation `[2,0,1.5]`, quaternion `[0,0,0,1]`) and only then converted to CARLA y-right coordinates.
+Fallback route points remain published in `Lidar3D-4`. Before TFv6 forward they are transformed by the recorded `T_base_from_lidar` (`base_link` parent, `Lidar3D-4` child, translation `[1.5,0,1.25]`, quaternion `[0,0,0,1]`) and only then converted to CARLA y-right coordinates.
 
 ### 3.2 Official no-radar contract
 

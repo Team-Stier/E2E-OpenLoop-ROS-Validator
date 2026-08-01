@@ -291,7 +291,7 @@ p_lidar = inverse(T_base_from_lidar) * p_base
 
 모든 temporary route point는 Lidar3D-4 frame에서 발행한다. status feature의 source는 fallback으로 명시한다.
 
-CARLA 계열 TFv6/InterFuser에 target을 넣을 때는 profile에 기록된 `T_base_from_lidar`를 먼저 적용한다. 이 bag의 고정 transform은 parent=base_link, child=Lidar3D-4, translation=[2,0,1.5] m, quaternion=[0,0,0,1]이다. 따라서 5/15/30 m fallback은 회전이 identity인 현재 bag에서 base x=7/17/32 m가 된 다음 CARLA y-right 부호 변환을 거친다.
+CARLA 계열 TFv6/InterFuser에 target을 넣을 때는 profile에 기록된 `T_base_from_lidar`를 먼저 적용한다. 이 bag의 고정 transform은 parent=base_link, child=Lidar3D-4, translation=[1.5,0,1.25] m, quaternion=[0,0,0,1]이다. 따라서 5/15/30 m fallback은 회전이 identity인 현재 bag에서 base x=6.5/16.5/31.5 m가 된 다음 CARLA y-right 부호 변환을 거친다.
 
 ## 8. ROS message와 code-level 경계
 
