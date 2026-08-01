@@ -65,26 +65,27 @@ def _relative_seconds(header_stamp_ns):
     stamps = list(header_stamp_ns)
     if not stamps:
         raise FilteringError("input is too short for zero-phase filtering")
+    numeric_stamps = []
     try:
-        numeric_stamps = [float(value) for value in stamps]
-    except (TypeError, ValueError) as error:
+        for value in stamps:
+            numeric_value = float(value)
+            if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+                raise ValueError("timestamp is not a finite integer")
+            numeric_stamps.append(int(value))
+    except (OverflowError, TypeError, ValueError) as error:
         raise FilteringError(
             "header_stamp_ns must contain finite numbers"
         ) from error
-    if not all(math.isfinite(value) for value in numeric_stamps):
-        raise FilteringError("header_stamp_ns must contain finite numbers")
-    if any(current <= previous for previous, current in zip(stamps, stamps[1:])):
+    if any(
+        current <= previous
+        for previous, current in zip(numeric_stamps, numeric_stamps[1:])
+    ):
         raise FilteringError("header_stamp_ns must be strictly increasing")
-    first = stamps[0]
-    try:
-        return np.asarray(
-            [(value - first) * 1e-9 for value in stamps],
-            dtype=float,
-        )
-    except (TypeError, ValueError) as error:
-        raise FilteringError(
-            "header_stamp_ns must contain finite numbers"
-        ) from error
+    first = numeric_stamps[0]
+    return np.asarray(
+        [(value - first) * 1e-9 for value in numeric_stamps],
+        dtype=float,
+    )
 
 
 def filter_orientation(
@@ -156,6 +157,8 @@ def _load_csv(input_path):
         with input_path.open(newline="", encoding="utf-8") as stream:
             reader = csv.DictReader(stream)
             fieldnames = tuple(reader.fieldnames or ())
+            if len(fieldnames) != len(set(fieldnames)):
+                raise FilteringError("input CSV contains duplicate header columns")
             missing = [field for field in REQUIRED_FIELDS if field not in fieldnames]
             if missing:
                 raise FilteringError(
@@ -170,7 +173,13 @@ def _load_csv(input_path):
                         ", ".join(existing)
                     )
                 )
-            rows = list(reader)
+            rows = []
+            for line_number, row in enumerate(reader, start=2):
+                if None in row or any(row.get(field) is None for field in fieldnames):
+                    raise FilteringError(
+                        "input CSV line {} is malformed".format(line_number)
+                    )
+                rows.append(row)
     except FilteringError:
         raise
     except (OSError, csv.Error) as error:
@@ -214,8 +223,9 @@ def _temporary_name(destination, suffix):
 
 
 def _atomic_write_csv(destination, fieldnames, rows, result):
-    temporary = _temporary_name(destination, ".csv")
+    temporary = None
     try:
+        temporary = _temporary_name(destination, ".csv")
         with temporary.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=fieldnames + FILTERED_FIELDS)
             writer.writeheader()
@@ -229,11 +239,12 @@ def _atomic_write_csv(destination, fieldnames, rows, result):
                 )
                 writer.writerow(output)
         os.replace(str(temporary), str(destination))
-    except (OSError, csv.Error) as error:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    except (OSError, ValueError, csv.Error) as error:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
         raise FilteringError(
             "failed to write output CSV {}: {}".format(destination, error)
         ) from error
@@ -245,9 +256,10 @@ def _atomic_write_plot(destination, elapsed, roll, pitch, result):
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
 
-    temporary = _temporary_name(destination, ".png")
+    temporary = None
     figure = None
     try:
+        temporary = _temporary_name(destination, ".png")
         figure, axes = plt.subplots(2, 1, figsize=(18, 10.5), sharex=True)
         axes[0].plot(elapsed, roll, color="#8a8a8a", linewidth=0.8, label="Raw roll")
         axes[0].plot(
@@ -285,10 +297,11 @@ def _atomic_write_plot(destination, elapsed, roll, pitch, result):
         figure.savefig(str(temporary), format="png", dpi=100)
         os.replace(str(temporary), str(destination))
     except (OSError, ValueError) as error:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
         raise FilteringError(
             "failed to write output PNG {}: {}".format(destination, error)
         ) from error

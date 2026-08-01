@@ -141,6 +141,17 @@ class FilterOrientationTest(unittest.TestCase):
             np.zeros(4),
         )
 
+    def test_numeric_timestamp_strings_use_numeric_order(self):
+        stamps = [str(index * 25_000_000) for index in range(20)]
+
+        result = filtering.filter_orientation(
+            stamps,
+            np.zeros(20),
+            np.zeros(20),
+        )
+
+        self.assertAlmostEqual(result.sample_rate_hz, 40.0)
+
 
 class CsvPlotTest(unittest.TestCase):
     fieldnames = (
@@ -235,6 +246,36 @@ class CsvPlotTest(unittest.TestCase):
                     Path(directory) / "comparison.png",
                 )
 
+    def test_extra_csv_value_is_rejected_as_malformed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            self.write_input(input_path)
+            lines = input_path.read_text(encoding="utf-8").splitlines()
+            lines[1] += ",unexpected"
+            input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(filtering.FilteringError, "malformed"):
+                filtering.filter_csv(
+                    input_path,
+                    Path(directory) / "filtered.csv",
+                    Path(directory) / "comparison.png",
+                )
+
+    def test_duplicate_csv_header_is_rejected_as_malformed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            self.write_input(input_path)
+            lines = input_path.read_text(encoding="utf-8").splitlines()
+            lines[0] = lines[0].replace("pitch_deg", "roll_deg")
+            input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(filtering.FilteringError, "duplicate"):
+                filtering.filter_csv(
+                    input_path,
+                    Path(directory) / "filtered.csv",
+                    Path(directory) / "comparison.png",
+                )
+
     def test_input_path_cannot_be_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory) / "input.csv"
@@ -275,6 +316,52 @@ class CsvPlotTest(unittest.TestCase):
                 "old output\n",
             )
             self.assertEqual(set(os.listdir(directory)), names_before)
+
+    def test_csv_temporary_file_failure_is_wrapped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            self.write_input(input_path)
+
+            with mock.patch.object(
+                filtering.tempfile,
+                "NamedTemporaryFile",
+                side_effect=OSError("temporary failed"),
+            ):
+                with self.assertRaisesRegex(
+                    filtering.FilteringError,
+                    "failed to write output CSV",
+                ):
+                    filtering.filter_csv(
+                        input_path,
+                        Path(directory) / "filtered.csv",
+                        Path(directory) / "comparison.png",
+                    )
+
+    def test_png_temporary_file_failure_is_wrapped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.csv"
+            output_path = Path(directory) / "filtered.csv"
+            png_path = Path(directory) / "comparison.png"
+            first_temporary = Path(directory) / ".filtered-temporary.csv"
+            self.write_input(input_path)
+
+            with mock.patch.object(
+                filtering,
+                "_temporary_name",
+                side_effect=[first_temporary, OSError("temporary failed")],
+            ):
+                with self.assertRaisesRegex(
+                    filtering.FilteringError,
+                    "failed to write output PNG",
+                ):
+                    filtering.filter_csv(
+                        input_path,
+                        output_path,
+                        png_path,
+                    )
+
+            self.assertTrue(output_path.is_file())
+            self.assertFalse(first_temporary.exists())
 
 
 class CommandLineTest(unittest.TestCase):
