@@ -76,6 +76,13 @@ class InferenceEngine:
             selected_profile.data["output"]["coordinate_frame"]
         )
         self._compatibility_flags = _profile_flags(selected_profile)
+        reference_policy = selected_profile.data.get("inference_policy", {}).get(
+            "reference_stamp_policy", "every_tick"
+        )
+        if reference_policy not in {"every_tick", "new_stamp_once"}:
+            raise ValueError("unsupported reference_stamp_policy")
+        self._new_stamp_once = reference_policy == "new_stamp_once"
+        self._last_submitted_reference_ns = None
         self._tick_index = 0
         self._submitted_ticks: Dict[int, int] = {}
 
@@ -117,6 +124,12 @@ class InferenceEngine:
                 rng_seed=0,
             )
             return
+        reference_ns = reference_stamp.to_nsec()
+        if (
+            self._new_stamp_once
+            and reference_ns == self._last_submitted_reference_ns
+        ):
+            return
 
         snapshot = self._buffer.snapshot_at(reference_stamp, self._required_keys)
         if isinstance(snapshot, NotReady):
@@ -147,6 +160,8 @@ class InferenceEngine:
                 rng_seed=0,
             )
             return
+        if self._new_stamp_once:
+            self._last_submitted_reference_ns = reference_ns
         self._submitted_ticks[id(snapshot)] = self._tick_index
 
     def _publish_completion(self, completion: Any, tick_index: int) -> None:

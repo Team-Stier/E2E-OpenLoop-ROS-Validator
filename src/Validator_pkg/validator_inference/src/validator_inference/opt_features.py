@@ -225,6 +225,8 @@ def build_driving_feature_data(
     vy: float = 0.0,
     ax: float = 0.0,
     ay: float = 0.0,
+    command_index: int = 1,
+    source: str = "fallback",
     profile_data: Optional[Mapping[str, Any]] = None,
 ) -> DrivingFeatureData:
     """ego motion을 모델별 status feature와 정적 compatibility data로 만든다.
@@ -238,11 +240,11 @@ def build_driving_feature_data(
     if model_id in {"tfv6", "interfuser"}:
         status = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, float(vx))
     else:
+        if type(command_index) is not int or not 0 <= command_index < 4:
+            raise FeatureContractError("command_index must be an integer in [0, 3]")
+        command = tuple(float(index == command_index) for index in range(4))
         status = (
-            0.0,
-            1.0,
-            0.0,
-            0.0,
+            *command,
             float(vx),
             float(vy),
             float(ax),
@@ -261,6 +263,7 @@ def build_driving_feature_data(
         tfv6_radar_rows=0,
         tfv6_radar_cols=0,
         camera_calibrations=calibrations,
+        source=source,
     )
 
 

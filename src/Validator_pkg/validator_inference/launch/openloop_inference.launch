@@ -5,12 +5,16 @@
   <!-- Empty means: let each node resolve the source/install profile location. -->
   <arg name="profile_file" default=""/>
   <arg name="record_dir" default="$(arg project_root)/records/openloop"/>
+  <arg name="use_ros_time_stamp" default="false"/>
+  <arg name="command_sidecar" default=""/>
 
   <param name="/use_sim_time" value="true"/>
 
   <node pkg="validator_inference" type="opt_feeder_node.py" name="opt_feeder" output="screen" required="true">
     <param name="model_id" value="$(arg model_id)"/>
     <param if="$(eval arg('profile_file') != '')" name="profile_file" value="$(arg profile_file)"/>
+    <param name="use_ros_time_stamp" value="$(arg use_ros_time_stamp)"/>
+    <param if="$(eval arg('command_sidecar') != '')" name="command_sidecar" value="$(arg command_sidecar)"/>
   </node>
 
   <node pkg="validator_inference" type="inference_engine_node.py" name="inference_engine" output="screen" required="true" launch-prefix="&quot;$(find validator_inference)/scripts/model_env_exec&quot;">

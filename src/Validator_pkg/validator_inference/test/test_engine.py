@@ -27,7 +27,14 @@ def _stamp(nanoseconds):
     )
 
 
-def _profile(model_id="diffusiondrive_v2", compatibility_flags=()):
+def _profile(
+    model_id="diffusiondrive_v2",
+    compatibility_flags=(),
+    reference_stamp_policy=None,
+):
+    inference_policy = {}
+    if reference_stamp_policy is not None:
+        inference_policy["reference_stamp_policy"] = reference_stamp_policy
     return SimpleNamespace(
         model_id=model_id,
         profile_sha256="1" * 64,
@@ -60,6 +67,7 @@ def _profile(model_id="diffusiondrive_v2", compatibility_flags=()):
                 }
             },
             "compatibility_flags": list(compatibility_flags),
+            "inference_policy": inference_policy,
         },
     )
 
@@ -236,6 +244,57 @@ def test_prior_completion_is_published_before_current_frame_submit():
     engine.on_timer_tick(None)
 
     assert actions.index("publish:metric") < actions.index("try_submit")
+
+
+def test_new_stamp_once_does_not_resubmit_the_same_reference():
+    frame = _frame()
+    worker = _Worker()
+    engine, _, metric = _engine(
+        _Buffer(frame),
+        worker,
+        profile=_profile(reference_stamp_policy="new_stamp_once"),
+    )
+
+    engine.on_timer_tick(None)
+    engine.on_timer_tick(None)
+
+    assert worker.submitted == [frame]
+    assert metric.messages == []
+
+
+def test_new_stamp_once_retries_busy_then_accepts_later_stamp():
+    first = _frame()
+    buffer = _Buffer(first)
+    worker = _Worker(SubmitResult(False, "busy_tick_skipped"))
+    engine, _, metric = _engine(
+        buffer,
+        worker,
+        profile=_profile(reference_stamp_policy="new_stamp_once"),
+    )
+
+    engine.on_timer_tick(None)
+    worker.submit_result = SubmitResult(True, "accepted")
+    engine.on_timer_tick(None)
+    engine.on_timer_tick(None)
+
+    second = _frame(reference_ns=4_000_000_000)
+    buffer.result = second
+    buffer.reference_stamp = second.reference_stamp
+    engine.on_timer_tick(None)
+
+    assert worker.submitted == [first, first, second]
+    assert [message.outcome for message in metric.messages] == [
+        "busy_tick_skipped"
+    ]
+
+
+def test_rejects_unknown_reference_stamp_policy():
+    with pytest.raises(ValueError, match="reference_stamp_policy"):
+        _engine(
+            _Buffer(_frame()),
+            _Worker(),
+            profile=_profile(reference_stamp_policy="queue_forever"),
+        )
 
 
 def test_metric_uses_only_profile_declared_compatibility_flags():

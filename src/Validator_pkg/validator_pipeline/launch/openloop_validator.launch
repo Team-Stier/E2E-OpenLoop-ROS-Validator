@@ -5,6 +5,9 @@
   <arg name="profile_file" default=""/>
   <arg name="record_dir" default="$(arg project_root)/records/openloop"/>
   <arg name="sensor_config" default="$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0716demo.json"/>
+  <arg name="use_ros_time_stamp" default="false"/>
+  <arg name="command_sidecar" default=""/>
+  <arg name="morai_ddv2_domain" default="false"/>
 
   <arg name="show_gui" default="false"/>
   <arg name="show_rviz" default="false"/>
@@ -18,6 +21,8 @@
   <include file="$(find Validator_pkg)/launch/camera_bev_pipeline.launch">
     <arg name="config_path" value="$(arg sensor_config)"/>
     <arg name="model_profiles" value="$(arg model_id)"/>
+    <arg name="use_ros_time_stamp" value="$(arg use_ros_time_stamp)"/>
+    <arg name="morai_ddv2_domain" value="$(arg morai_ddv2_domain)"/>
     <arg name="show_gui" value="$(arg show_gui)"/>
     <arg name="forward_range" value="$(arg forward_range)"/>
     <arg name="lateral_range" value="$(arg lateral_range)"/>
@@ -31,6 +36,8 @@
     <arg name="model_env_root" value="$(arg model_env_root)"/>
     <arg name="profile_file" value="$(arg profile_file)"/>
     <arg name="record_dir" value="$(arg record_dir)"/>
+    <arg name="use_ros_time_stamp" value="$(arg use_ros_time_stamp)"/>
+    <arg name="command_sidecar" value="$(arg command_sidecar)"/>
   </include>
 
   <include file="$(find Validator_pkg)/launch/bev_visualization.launch">
