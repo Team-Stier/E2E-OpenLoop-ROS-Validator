@@ -1,8 +1,8 @@
 <launch>
-  <arg name="config_path" default="$(find Validator_pkg)/config/0716demo.json" />
+  <arg name="config_path" default="$(find Validator_pkg)/config/0725demo_ros.json" />
   <arg name="model_profiles" default="raw" />
   <arg name="use_ros_time_stamp" default="false" />
-  <arg name="morai_ddv2_domain" default="false" />
+  <arg name="morai_ddv2_domain" default="true" />
   <arg name="show_gui" default="true" />
   <arg name="forward_range" default="25.0" />
   <arg name="lateral_range" default="30.0" />

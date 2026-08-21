@@ -171,16 +171,24 @@ def test_parser_rejects_unknown_models_commands_and_abbreviations(
 
 
 @pytest.mark.parametrize("rviz", [False, True])
+@pytest.mark.parametrize(
+    "model_id, morai_domain",
+    [("interfuser", "false"), ("diffusiondrive_v2", "true")],
+)
 def test_launch_argv_is_exact_array_contract(
-    cli: ModuleType, tmp_path: Path, rviz: bool
+    cli: ModuleType,
+    tmp_path: Path,
+    rviz: bool,
+    model_id: str,
+    morai_domain: str,
 ):
     root = tmp_path.resolve()
     profile_file = root / "src/Validator_pkg/config/profile.json"
     sensor_config = (
-        root / "src/Validator_pkg/validator_pipeline/config/0716demo.json"
+        root / "src/Validator_pkg/validator_pipeline/config/0725demo_ros.json"
     )
 
-    result = cli._launch_argv(root, "interfuser", rviz)
+    result = cli._launch_argv(root, model_id, rviz)
 
     assert isinstance(result, list)
     assert result == [
@@ -190,8 +198,9 @@ def test_launch_argv_is_exact_array_contract(
         f"project_root:={root}",
         f"profile_file:={profile_file}",
         f"sensor_config:={sensor_config}",
-        "model_id:=interfuser",
+        f"model_id:={model_id}",
         f"model_env_root:={root / '.venvs'}",
+        f"morai_ddv2_domain:={morai_domain}",
         f"show_rviz:={'true' if rviz else 'false'}",
     ]
 

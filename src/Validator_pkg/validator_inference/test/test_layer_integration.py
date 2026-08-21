@@ -263,11 +263,11 @@ def test_integrated_launch_wires_one_model_id_through_all_layers():
         "$(arg project_root)/records/openloop"
     )
     assert top_level_args["sensor_config"].attrib["default"] == (
-        "$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0716demo.json"
+        "$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0725demo_ros.json"
     )
     assert top_level_args["use_ros_time_stamp"].attrib["default"] == "false"
     assert top_level_args["command_sidecar"].attrib["default"] == ""
-    assert top_level_args["morai_ddv2_domain"].attrib["default"] == "false"
+    assert top_level_args["morai_ddv2_domain"].attrib["default"] == "true"
 
     includes = {
         Path(element.attrib["file"]).name: element for element in root.findall("include")
@@ -352,7 +352,7 @@ def test_visualization_geometry_matches_preprocessing_and_path_frame_transform()
     assert transform == {
         "parent_frame_id": "base_link",
         "child_frame_id": "Lidar3D-4",
-        "translation_m": [2.0, 0.0, 1.5],
+        "translation_m": [1.5, 0.0, 1.25],
         "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
     }
 

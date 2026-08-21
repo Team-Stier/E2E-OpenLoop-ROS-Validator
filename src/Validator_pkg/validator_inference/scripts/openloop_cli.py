@@ -27,7 +27,7 @@ _PACKAGE_RELATIVE_ROOT = Path("src/Validator_pkg/validator_inference")
 _MANIFEST_RELATIVE_PATH = _PACKAGE_RELATIVE_ROOT / "config/model_environments.json"
 _PROFILE_RELATIVE_PATH = Path("src/Validator_pkg/config/profile.json")
 _SENSOR_CONFIG_RELATIVE_PATH = Path(
-    "src/Validator_pkg/validator_pipeline/config/0716demo.json"
+    "src/Validator_pkg/validator_pipeline/config/0725demo_ros.json"
 )
 
 
@@ -168,6 +168,7 @@ def _launch_argv(project_root: Path, model_id: str, rviz: bool) -> list[str]:
         f"sensor_config:={root / _SENSOR_CONFIG_RELATIVE_PATH}",
         f"model_id:={model_id}",
         f"model_env_root:={root / '.venvs'}",
+        f"morai_ddv2_domain:={'true' if model_id == 'diffusiondrive_v2' else 'false'}",
         f"show_rviz:={'true' if rviz else 'false'}",
     ]
 

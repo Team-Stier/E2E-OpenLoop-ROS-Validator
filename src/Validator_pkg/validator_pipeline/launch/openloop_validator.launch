@@ -4,10 +4,10 @@
   <arg name="model_env_root" default="$(arg project_root)/.venvs"/>
   <arg name="profile_file" default=""/>
   <arg name="record_dir" default="$(arg project_root)/records/openloop"/>
-  <arg name="sensor_config" default="$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0716demo.json"/>
+  <arg name="sensor_config" default="$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0725demo_ros.json"/>
   <arg name="use_ros_time_stamp" default="false"/>
   <arg name="command_sidecar" default=""/>
-  <arg name="morai_ddv2_domain" default="false"/>
+  <arg name="morai_ddv2_domain" default="true"/>
 
   <arg name="show_gui" default="false"/>
   <arg name="show_rviz" default="false"/>
