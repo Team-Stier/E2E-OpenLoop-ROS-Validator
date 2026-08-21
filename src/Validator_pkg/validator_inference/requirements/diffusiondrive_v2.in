@@ -1,0 +1,65 @@
+# Runtime requirements from the pinned DiffusionDriveV2 source:
+# https://github.com/hustvl/DiffusionDriveV2/blob/1cd12a1e155c34dcc471261835444c8d5587580b/requirements.txt
+#
+# The upstream Git dependency is expressed as the immutable nuPlan archive so
+# uv can hash it. Upstream docs/install.md names diffusers and einops without
+# versions; these exact pins make that additional runtime contract reproducible.
+# diffusers 0.35.2 is the newest tested release that imports with the upstream
+# torch 2.0.1 pin; 0.36.0 accesses torch.xpu, which torch 2.0.1 does not expose.
+
+PyYAML==6.0.3
+rospkg==1.6.0
+catkin-pkg==1.0.0
+netifaces==0.11.0
+python-dateutil==2.9.0.post0
+
+nuplan-devkit @ https://github.com/motional/nuplan-devkit/archive/ce3c323af01c0d7ec5672f7832ef53f9c679aab0.tar.gz
+scikit-learn==1.2.2
+positional-encodings==6.0.1
+
+aioboto3
+aiofiles
+bokeh==2.4.3
+casadi
+control==0.9.1
+Fiona
+geopandas>=0.12.1
+guppy3==3.1.2
+hydra-core==1.2.0
+joblib
+matplotlib
+nest_asyncio
+numpy==1.23.4
+opencv-python==4.9.0.80
+pandas
+Pillow
+psutil
+pyarrow
+pyinstrument
+pyogrio
+pyquaternion>=0.9.5
+pytest
+rasterio
+ray
+retry
+rtree
+scipy
+selenium
+setuptools==65.5.1
+Shapely>=2.0.0
+SQLAlchemy==1.4.27
+sympy
+tornado
+tqdm
+ujson
+
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+pytorch-lightning==2.2.1
+tensorboard==2.16.2
+protobuf==4.25.3
+
+notebook
+timm
+diffusers==0.35.2
+einops==0.8.1

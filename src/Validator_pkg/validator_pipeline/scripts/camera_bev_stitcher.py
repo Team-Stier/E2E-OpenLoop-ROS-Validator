@@ -97,29 +97,42 @@ def camera_axes(calibration):
     pitch = math.radians(calibration["pitch"])
     yaw = math.radians(calibration["yaw"])
 
-    # MORAI vehicle frame: x forward, y left, z up. Positive camera pitch in
-    # the supplied configuration points the optical axis down toward the road.
-    forward = np.array(
+    rotation_y = np.array(
         [
-            math.cos(pitch) * math.cos(yaw),
-            math.cos(pitch) * math.sin(yaw),
-            -math.sin(pitch),
+            [math.cos(pitch), 0.0, math.sin(pitch)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(pitch), 0.0, math.cos(pitch)],
         ],
         dtype=np.float32,
     )
-    right = np.array(
-        [math.sin(yaw), -math.cos(yaw), 0.0],
+    rotation_z = np.array(
+        [
+            [math.cos(yaw), -math.sin(yaw), 0.0],
+            [math.sin(yaw), math.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
         dtype=np.float32,
     )
-    down = np.cross(forward, right)
-
-    if roll != 0.0:
-        original_right = right.copy()
-        original_down = down.copy()
-        right = math.cos(roll) * original_right + math.sin(roll) * original_down
-        down = -math.sin(roll) * original_right + math.cos(roll) * original_down
-
-    return right, down, forward
+    optical_to_vehicle = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    optical_roll = np.array(
+        [
+            [math.cos(roll), -math.sin(roll), 0.0],
+            [math.sin(roll), math.cos(roll), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    camera_to_vehicle = (
+        rotation_y @ rotation_z @ optical_to_vehicle @ optical_roll
+    )
+    return tuple(camera_to_vehicle[:, index] for index in range(3))
 
 
 class CameraBEVStitcher:

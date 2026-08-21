@@ -1,0 +1,20 @@
+# Runtime-only dependencies validated against the pinned InterFuser source:
+# https://github.com/opendilab/InterFuser/tree/f0be8ea294c49a59febaa032dd6da40b475e3657
+# Training, simulator, and leaderboard dependencies are intentionally omitted.
+
+PyYAML==6.0.3
+rospkg==1.6.0
+catkin-pkg==1.0.0
+netifaces==0.11.0
+python-dateutil==2.9.0.post0
+
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+numpy==1.24.4
+pillow==10.4.0
+opencv-python==4.10.0.84
+imgaug==0.4.0
+scikit-image==0.21.0
+scipy==1.10.1
+shapely==2.0.7
+tqdm==4.69.0

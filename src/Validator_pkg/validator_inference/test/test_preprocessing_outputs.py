@@ -4,11 +4,13 @@ from collections import deque
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 
 np = pytest.importorskip("numpy")
+cv2 = pytest.importorskip("cv2")
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_SCRIPTS = PACKAGE_ROOT.parent / "validator_pipeline" / "scripts"
@@ -29,6 +31,11 @@ def _load_pipeline_script(name):
 @pytest.fixture(scope="module")
 def image_adaptor():
     return _load_pipeline_script("image_adaptor.py")
+
+
+@pytest.fixture(scope="module")
+def camera_stitcher():
+    return _load_pipeline_script("camera_bev_stitcher.py")
 
 
 @pytest.fixture(scope="module")
@@ -104,6 +111,127 @@ def test_all_camera_profiles_emit_model_transport_contracts(
     assert all(np.isfinite(value).all() for value in sparse.values())
 
 
+def test_diffusiondrive_camera_matches_morai_training_adapter(image_adaptor):
+    images = {
+        "left": np.arange(480 * 640 * 3, dtype=np.uint32)
+        .reshape(480, 640, 3)
+        .astype(np.uint8),
+        "front": np.arange(720 * 1280 * 3, dtype=np.uint32)
+        .reshape(720, 1280, 3)
+        .astype(np.uint8),
+        "right": np.arange(480 * 640 * 3, dtype=np.uint32)[::-1]
+        .reshape(480, 640, 3)
+        .astype(np.uint8),
+    }
+    resized = [
+        cv2.resize(
+            cv2.cvtColor(images[name], cv2.COLOR_BGR2RGB),
+            size,
+            interpolation=cv2.INTER_AREA,
+        )
+        for name, size in (
+            ("left", (341, 256)),
+            ("front", (455, 256)),
+            ("right", (341, 256)),
+        )
+    ]
+    expected = (
+        np.concatenate(resized, axis=1)[:, 56:1080]
+        .astype(np.float32)
+        / np.float32(255.0)
+    )
+
+    actual = image_adaptor.prepare_diffusiondrive_v2(
+        images,
+        morai_domain=True,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+
+    canonical = {
+        name: cv2.resize(
+            cv2.cvtColor(images[name], cv2.COLOR_BGR2RGB),
+            (1920, 1080),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        for name in image_adaptor.CAMERA_NAMES
+    }
+    official = cv2.resize(
+        np.concatenate(
+            [
+                canonical["left"][28:-28, 416:-416],
+                canonical["front"][28:-28],
+                canonical["right"][28:-28, 416:-416],
+            ],
+            axis=1,
+        ),
+        (1024, 256),
+        interpolation=cv2.INTER_LINEAR,
+    ).astype(np.float32) / np.float32(255.0)
+    np.testing.assert_array_equal(
+        image_adaptor.prepare_diffusiondrive_v2(images),
+        official,
+    )
+
+
+def test_morai_camera_rotations_match_recorded_optical_frame_transforms(
+    image_adaptor,
+    camera_stitcher,
+):
+    config_path = (
+        PACKAGE_ROOT.parent
+        / "validator_pipeline"
+        / "config"
+        / "0716demo.json"
+    )
+    sparse_calibration = image_adaptor.load_sparsedrive_calibration(config_path)
+    bev_calibrations = camera_stitcher.load_camera_calibrations(config_path)
+    expected_camera_to_lidar = {
+        "front": np.asarray(
+            [
+                [0.0, -0.03489949670250097, 0.9993908270190958],
+                [-1.0, 0.0, 0.0],
+                [0.0, -0.9993908270190958, -0.03489949670250097],
+            ]
+        ),
+        "left": np.asarray(
+            [
+                [0.9254165783983233, -0.17364817766693033, 0.33682408883346526],
+                [-0.3420201433256688, 0.0, 0.9396926207859083],
+                [-0.1631759111665348, -0.984807753012208, -0.05939117461388472],
+            ]
+        ),
+        "right": np.asarray(
+            [
+                [-0.9254165783983233, -0.17364817766693033, 0.33682408883346543],
+                [-0.342020143325669, 0.0, -0.9396926207859083],
+                [0.1631759111665348, -0.984807753012208, -0.05939117461388475],
+            ]
+        ),
+    }
+
+    for camera_name, expected in expected_camera_to_lidar.items():
+        vehicle_to_optical = (
+            image_adaptor.camera_vehicle_to_optical_rotation(
+                sparse_calibration["cameras"][camera_name]
+            )
+        )
+        np.testing.assert_allclose(
+            vehicle_to_optical,
+            expected.T,
+            atol=1.0e-12,
+        )
+
+        right, down, forward = camera_stitcher.camera_axes(
+            bev_calibrations[camera_name]
+        )
+        np.testing.assert_allclose(
+            np.stack([right, down, forward], axis=1),
+            expected,
+            atol=1.0e-7,
+        )
+
+
 def test_lidar_profiles_emit_expected_hwc_transport_shapes(lidar_processor):
     points = np.asarray(
         [
@@ -132,10 +260,150 @@ def test_lidar_profiles_emit_expected_hwc_transport_shapes(lidar_processor):
     assert float(interfuser[:, :, :2].max()) <= 1.0
     assert float(interfuser[:, :, 2].max()) <= 2.0
 
-    diffusion = lidar_processor.prepare_diffusiondrive_v2(points)
+    diffusion = lidar_processor.prepare_diffusiondrive_v2(
+        points,
+        morai_domain=True,
+    )
     assert diffusion.shape == (256, 256)
     assert diffusion.dtype == np.float32
     assert 0.0 <= float(diffusion.min()) <= float(diffusion.max()) <= 1.0
+
+
+def test_diffusiondrive_lidar_removes_only_the_3d_vehicle_roof(lidar_processor):
+    points = np.asarray(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, -1.0, 0.8],
+            [2.0, 1.0, 1.6],
+            [1.0, 0.0, 0.5],
+            [3.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    default = lidar_processor.prepare_diffusiondrive_v2(points)
+    diffusion = lidar_processor.prepare_diffusiondrive_v2(
+        points,
+        morai_domain=True,
+    )
+
+    x_inside = int((1.0 + 32.0) * 4.0)
+    x_ahead = int((3.0 + 32.0) * 4.0)
+    y_center = int((0.0 + 32.0) * 4.0)
+    assert default[x_inside, y_center] == pytest.approx(0.4)
+    assert diffusion[x_inside, y_center] == pytest.approx(0.2)
+    assert diffusion[x_ahead, y_center] == pytest.approx(0.2)
+    assert diffusion[int(32.0 * 4.0), int(31.0 * 4.0)] == 0.0
+    assert diffusion[int(34.0 * 4.0), int(33.0 * 4.0)] == 0.0
+
+
+def test_replay_stamp_switch_uses_ros_clock(
+    image_adaptor,
+    lidar_processor,
+    monkeypatch,
+):
+    source_stamp = object()
+    replay_stamp = object()
+
+    class FakeTime:
+        @staticmethod
+        def now():
+            return replay_stamp
+
+    for module in (image_adaptor, lidar_processor):
+        monkeypatch.setattr(module.rospy, "Time", FakeTime)
+        assert module.select_output_stamp(source_stamp, False) is source_stamp
+        assert module.select_output_stamp(source_stamp, True) is replay_stamp
+
+    class Bridge:
+        @staticmethod
+        def cv2_to_imgmsg(_image, encoding):
+            return SimpleNamespace(
+                encoding=encoding,
+                header=SimpleNamespace(seq=0, stamp=None, frame_id=""),
+            )
+
+    class Publisher:
+        message = None
+
+        def publish(self, message):
+            self.message = message
+
+    header = SimpleNamespace(seq=7, stamp=source_stamp, frame_id="sensor")
+    for module, owner in (
+        (image_adaptor, image_adaptor.ImageAdaptor),
+        (lidar_processor, lidar_processor.LidarBEVProcessor),
+    ):
+        publisher = Publisher()
+        node = SimpleNamespace(bridge=Bridge(), use_ros_time_stamp=True)
+        owner.publish_image(
+            node,
+            publisher,
+            np.zeros((1, 1), dtype=np.uint8),
+            "mono8",
+            header,
+            "base_link",
+        )
+        assert publisher.message.header.stamp is source_stamp
+
+
+def test_replay_receipt_stamps_do_not_change_camera_source_sync(
+    image_adaptor,
+    monkeypatch,
+):
+    class Stamp:
+        def __init__(self, seconds):
+            self.seconds = seconds
+
+        def to_sec(self):
+            return self.seconds
+
+        def to_nsec(self):
+            return int(self.seconds * 1_000_000_000)
+
+    node = image_adaptor.ImageAdaptor.__new__(image_adaptor.ImageAdaptor)
+    node.use_ros_time_stamp = True
+    node.decode_compressed_image = lambda _message: np.zeros(
+        (2, 2, 3), dtype=np.uint8
+    )
+    node.publish_image = lambda *_args, **_kwargs: None
+    node.legacy_publishers = {name: object() for name in image_adaptor.CAMERA_NAMES}
+    node.model_profiles = {"diffusiondrive_v2"}
+    node.lock = threading.Lock()
+    node.generation = {name: 0 for name in image_adaptor.CAMERA_NAMES}
+    node.latest = {}
+    node.last_profile_generation = {
+        name: 0 for name in image_adaptor.CAMERA_NAMES
+    }
+    node.sync_slop = 0.1
+    snapshots = []
+    node.publish_model_profiles = snapshots.append
+    receipt_stamps = iter((Stamp(10.0), Stamp(11.0), Stamp(12.0)))
+    monkeypatch.setattr(
+        image_adaptor,
+        "select_output_stamp",
+        lambda _source, _enabled: next(receipt_stamps),
+    )
+    monkeypatch.setattr(image_adaptor.rospy, "loginfo_throttle", lambda *_args: None)
+    monkeypatch.setattr(image_adaptor.rospy, "logwarn_throttle", lambda *_args: None)
+
+    for name, source_seconds in zip(
+        image_adaptor.CAMERA_NAMES,
+        (1.00, 1.02, 1.01),
+    ):
+        image_adaptor.ImageAdaptor.image_callback(
+            node,
+            SimpleNamespace(
+                header=SimpleNamespace(
+                    seq=1,
+                    stamp=Stamp(source_seconds),
+                    frame_id=name,
+                )
+            ),
+            name,
+        )
+
+    assert len(snapshots) == 1
 
 
 def test_visualizer_transform_causal_history_and_grid_mask(visualizer):

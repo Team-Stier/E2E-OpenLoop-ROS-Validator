@@ -252,6 +252,22 @@ def test_integrated_launch_wires_one_model_id_through_all_layers():
     root = ElementTree.parse(launch_path).getroot()
     top_level_args = {element.attrib["name"]: element for element in root.findall("arg")}
     assert "model_id" in top_level_args
+    assert "project_root" in top_level_args
+    assert top_level_args["project_root"].attrib["default"] == (
+        "$(eval '/'.join(find('Validator_pkg').split('/')[:-3]))"
+    )
+    assert top_level_args["model_env_root"].attrib["default"] == (
+        "$(arg project_root)/.venvs"
+    )
+    assert top_level_args["record_dir"].attrib["default"] == (
+        "$(arg project_root)/records/openloop"
+    )
+    assert top_level_args["sensor_config"].attrib["default"] == (
+        "$(arg project_root)/src/Validator_pkg/validator_pipeline/config/0725demo_ros.json"
+    )
+    assert top_level_args["use_ros_time_stamp"].attrib["default"] == "false"
+    assert top_level_args["command_sidecar"].attrib["default"] == ""
+    assert top_level_args["morai_ddv2_domain"].attrib["default"] == "true"
 
     includes = {
         Path(element.attrib["file"]).name: element for element in root.findall("include")
@@ -275,13 +291,48 @@ def test_integrated_launch_wires_one_model_id_through_all_layers():
         for arg in includes["bev_visualization.launch"].findall("arg")
     }
     assert preprocessing_args["model_profiles"] == "$(arg model_id)"
+    assert preprocessing_args["config_path"] == "$(arg sensor_config)"
+    assert preprocessing_args["use_ros_time_stamp"] == "$(arg use_ros_time_stamp)"
+    assert preprocessing_args["morai_ddv2_domain"] == "$(arg morai_ddv2_domain)"
     assert inference_args["model_id"] == "$(arg model_id)"
     assert inference_args["profile_file"] == "$(arg profile_file)"
+    assert inference_args["project_root"] == "$(arg project_root)"
+    assert inference_args["model_env_root"] == "$(arg model_env_root)"
+    assert inference_args["record_dir"] == "$(arg record_dir)"
+    assert inference_args["use_ros_time_stamp"] == "$(arg use_ros_time_stamp)"
+    assert inference_args["command_sidecar"] == "$(arg command_sidecar)"
     assert visualization_args["profile_file"] == "$(arg profile_file)"
     for geometry_argument in ("forward_range", "lateral_range", "resolution"):
         expected = f"$(arg {geometry_argument})"
         assert preprocessing_args[geometry_argument] == expected
         assert visualization_args[geometry_argument] == expected
+
+    preprocessing = ElementTree.parse(
+        PIPELINE_PACKAGE / "launch" / "camera_bev_pipeline.launch"
+    ).getroot()
+    image_adaptor = next(
+        node
+        for node in preprocessing.findall("node")
+        if node.attrib["name"] == "image_adaptor"
+    )
+    image_parameters = {
+        parameter.attrib["name"]: parameter.attrib["value"]
+        for parameter in image_adaptor.findall("param")
+    }
+    lidar_processor = next(
+        node
+        for node in preprocessing.findall("node")
+        if node.attrib["name"] == "lidar_bev_processor"
+    )
+    lidar_parameters = {
+        parameter.attrib["name"]: parameter.attrib["value"]
+        for parameter in lidar_processor.findall("param")
+    }
+    assert image_parameters["config_path"] == "$(arg config_path)"
+    assert image_parameters["use_ros_time_stamp"] == "$(arg use_ros_time_stamp)"
+    assert image_parameters["morai_ddv2_domain"] == "$(arg morai_ddv2_domain)"
+    assert lidar_parameters["use_ros_time_stamp"] == "$(arg use_ros_time_stamp)"
+    assert lidar_parameters["morai_ddv2_domain"] == "$(arg morai_ddv2_domain)"
 
 
 def test_visualization_geometry_matches_preprocessing_and_path_frame_transform():

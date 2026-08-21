@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_source_ros_environment() {
+  set +u
+  source /opt/ros/noetic/setup.bash
+  if [[ -f "$PROJECT_ROOT/devel/setup.bash" ]]; then
+    source "$PROJECT_ROOT/devel/setup.bash"
+  fi
+  set -u
+}
+_source_ros_environment
+unset -f _source_ros_environment
+export OPENLOOP_PROJECT_ROOT="$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT/src/Validator_pkg/validator_inference/src${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 "$PROJECT_ROOT/src/Validator_pkg/validator_inference/scripts/openloop_cli.py" "$@"

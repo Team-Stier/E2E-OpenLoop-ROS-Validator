@@ -69,6 +69,37 @@ def test_navsim_models_preserve_command_velocity_and_acceleration_order(model_id
     assert feature.tfv6_radar == ()
 
 
+@pytest.mark.parametrize(
+    "command_index, expected",
+    [
+        (0, (1.0, 0.0, 0.0, 0.0)),
+        (1, (0.0, 1.0, 0.0, 0.0)),
+        (2, (0.0, 0.0, 1.0, 0.0)),
+        (3, (0.0, 0.0, 0.0, 1.0)),
+    ],
+)
+def test_diffusiondrive_accepts_oracle_command(command_index, expected):
+    feature = build_driving_feature_data(
+        "diffusiondrive_v2",
+        vx=1.0,
+        command_index=command_index,
+        source="future_trajectory_oracle",
+    )
+
+    assert feature.status_feature[:4] == expected
+    assert feature.source == "future_trajectory_oracle"
+
+
+@pytest.mark.parametrize("command_index", [-1, 4, True])
+def test_diffusiondrive_rejects_invalid_oracle_command(command_index):
+    with pytest.raises(FeatureContractError, match="command_index"):
+        build_driving_feature_data(
+            "diffusiondrive_v2",
+            vx=0.0,
+            command_index=command_index,
+        )
+
+
 def test_sparse_calibration_is_converted_in_front_left_right_order():
     cameras = [
         _camera("right", 640, 480, 3),

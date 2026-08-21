@@ -26,6 +26,7 @@ import math
 import os
 import threading
 from collections import deque, namedtuple
+from copy import copy
 
 import cv2
 import numpy as np
@@ -417,18 +418,34 @@ def prepare_interfuser(points_vehicle):
     )
 
 
-def prepare_diffusiondrive_v2(points_vehicle):
+def prepare_diffusiondrive_v2(points_vehicle, morai_domain=False):
     """Build the public default DiffusionDriveV2 1x256x256 LiDAR input."""
     if points_vehicle.size == 0:
         above = points_vehicle
     else:
         below_max_height = points_vehicle[:, 2] < 100.0
         above_split = points_vehicle[:, 2] > 0.2
-        above = points_vehicle[below_max_height & above_split]
+        keep = below_max_height & above_split
+        if morai_domain:
+            inside_vehicle = (
+                (0.0 <= points_vehicle[:, 0])
+                & (points_vehicle[:, 0] <= 2.0)
+                & (-1.0 <= points_vehicle[:, 1])
+                & (points_vehicle[:, 1] <= 1.0)
+                & (0.8 <= points_vehicle[:, 2])
+                & (points_vehicle[:, 2] <= 1.6)
+            )
+            keep &= ~inside_vehicle
+        above = points_vehicle[keep]
 
     x_edges = np.linspace(-32.0, 32.0, 257, dtype=np.float32)
     y_edges = np.linspace(-32.0, 32.0, 257, dtype=np.float32)
     return capped_histogram(above[:, :2], x_edges, y_edges)
+
+
+def select_output_stamp(source_stamp, use_ros_time_stamp):
+    """명시적으로 요청한 경우에만 bag replay 시각을 선택한다."""
+    return rospy.Time.now() if use_ros_time_stamp else source_stamp
 
 
 def vehicle_points_to_world(points_vehicle, pose):
@@ -489,6 +506,12 @@ class LidarBEVProcessor:
         ).lstrip("/")
         self.output_frame_id = rospy.get_param("~frame_id", "base_link")
         self.show_gui = bool(rospy.get_param("~show_gui", False))
+        self.use_ros_time_stamp = bool(
+            rospy.get_param("~use_ros_time_stamp", False)
+        )
+        self.morai_ddv2_domain = bool(
+            rospy.get_param("~morai_ddv2_domain", False)
+        )
         self.forward_range = float(rospy.get_param("~forward_range", 25.0))
         self.lateral_range = float(rospy.get_param("~lateral_range", 30.0))
         self.resolution = float(rospy.get_param("~resolution", 0.05))
@@ -707,6 +730,11 @@ class LidarBEVProcessor:
 
     def lidar_callback(self, message):
         """Decode one cloud and publish every selected LiDAR representation."""
+        output_header = copy(message.header)
+        output_header.stamp = select_output_stamp(
+            message.header.stamp,
+            self.use_ros_time_stamp,
+        )
         try:
             points_sensor = decode_point_cloud(message)
             points_vehicle = sensor_to_vehicle(
@@ -730,7 +758,7 @@ class LidarBEVProcessor:
             self.visual_publisher,
             visual,
             "mono8",
-            message.header,
+            output_header,
             self.output_frame_id,
         )
 
@@ -749,7 +777,7 @@ class LidarBEVProcessor:
                 self.model_publishers["tfv6"],
                 prepare_tfv6(accumulated_points),
                 "32FC1",
-                message.header,
+                output_header,
                 "tfv6_lidar_bev",
             )
 
@@ -758,16 +786,19 @@ class LidarBEVProcessor:
                 self.model_publishers["interfuser"],
                 prepare_interfuser(points_vehicle),
                 "32FC3",
-                message.header,
+                output_header,
                 "interfuser_lidar_bev",
             )
 
         if "diffusiondrive_v2" in self.model_profiles:
             self.publish_image(
                 self.model_publishers["diffusiondrive_v2"],
-                prepare_diffusiondrive_v2(points_vehicle),
+                prepare_diffusiondrive_v2(
+                    points_vehicle,
+                    self.morai_ddv2_domain,
+                ),
                 "32FC1",
-                message.header,
+                output_header,
                 "diffusiondrive_v2_lidar_bev",
             )
 

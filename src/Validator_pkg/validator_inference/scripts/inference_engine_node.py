@@ -7,7 +7,9 @@
 """
 
 from datetime import datetime, timezone
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
+import stat
 import uuid
 
 import rospkg
@@ -50,6 +52,52 @@ def _new_run_id() -> str:
     return "{}-{}".format(started, uuid.uuid4().hex[:8])
 
 
+def _project_root_from_environment():
+    """선택적 wrapper project root를 보정 없이 검증한다.
+
+    입력: ``OPENLOOP_PROJECT_ROOT`` environment variable.
+    반환: 변수가 없으면 ``None``, 있으면 canonical 실제 project directory.
+    """
+    value = os.environ.get("OPENLOOP_PROJECT_ROOT")
+    if value is None:
+        return None
+    if (
+        not value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise RuntimeError("OPENLOOP_PROJECT_ROOT must be a canonical absolute path")
+    pure = PurePosixPath(value)
+    if (
+        not pure.is_absolute()
+        or value.startswith("//")
+        or value != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        raise RuntimeError("OPENLOOP_PROJECT_ROOT must be a canonical absolute path")
+    project_root = Path(*pure.parts)
+    try:
+        metadata = project_root.lstat()
+        resolved = project_root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("OPENLOOP_PROJECT_ROOT directory is missing") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or resolved != project_root:
+        raise RuntimeError("OPENLOOP_PROJECT_ROOT must be a canonical real directory")
+    return project_root
+
+
+def _build_model_for_project(selected_profile):
+    """wrapper project root 또는 기존 source fallback으로 concrete model을 만든다.
+
+    입력: 검증된 ``SelectedProfile``.
+    반환: 아직 load하지 않은 concrete model wrapper.
+    """
+    project_root = _project_root_from_environment()
+    if project_root is None:
+        return build_selected_model(selected_profile)
+    return build_selected_model(selected_profile, project_root=project_root)
+
+
 def require_sim_time(get_param) -> None:
     """rosbag open-loop 평가가 simulated clock을 사용하도록 강제한다.
 
@@ -81,7 +129,7 @@ class InferenceEngineNode:
         run_id = rospy.get_param("~run_id", _new_run_id())
 
         selected_profile = load_selected_profile(profile_file, model_id)
-        model = build_selected_model(selected_profile)
+        model = _build_model_for_project(selected_profile)
         model.load()
 
         input_buffer = InputBuffer.configure(selected_profile)

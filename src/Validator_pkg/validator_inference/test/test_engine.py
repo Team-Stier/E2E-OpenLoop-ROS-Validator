@@ -27,7 +27,14 @@ def _stamp(nanoseconds):
     )
 
 
-def _profile(model_id="diffusiondrive_v2", compatibility_flags=()):
+def _profile(
+    model_id="diffusiondrive_v2",
+    compatibility_flags=(),
+    reference_stamp_policy=None,
+):
+    inference_policy = {}
+    if reference_stamp_policy is not None:
+        inference_policy["reference_stamp_policy"] = reference_stamp_policy
     return SimpleNamespace(
         model_id=model_id,
         profile_sha256="1" * 64,
@@ -60,6 +67,7 @@ def _profile(model_id="diffusiondrive_v2", compatibility_flags=()):
                 }
             },
             "compatibility_flags": list(compatibility_flags),
+            "inference_policy": inference_policy,
         },
     )
 
@@ -238,6 +246,57 @@ def test_prior_completion_is_published_before_current_frame_submit():
     assert actions.index("publish:metric") < actions.index("try_submit")
 
 
+def test_new_stamp_once_does_not_resubmit_the_same_reference():
+    frame = _frame()
+    worker = _Worker()
+    engine, _, metric = _engine(
+        _Buffer(frame),
+        worker,
+        profile=_profile(reference_stamp_policy="new_stamp_once"),
+    )
+
+    engine.on_timer_tick(None)
+    engine.on_timer_tick(None)
+
+    assert worker.submitted == [frame]
+    assert metric.messages == []
+
+
+def test_new_stamp_once_retries_busy_then_accepts_later_stamp():
+    first = _frame()
+    buffer = _Buffer(first)
+    worker = _Worker(SubmitResult(False, "busy_tick_skipped"))
+    engine, _, metric = _engine(
+        buffer,
+        worker,
+        profile=_profile(reference_stamp_policy="new_stamp_once"),
+    )
+
+    engine.on_timer_tick(None)
+    worker.submit_result = SubmitResult(True, "accepted")
+    engine.on_timer_tick(None)
+    engine.on_timer_tick(None)
+
+    second = _frame(reference_ns=4_000_000_000)
+    buffer.result = second
+    buffer.reference_stamp = second.reference_stamp
+    engine.on_timer_tick(None)
+
+    assert worker.submitted == [first, first, second]
+    assert [message.outcome for message in metric.messages] == [
+        "busy_tick_skipped"
+    ]
+
+
+def test_rejects_unknown_reference_stamp_policy():
+    with pytest.raises(ValueError, match="reference_stamp_policy"):
+        _engine(
+            _Buffer(_frame()),
+            _Worker(),
+            profile=_profile(reference_stamp_policy="queue_forever"),
+        )
+
+
 def test_metric_uses_only_profile_declared_compatibility_flags():
     profile = _profile(compatibility_flags=("camera_rig_differs_from_training",))
     engine, _, metric = _engine(
@@ -411,6 +470,46 @@ def test_node_requires_sim_time_and_declares_exactly_one_tenth_second_timer():
     assert "rospy.Duration.from_sec(0.1)" in source
     assert "rospy.Subscriber(" not in source
     assert "/inference_time" not in source
+
+
+def test_node_passes_validated_environment_project_root_to_model_selection(
+    tmp_path, monkeypatch
+):
+    """wrapper가 검증한 project root를 concrete model asset 해석에 사용한다."""
+    module, _source = _load_node_script()
+    selected_profile = object()
+    calls = []
+    project_root = tmp_path.resolve()
+    monkeypatch.setenv("OPENLOOP_PROJECT_ROOT", str(project_root))
+
+    def record_build(profile, **kwargs):
+        """model selector 호출 형태를 기록한다."""
+        calls.append((profile, kwargs))
+        return "model"
+
+    monkeypatch.setattr(
+        module,
+        "build_selected_model",
+        record_build,
+    )
+
+    assert module._build_model_for_project(selected_profile) == "model"
+    assert calls == [(selected_profile, {"project_root": project_root})]
+
+    monkeypatch.delenv("OPENLOOP_PROJECT_ROOT")
+    calls.clear()
+    assert module._build_model_for_project(selected_profile) == "model"
+    assert calls == [(selected_profile, {})]
+
+
+@pytest.mark.parametrize("value", ("relative", "/tmp/../tmp", "/missing/project"))
+def test_node_rejects_unvalidated_environment_project_root(value, monkeypatch):
+    """직접 node 실행도 상대·비정규·누락 project root를 신뢰하지 않는다."""
+    module, _source = _load_node_script()
+    monkeypatch.setenv("OPENLOOP_PROJECT_ROOT", value)
+
+    with pytest.raises(RuntimeError, match="OPENLOOP_PROJECT_ROOT"):
+        module._build_model_for_project(object())
 
 
 def test_catkin_contract_installs_engine_and_declares_direct_tf_message_dependency():

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from validator_inference import assets
 from validator_inference.assets import (
     AssetError,
     fetch_runtime_assets,
@@ -23,7 +24,7 @@ from validator_inference.models.interfuser import InterFuserModel
 from validator_inference.models.select import build_selected_model
 from validator_inference.models.sparsedrive_v2 import SparseDriveV2Model
 from validator_inference.models.tfv6 import TFv6Model
-from validator_inference.profile_store import SelectedProfile
+from validator_inference.profile_store import SelectedProfile, load_selected_profile
 
 
 MODEL_TYPES = {
@@ -32,6 +33,48 @@ MODEL_TYPES = {
     "diffusiondrive_v2": DiffusionDriveV2InferenceModel,
     "sparsedrive_v2": SparseDriveV2Model,
 }
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+PROFILE_PATH = PACKAGE_ROOT.parent / "config" / "profile.json"
+
+
+def test_generated_asset_publication_preserves_equal_file_identity(tmp_path):
+    destination = tmp_path / "generated.py"
+    payload = b"VALUE = 1\n"
+    destination.write_bytes(payload)
+    before = destination.stat()
+
+    assets._publish_generated_bytes(destination, payload)
+
+    after = destination.stat()
+    assert destination.read_bytes() == payload
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+def test_generated_asset_publication_atomically_replaces_changed_bytes(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "generated.py"
+    destination.write_bytes(b"VALUE = 1\n")
+    real_replace = os.replace
+    replacements = []
+
+    def record_replace(source, target):
+        replacements.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    monkeypatch.setattr(assets.os, "replace", record_replace)
+
+    assets._publish_generated_bytes(destination, b"VALUE = 2\n")
+
+    assert destination.read_bytes() == b"VALUE = 2\n"
+    assert len(replacements) == 1
+    assert replacements[0][1] == destination
+    assert replacements[0][0].parent == destination.parent
 
 
 def _selected(model_id, data=None):
@@ -98,6 +141,19 @@ def test_factory_returns_exact_concrete_type_without_loading_assets(
 def test_factory_rejects_unknown_model_id(tmp_path):
     with pytest.raises(ValueError, match="unsupported model_id: unknown"):
         build_selected_model(_selected("unknown"), project_root=tmp_path)
+
+
+def test_interfuser_asset_order_keeps_checkpoint_at_runtime_index_zero():
+    profile = load_selected_profile(PROFILE_PATH, "interfuser").data
+
+    assert [asset["role"] for asset in profile["runtime_assets"]] == [
+        "checkpoint",
+        "image_backbone",
+    ]
+    assert profile["runtime_assets"][0]["path"] == (
+        "models/interfuser/official_carla/interfuser.pth.tar"
+    )
+    assert "43.163.208.95" not in json.dumps(profile, sort_keys=True)
 
 
 def test_missing_asset_names_resolved_path_and_expected_hash(tmp_path):
@@ -256,6 +312,49 @@ def test_fetch_dispatches_download_atomically_and_writes_manifest(tmp_path):
     assert target.read_bytes() == b"downloaded"
     assert all(call[1] != target for call in calls)
     assert manifest == tmp_path / "models/interfuser/asset-manifest.json"
+
+
+def test_fetch_hash_mismatch_is_not_published_and_retry_recovers(tmp_path):
+    """잘못된 HTTP body는 final에 남기지 않고 다음 setup이 다시 받을 수 있다."""
+    upstream = tmp_path / "upstream"
+    commit = _git_repo(upstream)
+    expected = b"exact helper"
+    profile = {
+        "id": "tfv6",
+        "source": {"repository": upstream.as_uri(), "commit": commit},
+        "runtime_assets": [
+            {
+                "role": "carla_helper",
+                "path": "models/sources/lead/3rd_party/helper.py",
+                "source_url": "file:///fixture/helper.py",
+                "sha256": hashlib.sha256(expected).hexdigest(),
+            }
+        ],
+    }
+    target = tmp_path / "models/sources/lead/3rd_party/helper.py"
+
+    with pytest.raises(AssetError, match="SHA-256 mismatch"):
+        fetch_runtime_assets(
+            profile,
+            model_id="tfv6",
+            project_root=tmp_path,
+            downloader=lambda _url, destination: Path(destination).write_bytes(
+                b"wrong HTTP 200 body"
+            ),
+        )
+
+    assert not target.exists()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"poisoned by an earlier setup")
+    fetch_runtime_assets(
+        profile,
+        model_id="tfv6",
+        project_root=tmp_path,
+        downloader=lambda _url, destination: Path(destination).write_bytes(
+            expected
+        ),
+    )
+    assert target.read_bytes() == expected
 
 
 def test_load_is_lazy_but_missing_source_failure_names_model_and_checkout(tmp_path):

@@ -269,7 +269,7 @@ rosrun Validator_pkg image_adaptor.py _model_profiles:=all
 
 InterFuser histogram은 고정 source와 동일하게 `xbins=np.linspace(-28,29,225)`, `ybins=np.linspace(-28,0,225)`를 사용해 각 축에 225개 edge/224개 bin을 만든다. x 끝값 29는 의도된 계약이며 28로 바꾸지 않는다.
 
-좌표 변환에는 `validator_pipeline/config/0716demo.json`과 공유 profile의 LiDAR 장착 위치 `(x=2.0, y=0.0, z=1.5)`를 사용한다. TFv6 inference는 `/lidar3D`의 시간순 raw `PointCloud2` 10개를 직접 FIFO에 보관한다. 각 sweep stamp에서 `/tf`의 `map` → `base_link` pose를 translation 선형 보간과 quaternion SLERP로 구한 뒤 최신 causal anchor로 정렬하고, 고정된 LEAD builder의 ego mask·ground removal·rasterization 순서를 적용한다. 따라서 `/lidar/tfv6/processed` 5-sweep 영상은 TFv6 model input이 아니다.
+좌표 변환에는 `validator_pipeline/config/0725demo_ros.json`과 공유 profile의 LiDAR 장착 위치 `(x=1.5, y=0.0, z=1.25)`를 사용한다. TFv6 inference는 `/lidar3D`의 시간순 raw `PointCloud2` 10개를 직접 FIFO에 보관한다. 각 sweep stamp에서 `/tf`의 `map` → `base_link` pose를 translation 선형 보간과 quaternion SLERP로 구한 뒤 최신 causal anchor로 정렬하고, 고정된 LEAD builder의 ego mask·ground removal·rasterization 순서를 적용한다. 따라서 `/lidar/tfv6/processed` 5-sweep 영상은 TFv6 model input이 아니다.
 
 카메라와 LiDAR의 `~model_profiles`는 launch 인자 하나로 함께 선택한다. 기본값 `raw`는 legacy 카메라 토픽과 시각화용 LiDAR BEV만 발행하고, `all`은 지원하는 모든 모델별 전처리 토픽을 활성화한다.
 
@@ -334,22 +334,33 @@ lidar BEV, Image BEV, waypoints를 overlap하여 시각화.
 
 ## 3. Open-loop 실행
 
-아래 예시는 `interfuser`를 선택해 preprocessing, inference, visualization을 하나의 launch로 시작한다. 다른 모델은 두 명령의 model ID를 동일하게 바꾼다. SparseDrive V2는 실행 전에 `src/Validator_pkg/config/profile.json`의 front/left/right inline calibration(`K_original_3x3`, distortion metadata, `T_lidar_from_camera_4x4`)을 모두 채워야 하며, 하나라도 비어 있으면 worker 생성 전에 시작을 차단한다.
+아래는 InterFuser 예시다. 첫 명령으로 모델 환경을 만들고 validator와 RViz를 시작한 뒤, 다른 terminal에서 기본 bag을 재생한다. `interfuser` 대신 `tfv6`, `diffusiondrive_v2`, `sparsedrive_v2`를 넣어도 같은 절차로 실행된다.
 
 ```bash
-catkin_make
-source devel/setup.bash
-rosrun validator_inference fetch_model_assets.py --model-id interfuser
-roslaunch Validator_pkg openloop_validator.launch model_id:=interfuser show_rviz:=true
+./openloop setup interfuser
+./openloop interfuser --rviz
+./openloop bag
 ```
 
-`openloop_validator.launch`는 `/use_sim_time=true`를 설정하고 선택한 model ID를 preprocessing의 `model_profiles`와 inference의 `model_id`에 동일하게 전달한 뒤 visualizer/RViz까지 시작한다. 다른 terminal에서 bag clock과 함께 재생한다. Inference layer만 독립적으로 점검할 때에만 `roslaunch validator_inference openloop_inference.launch model_id:=...`를 사용한다.
+`setup`은 모델별 고정 Python/CUDA dependency를 `.venvs/<model>/builds/`에 만들고 검증이 끝난 build만 `current`로 선택한다. `run`과 모델 shorthand는 환경을 설치하거나 변경하지 않는다. 전체 hash 무결성 검사와 이전 build 정리는 각각 다음 명령을 사용한다.
 
-이 저장소의 기본 Docker 이미지는 ROS Noetic의 Catkin/메시지/launch 및 전처리·시각화 계약을 검증하는 환경이다. 실제 네 모델 forward에는 `fetch_model_assets.py`로 받는 checkpoint/source 외에도 각 고정 source가 요구하는 PyTorch·Python·CUDA 런타임이 별도로 필요하며, 특히 TFv6는 LEAD 호환 Python/CUDA 환경에서 실행해야 한다.
+지원 host는 Ubuntu 20.04 x86_64, ROS Noetic, `uv 0.11.14`이다. SparseDrive V2 setup은 해시가 고정된 최소 CUDA 11.8 compiler를 프로젝트의 `.toolchains/`에 자동 준비하므로 별도 `sudo` 설치나 `CUDA_HOME` 설정이 필요 없다.
 
 ```bash
-source devel/setup.bash
-rosbag play --clock rosbag/2026-07-16-17-13-14.bag
+./openloop verify interfuser
+./openloop prune interfuser
 ```
 
-기본 결과 위치는 프로젝트의 `records/openloop/`이며 launch 인자 `profile_file:=...`, `record_dir:=...`로 로컬 경로를 바꿀 수 있다. `/waypoints`는 `Lidar3D-4` frame이고 매 tick 결과는 `/inference_metric` 하나를 통해 CSV에 기록된다.
+네 모델 모두 source, runtime asset, dependency lock, 실제 model load까지 setup/verify 대상이다. InterFuser checkpoint는 공식 배포본으로 가장하지 않고 Drivora 호환 mirror의 `third-party compatibility artifact`로 hash와 provenance를 고정한다. 자세한 준비 조건, 직접 launch, 오류 복구 절차는 [Open-loop 운영 절차](docs/openloop_validator.md)를 참고한다.
+
+고급 사용자가 launch 인자를 직접 제어할 때는 setup을 먼저 완료하고 절대 환경 root를 전달한다.
+
+```bash
+roslaunch Validator_pkg openloop_validator.launch \
+  project_root:=/home/stier/E2E-OpenLoop-ROS-Validator \
+  model_id:=interfuser \
+  model_env_root:=/home/stier/E2E-OpenLoop-ROS-Validator/.venvs \
+  show_rviz:=true
+```
+
+기본 결과 위치는 프로젝트의 `records/openloop/`이다. 고급 직접 launch에서는 `profile_file:=/absolute/profile.json`, `record_dir:=/absolute/records`로 로컬 경로를 바꿀 수 있다. `/waypoints`는 `Lidar3D-4` frame이고 매 tick 결과는 `/inference_metric` 하나를 통해 CSV에 기록된다.

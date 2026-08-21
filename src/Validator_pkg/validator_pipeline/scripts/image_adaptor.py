@@ -44,6 +44,7 @@ import json
 import math
 import os
 import threading
+from copy import copy
 
 import cv2
 import numpy as np
@@ -234,39 +235,49 @@ def camera_vehicle_to_optical_rotation(calibration):
     """Return MORAI vehicle-to-camera-optical rotation.
 
     MORAI vehicle coordinates are x-forward, y-left, z-up. Camera optical
-    coordinates are x-right, y-down, z-forward.
+    coordinates are x-right, y-down, z-forward. The pitch-then-yaw order is
+    fixed by the recorded MORAI camera-frame transforms for this sensor rig.
     """
     roll = math.radians(calibration["roll"])
     pitch = math.radians(calibration["pitch"])
     yaw = math.radians(calibration["yaw"])
 
-    forward = np.array(
+    rotation_y = np.array(
         [
-            math.cos(pitch) * math.cos(yaw),
-            math.cos(pitch) * math.sin(yaw),
-            -math.sin(pitch),
+            [math.cos(pitch), 0.0, math.sin(pitch)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(pitch), 0.0, math.cos(pitch)],
         ],
         dtype=np.float64,
     )
-    right = np.array(
-        [math.sin(yaw), -math.cos(yaw), 0.0],
+    rotation_z = np.array(
+        [
+            [math.cos(yaw), -math.sin(yaw), 0.0],
+            [math.sin(yaw), math.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
         dtype=np.float64,
     )
-    down = np.cross(forward, right)
-
-    if roll != 0.0:
-        original_right = right.copy()
-        original_down = down.copy()
-        right = (
-            math.cos(roll) * original_right
-            + math.sin(roll) * original_down
-        )
-        down = (
-            -math.sin(roll) * original_right
-            + math.cos(roll) * original_down
-        )
-
-    return np.stack([right, down, forward], axis=0)
+    optical_to_vehicle = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    optical_roll = np.array(
+        [
+            [math.cos(roll), -math.sin(roll), 0.0],
+            [math.sin(roll), math.cos(roll), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    camera_to_vehicle = (
+        rotation_y @ rotation_z @ optical_to_vehicle @ optical_roll
+    )
+    return camera_to_vehicle.T
 
 
 def load_sparsedrive_calibration(config_path):
@@ -521,12 +532,23 @@ def prepare_interfuser(images):
     }
 
 
-def prepare_diffusiondrive_v2(images):
+def prepare_diffusiondrive_v2(images, morai_domain=False):
     """Build DiffusionDriveV2's 1024x256 left/front/right camera strip."""
-    # The pinned NAVSIM builder crops 1920x1080 views, stitches the complete
-    # 4096x1024 strip, then applies one default cv2.INTER_LINEAR resize. MORAI
-    # cameras have different source sizes, so first map each deterministically
-    # into that source canvas and preserve the pinned operation order.
+    if morai_domain:
+        resized = [
+            cv2.resize(
+                bgr_to_rgb(images[name]),
+                size,
+                interpolation=cv2.INTER_AREA,
+            )
+            for name, size in (
+                ("left", (341, 256)),
+                ("front", (455, 256)),
+                ("right", (341, 256)),
+            )
+        ]
+        return unit_normalize(np.concatenate(resized, axis=1)[:, 56:1080])
+
     canonical = {
         name: cv2.resize(
             bgr_to_rgb(images[name]),
@@ -535,16 +557,22 @@ def prepare_diffusiondrive_v2(images):
         )
         for name in CAMERA_NAMES
     }
-    left = canonical["left"][28:-28, 416:-416]
-    front = canonical["front"][28:-28]
-    right = canonical["right"][28:-28, 416:-416]
-    stitched = np.concatenate([left, front, right], axis=1)
-    resized = cv2.resize(
-        stitched,
-        (1024, 256),
-        interpolation=cv2.INTER_LINEAR,
+    stitched = np.concatenate(
+        [
+            canonical["left"][28:-28, 416:-416],
+            canonical["front"][28:-28],
+            canonical["right"][28:-28, 416:-416],
+        ],
+        axis=1,
     )
-    return unit_normalize(resized)
+    return unit_normalize(
+        cv2.resize(stitched, (1024, 256), interpolation=cv2.INTER_LINEAR)
+    )
+
+
+def select_output_stamp(source_stamp, use_ros_time_stamp):
+    """명시적으로 요청한 경우에만 bag replay 시각을 선택한다."""
+    return rospy.Time.now() if use_ros_time_stamp else source_stamp
 
 
 def prepare_sparsedrive_v2(images):
@@ -579,6 +607,12 @@ class ImageAdaptor:
         self.generation = {name: 0 for name in CAMERA_NAMES}
         self.last_profile_generation = {name: 0 for name in CAMERA_NAMES}
         self.sync_slop = float(rospy.get_param("~sync_slop", 0.1))
+        self.use_ros_time_stamp = bool(
+            rospy.get_param("~use_ros_time_stamp", False)
+        )
+        self.morai_ddv2_domain = bool(
+            rospy.get_param("~morai_ddv2_domain", False)
+        )
 
         if self.sync_slop < 0.0:
             raise ValueError("~sync_slop must be non-negative")
@@ -770,6 +804,11 @@ class ImageAdaptor:
 
     def image_callback(self, msg, camera_name):
         """Publish the legacy image and trigger a synchronized model batch."""
+        output_header = copy(msg.header)
+        output_header.stamp = select_output_stamp(
+            msg.header.stamp,
+            self.use_ros_time_stamp,
+        )
         image = self.decode_compressed_image(msg)
         if image is None:
             rospy.logwarn_throttle(
@@ -783,7 +822,7 @@ class ImageAdaptor:
             self.legacy_publishers[camera_name],
             image,
             "bgr8",
-            msg.header,
+            output_header,
         )
 
         snapshot = None
@@ -794,6 +833,7 @@ class ImageAdaptor:
                     image,
                     msg.header,
                     self.generation[camera_name],
+                    output_header,
                 )
                 snapshot = self.get_synchronized_snapshot()
 
@@ -848,9 +888,9 @@ class ImageAdaptor:
         images = {name: snapshot[name][0] for name in CAMERA_NAMES}
         latest_name = max(
             CAMERA_NAMES,
-            key=lambda name: snapshot[name][1].stamp.to_nsec(),
+            key=lambda name: snapshot[name][3].stamp.to_nsec(),
         )
-        header = snapshot[latest_name][1]
+        header = snapshot[latest_name][3]
 
         try:
             if "tfv6" in self.model_profiles:
@@ -876,7 +916,10 @@ class ImageAdaptor:
             if "diffusiondrive_v2" in self.model_profiles:
                 self.publish_image(
                     self.profile_publishers["diffusiondrive_v2"],
-                    prepare_diffusiondrive_v2(images),
+                    prepare_diffusiondrive_v2(
+                        images,
+                        self.morai_ddv2_domain,
+                    ),
                     "32FC3",
                     header,
                     "diffusiondrive_v2_multi_camera",

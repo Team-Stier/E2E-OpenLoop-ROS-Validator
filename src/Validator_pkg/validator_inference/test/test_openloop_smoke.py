@@ -1,9 +1,11 @@
 """오픈루프 추론 launch와 경량 종단간 계약을 검사한다."""
 
 import csv
+import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import time
+from xml.etree import ElementTree
 
 import pytest
 import rospy
@@ -41,7 +43,7 @@ def test_launch_uses_sim_time_arguments_and_exactly_three_runtime_nodes():
     assert '<arg name="profile_file" default=""/>' in launch
     assert (
         '<arg name="record_dir" '
-        'default="$(find validator_inference)/../../../records/openloop"/>'
+        'default="$(arg project_root)/records/openloop"/>'
         in launch
     )
     assert launch.count("<node ") == 3
@@ -54,6 +56,29 @@ def test_launch_uses_sim_time_arguments_and_exactly_three_runtime_nodes():
     ) == 2
     assert '<param name="record_dir" value="$(arg record_dir)"/>' in launch
     assert "/inference_time" not in launch
+
+    root = ElementTree.parse(launch_path).getroot()
+    arguments = {element.attrib["name"]: element for element in root.findall("arg")}
+    assert "project_root" in arguments
+    assert arguments["model_env_root"].attrib["default"] == "$(arg project_root)/.venvs"
+    nodes = root.findall("node")
+    prefixed = [node for node in nodes if "launch-prefix" in node.attrib]
+    assert len(prefixed) == 1
+    engine = prefixed[0]
+    assert engine.attrib["type"] == "inference_engine_node.py"
+    assert engine.attrib["launch-prefix"] == (
+        '"$(find validator_inference)/scripts/model_env_exec"'
+    )
+    engine_environment = {
+        element.attrib["name"]: element.attrib["value"]
+        for element in engine.findall("env")
+    }
+    assert engine_environment == {
+        "OPENLOOP_MODEL_ENV_ROOT": "$(arg model_env_root)",
+        "OPENLOOP_MODEL_ID": "$(arg model_id)",
+        "OPENLOOP_PROJECT_ROOT": "$(arg project_root)",
+    }
+    assert sum(len(node.findall("env")) for node in nodes) == 3
 
     cmake = (PACKAGE_ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
     assert "install(DIRECTORY launch/" in cmake
@@ -154,13 +179,22 @@ def test_fake_model_smoke_writes_completed_csv_and_lidar_path(tmp_path):
         assert all(pose.header.frame_id == "Lidar3D-4" for pose in path.poses)
 
 
-def test_shipped_sparse_null_calibration_fails_before_worker_construction(monkeypatch):
+def test_sparse_null_calibration_fails_before_worker_construction(
+    monkeypatch, tmp_path
+):
     node = _load_script("inference_engine_node.py")
     worker_calls = []
+    payload = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    sparse = next(item for item in payload["profiles"] if item["id"] == "sparsedrive_v2")
+    sparse["static_runtime_inputs"]["camera_calibration"]["cameras"][0][
+        "K_original_3x3"
+    ] = None
+    incomplete_profile = tmp_path / "profile.json"
+    incomplete_profile.write_text(json.dumps(payload), encoding="utf-8")
     parameters = {
         "/use_sim_time": True,
         "~model_id": "sparsedrive_v2",
-        "~profile_file": str(PROFILE_FILE),
+        "~profile_file": str(incomplete_profile),
         "~run_id": "sparse-smoke",
     }
 
@@ -168,6 +202,11 @@ def test_shipped_sparse_null_calibration_fails_before_worker_construction(monkey
         node.rospy,
         "get_param",
         lambda name, default=None: parameters.get(name, default),
+    )
+    monkeypatch.setattr(
+        node,
+        "_default_profile_file",
+        lambda: str(PROFILE_FILE),
     )
     monkeypatch.setattr(node, "InferenceWorker", lambda *args: worker_calls.append(args))
 
@@ -177,20 +216,18 @@ def test_shipped_sparse_null_calibration_fails_before_worker_construction(monkey
     assert worker_calls == []
 
 
-def test_operator_docs_name_the_reproducible_rosbag_clock_sequence():
-    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
-    design = (PROJECT_ROOT / "docs" / "inference_engine_design.md").read_text(
-        encoding="utf-8"
-    )
-    contracts = (PROJECT_ROOT / "docs" / "model_io_contracts.md").read_text(
-        encoding="utf-8"
-    )
+def test_operator_docs_name_the_canonical_openloop_sequence():
+    """운영 문서가 모델 setup, validator 실행과 clock bag 순서를 고정하는지 검사한다."""
     required = (
-        "catkin_make",
-        "source devel/setup.bash",
-        "fetch_model_assets.py --model-id",
-        "roslaunch validator_inference openloop_inference.launch",
-        "rosbag play --clock rosbag/2026-07-16-17-13-14.bag",
+        "./openloop setup interfuser",
+        "./openloop interfuser --rviz",
+        "./openloop bag",
+        "./openloop verify interfuser",
+        "./openloop prune interfuser",
     )
-    for document in (readme, design, contracts):
+    for path in (
+        PROJECT_ROOT / "README.md",
+        PROJECT_ROOT / "docs" / "openloop_validator.md",
+    ):
+        document = path.read_text(encoding="utf-8")
         assert all(command in document for command in required)

@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "uv_version": "0.11.14",
+  "python_platform": "x86_64-manylinux_2_31",
+  "exclude_newer": "2026-07-21T00:00:00Z",
+  "default_index": "https://pypi.org/simple",
+  "index_strategy": "first-index",
+  "models": {
+    "interfuser": {
+      "python_version": "3.8.20",
+      "requirements_input": "requirements/interfuser.in",
+      "requirements_input_sha256": "423c52bdabfc1a38c1ffca31a3eac3e85054ce8f980d0eb37df95c93d7b21a30",
+      "requirements_lock": "requirements/interfuser.lock",
+      "requirements_lock_sha256": "9cae6d2193f431d181674c37f2c91d40d2e14c688c8f0b1f77195f0d04e19f0b",
+      "indexes": [
+        "https://download.pytorch.org/whl/cu121",
+        "https://pypi.org/simple"
+      ],
+      "torch_backend": "cu121",
+      "cuda_policy": "recommended",
+      "source_commit": "f0be8ea294c49a59febaa032dd6da40b475e3657",
+      "required_imports": [
+        "torch",
+        "torchvision",
+        "numpy",
+        "cv2",
+        "timm",
+        "imgaug",
+        "skimage"
+      ],
+      "setup_actions": []
+    },
+    "tfv6": {
+      "python_version": "3.10.20",
+      "requirements_input": "requirements/tfv6.in",
+      "requirements_input_sha256": "bcfb9fe74ade0560cd1dd2ca7e000ffbb9bc75ef95d15c0e02b2ce95abcaca1c",
+      "requirements_lock": "requirements/tfv6.lock",
+      "requirements_lock_sha256": "6e8a6698283d5b075100705aceee12c05e5144a452f9efc0062a37a3108a59cd",
+      "indexes": [
+        "https://download.pytorch.org/whl/cu124",
+        "https://pypi.org/simple"
+      ],
+      "torch_backend": "cu124",
+      "cuda_policy": "required",
+      "source_commit": "730bc1a2f44d5f28312dd55f0ca958e94a24c038",
+      "required_imports": [
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "numpy",
+        "timm",
+        "transformers",
+        "torchmetrics"
+      ],
+      "setup_actions": []
+    },
+    "diffusiondrive_v2": {
+      "python_version": "3.9.25",
+      "requirements_input": "requirements/diffusiondrive_v2.in",
+      "requirements_input_sha256": "01c5c41c45230f89e4ff3ead009d3a61a91a5d4e2e5c81237fe272807d42fd70",
+      "requirements_lock": "requirements/diffusiondrive_v2.lock",
+      "requirements_lock_sha256": "4ccff6e77c1ceeb61e6f8f1164020749cd3b32b8a8848299848aed7f14133c74",
+      "indexes": [
+        "https://download.pytorch.org/whl/cu118",
+        "https://pypi.org/simple"
+      ],
+      "torch_backend": "cu118",
+      "cuda_policy": "recommended",
+      "source_commit": "1cd12a1e155c34dcc471261835444c8d5587580b",
+      "required_imports": [
+        "torch",
+        "torchvision",
+        "diffusers",
+        "einops",
+        "nuplan"
+      ],
+      "setup_actions": []
+    },
+    "sparsedrive_v2": {
+      "python_version": "3.9.25",
+      "requirements_input": "requirements/sparsedrive_v2.in",
+      "requirements_input_sha256": "e3db20cc70f7d89de89d42d39a970155cf335716f845f44ac610d27a123da651",
+      "requirements_lock": "requirements/sparsedrive_v2.lock",
+      "requirements_lock_sha256": "9b5e15311b66683fb1113479c9a3a7eeb3fc0aa379c55f8957b58e38b286b5ba",
+      "indexes": [
+        "https://download.pytorch.org/whl/cu118",
+        "https://pypi.org/simple"
+      ],
+      "torch_backend": "cu118",
+      "cuda_policy": "extension_required",
+      "source_commit": "696ef77924eb9e0a4b4047d013a50e9854bfa026",
+      "required_imports": [
+        "torch",
+        "torchvision",
+        "nuplan",
+        "deformable_aggregation_ext",
+        "deformable_aggregation_with_depth_ext"
+      ],
+      "setup_actions": [
+        "build_sparsedrive_cuda_extensions"
+      ]
+    }
+  }
+}
