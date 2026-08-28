@@ -10,10 +10,6 @@ rosbag/*.bag
 .build_tools/
 .DS_Store
 
-# open-loop evaluation records
-records/openloop/*.csv
-records/horizontal/*.csv
-
 # Downloaded model weights and their auxiliary binary assets
 /models/*
 !/models/.gitkeep
